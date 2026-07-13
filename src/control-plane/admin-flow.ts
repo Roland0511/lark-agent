@@ -110,7 +110,7 @@ export function registerAdminFlowRoutes(
     const start = since(request.query.range);
     if (view === "inbox") {
       let query = db.selectFrom("signals").innerJoin("tasks", "tasks.id", "signals.task_id").innerJoin("conversations", "conversations.id", "signals.conversation_id").innerJoin("bots", "bots.id", "signals.bot_id")
-        .select(["signals.id", "signals.bot_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.message_type", "signals.content", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
+        .select(["signals.id", "signals.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.message_type", "signals.content", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
         .orderBy(sql`CASE WHEN signals.decision IN ('pending','defer') THEN 0 ELSE 1 END`).orderBy("signals.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("signals.created_at", ">=", start);
       if (request.query.state) query = query.where("signals.decision", "=", request.query.state);
@@ -126,7 +126,7 @@ export function registerAdminFlowRoutes(
     if (view === "outbox") {
       let query = db.selectFrom("outbox_messages").innerJoin("tasks", "tasks.id", "outbox_messages.task_id").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
         .leftJoin("drafts", "drafts.id", "outbox_messages.draft_id").leftJoin("task_outputs", "task_outputs.task_id", "tasks.id")
-        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.bot_id", "bots.display_name as bot_display_name", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id"])
+        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id"])
         .orderBy(sql`CASE WHEN outbox_messages.state IN ('unknown','pending') THEN 0 ELSE 1 END`).orderBy("outbox_messages.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("outbox_messages.created_at", ">=", start);
       if (request.query.state) query = query.where("outbox_messages.state", "=", request.query.state);
@@ -141,7 +141,7 @@ export function registerAdminFlowRoutes(
     }
 
     let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
-      .select(["bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at"])
+      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at"])
       .orderBy(sql`CASE WHEN tasks.state IN ('completed','cancelled') THEN 1 ELSE 0 END`).orderBy("tasks.created_at", "desc").limit(limit + 1);
     if (start) query = query.where("tasks.created_at", ">=", start);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
@@ -200,6 +200,7 @@ export function registerAdminFlowRoutes(
     const task = await db.selectFrom("tasks").selectAll().where("id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const conversation = await db.selectFrom("conversations").selectAll().where("id", "=", task.conversation_id).executeTakeFirstOrThrow();
+    const bot = await db.selectFrom("bots").select(["app_id", "display_name"]).where("id", "=", task.bot_id).executeTakeFirstOrThrow();
     const [signals, events, drafts, approvals, output, updates, outbox, actions, latestTurn] = await Promise.all([
       db.selectFrom("signals").selectAll().where("task_id", "=", task.id).orderBy("seq").execute(),
       db.selectFrom("task_events").selectAll().where("task_id", "=", task.id).orderBy("created_at").execute(),
@@ -228,7 +229,7 @@ export function registerAdminFlowRoutes(
       check("event", signals.length > 0 && processedEvents.length === new Set(signals.map((signal) => signal.event_id)).size, "错误", processedEvents.length ? `去重账本已记录 ${processedEvents.length} 个飞书事件` : "任务没有对应的 processed_events 接收证据", firstSignal?.created_at, processedEvents.at(-1)?.processed_at, processedEvents.map((x) => x.event_id)),
       check("signal", signals.every((x) => x.task_id === task.id && x.conversation_id === task.conversation_id), "错误", "Signal 与任务、会话关联一致", firstSignal?.created_at, lastSignal?.created_at, signals.map((x) => x.id)),
       check("attention", !signals.some((x) => x.decision === "pending") || !["completed", "failed"].includes(task.state), "警告", signals.some((x) => x.decision === "pending") ? "仍有待判断 Signal" : "注意力判断已完成", firstSignal?.created_at, lastSignal?.decided_at, signals.map((x) => x.id)),
-      check("executor", !consumed || Boolean(task.executor_id && task.resolved_workspace_alias), "错误", task.executor_id ? `执行器 ${task.executor_id} · ${task.resolved_workspace_alias ?? "工作区缺失"}` : "已消费任务没有绑定执行器", task.created_at, task.executor_id ? task.updated_at : null, [task.executor_id, task.resolved_workspace_alias].filter(Boolean) as string[]),
+      check("executor", !consumed || Boolean(task.executor_id && task.resolved_workspace_alias), "错误", task.executor_id ? `执行器 ${task.executor_id} · ${task.resolved_workspace_alias ? `${task.resolved_workspace_alias}/${bot.app_id}` : "总工作区缺失"}` : "已消费任务没有绑定执行器", task.created_at, task.executor_id ? task.updated_at : null, [task.executor_id, task.resolved_workspace_alias, bot.app_id].filter(Boolean) as string[]),
       check("codex", !consumed || Boolean(task.codex_thread_id), "错误", task.codex_thread_id ? `Codex thread ${task.codex_thread_id}` : "已消费任务缺少 Codex thread", codexEvent?.created_at ?? task.updated_at, task.codex_thread_id ? task.updated_at : null, [task.codex_thread_id].filter(Boolean) as string[]),
       check("draft", !latestDraft || latestDraft.observed_room_seq >= latestDraft.base_room_seq, "错误", latestDraft ? `草稿版本 ${latestDraft.base_room_seq} → ${latestDraft.observed_room_seq}` : silent ? "静默任务无需草稿" : "尚无草稿", latestDraft?.created_at, latestDraft?.sent_at ?? latestDraft?.updated_at, latestDraft ? [latestDraft.id] : []),
       check("sequence", monotonic, "错误", monotonic ? `输出 sequence 单调递增（${numericalSequences.join(", ") || "无更新"}）` : "输出 sequence 重复或倒退", firstUpdate?.created_at, lastUpdate?.sent_at ?? lastUpdate?.updated_at, updates.map((x) => x.id)),
@@ -237,7 +238,7 @@ export function registerAdminFlowRoutes(
       check("lifecycle", !isLatest || lifecycleConsistent(task, conversation.active, conversation.followup_expires_at), "错误", `Conversation active=${conversation.active} · disposition=${task.conversation_disposition ?? "未判断"}`, task.created_at, task.completed_at, [task.conversation_id, task.id])
     ];
     return redactSecrets({
-      task: { ...publicTask(task), created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at) },
+      task: { ...publicTask(task), bot_app_id: bot.app_id, bot_display_name: bot.display_name, created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at) },
       conversation: { ...conversation, created_at: iso(conversation.created_at), updated_at: iso(conversation.updated_at), followup_expires_at: iso(conversation.followup_expires_at) },
       processed_events: processedEvents.map((x) => ({ ...x, received_at: iso(x.received_at), processed_at: iso(x.processed_at) })),
       signals: signals.map((x) => ({ ...x, created_at: iso(x.created_at), decided_at: iso(x.decided_at) })),

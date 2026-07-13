@@ -58,7 +58,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.0" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.1" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});

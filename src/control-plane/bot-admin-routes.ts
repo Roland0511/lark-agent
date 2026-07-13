@@ -45,6 +45,18 @@ export function registerBotAdminRoutes(
   dependencies: { gateways: BotGatewayRegistry; runtime: RuntimeStatus; events: AdminEventBus; controller: BotRuntimeController }
 ): void {
   const profiles = new LarkProfileStore(config.larkCliPath);
+  const validateExecutionRoute = async (executorId: string | null, workspaceAlias: string | null) => {
+    if (!executorId && !workspaceAlias) return;
+    const workers = await db.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).execute();
+    const candidates = executorId ? workers.filter((worker) => worker.executor_id === executorId) : workers;
+    if (executorId && !candidates.length) throw new AppError("默认执行器不存在", 409, "bot_executor_not_found");
+    if (executorId && !workspaceAlias && candidates[0]?.workspace_aliases.length !== 1) {
+      throw new AppError("该执行器声明了多个总工作区，请明确选择一个", 409, "bot_workspace_required");
+    }
+    if (workspaceAlias && !candidates.some((worker) => Array.isArray(worker.workspace_aliases) && worker.workspace_aliases.map(String).includes(workspaceAlias))) {
+      throw new AppError("所选执行器未声明该总工作区", 409, "bot_workspace_unavailable");
+    }
+  };
   const view = async (botId: string) => {
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", botId).where("deleted_at", "is", null).executeTakeFirst();
     if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
@@ -80,6 +92,7 @@ export function registerBotAdminRoutes(
     const principal = await requireAdmin(db, config, request); requireCsrf(request, principal);
     const body = createSchema.parse(request.body);
     if (await db.selectFrom("bots").select("id").where("app_id", "=", body.appId).where("deleted_at", "is", null).executeTakeFirst()) throw new AppError("该 App ID 已绑定", 409, "bot_exists");
+    await validateExecutionRoute(body.defaultExecutorId, body.defaultWorkspaceAlias);
     const profileName = `bot-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     await profiles.add(profileName, body.appId, body.appSecret);
     try {
@@ -102,11 +115,13 @@ export function registerBotAdminRoutes(
   app.patch<{ Params: { id: string } }>("/v1/admin/bots/:id", async (request) => {
     const principal = await requireAdmin(db, config, request); requireCsrf(request, principal);
     const body = updateSchema.parse(request.body);
+    await validateExecutionRoute(body.defaultExecutorId, body.defaultWorkspaceAlias);
     const updated = await db.updateTable("bots").set({
       display_name: body.displayName, role_instructions: body.roleInstructions, default_executor_id: body.defaultExecutorId,
       default_workspace_alias: body.defaultWorkspaceAlias, config_revision: sql`config_revision + 1`, updated_at: new Date()
     }).where("id", "=", request.params.id).where("deleted_at", "is", null).returning("id").executeTakeFirst();
     if (!updated) throw new AppError("机器人不存在", 404, "bot_not_found");
+    await dependencies.controller.reconcile(updated.id);
     dependencies.events.publish("bot", updated.id);
     return view(updated.id);
   });
@@ -174,6 +189,7 @@ export function registerBotAdminRoutes(
   app.put<{ Params: { id: string } }>("/v1/admin/bots/:id/chat-bindings", async (request) => {
     const principal = await requireAdmin(db, config, request); requireCsrf(request, principal);
     const body = bindingsSchema.parse(request.body);
+    await Promise.all(body.bindings.map((binding) => validateExecutionRoute(binding.preferredExecutorId, binding.workspaceAlias)));
     await db.transaction().execute(async (trx) => {
       await trx.deleteFrom("bot_chat_bindings").where("bot_id", "=", request.params.id).execute();
       if (body.bindings.length) await trx.insertInto("bot_chat_bindings").values(body.bindings.map((item) => ({

@@ -6,6 +6,7 @@ import { sha256 } from "../shared/crypto.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { ControlPlaneClient } from "./control-plane-client.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { resolveBotWorkspace } from "./workspace.js";
 
 export class TaskProcessor {
   private currentTask: ClaimedTask | null = null;
@@ -42,7 +43,7 @@ export class TaskProcessor {
     let heartbeatTimer: NodeJS.Timeout | null = null;
     let controlState: "human_owned" | "cancelled" | null = null;
     try {
-      const workspace = this.resolveWorkspace(task.resolvedWorkspaceAlias);
+      const workspace = await resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
       let stoppedByControl = false;
       heartbeatTimer = setInterval(() => {
         void this.client.heartbeat(task.id, task.leaseToken).then(async (status) => {
@@ -58,7 +59,7 @@ export class TaskProcessor {
       }, 20_000);
 
       const threadId = await this.codex.startOrResumeThread(workspace.path, task.codexThreadId);
-      await this.client.event(task.id, task.leaseToken, "codex.thread", "Codex 线程已就绪", { threadId, executorId: this.config.executorId, homeRef: this.config.homeRef, profile: this.config.codexProfile });
+      await this.client.event(task.id, task.leaseToken, "codex.thread", "Codex 线程已就绪", { threadId, executorId: this.config.executorId, homeRef: this.config.homeRef, profile: this.config.codexProfile, workspaceAlias: workspace.alias });
       let baseRoomSeq = task.roomSeq;
       this.currentBaseRoomSeq = baseRoomSeq;
       let signals = task.signals;
@@ -137,21 +138,11 @@ export class TaskProcessor {
 
   async openHandoff(task: ClaimedTask): Promise<void> {
     if (!this.config.appLauncher) throw new Error("this executor has no app_launcher capability");
-    const workspace = this.resolveWorkspace(task.resolvedWorkspaceAlias);
+    const workspace = await resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: this.config.codexHome };
     delete env.CODEX_SQLITE_HOME;
     const child = spawn(this.config.appLauncher, [workspace.path], { env, detached: true, stdio: "ignore" });
     child.unref();
-  }
-
-  private resolveWorkspace(alias: string | null): { alias: string; path: string } {
-    if (alias) {
-      const match = this.config.workspaceRoots.find((root) => root.alias === alias);
-      if (!match) throw new Error(`executor cannot access workspace alias ${alias}`);
-      return match;
-    }
-    if (this.config.workspaceRoots.length !== 1) throw new Error("task has no workspace alias and executor has multiple workspace roots");
-    return this.config.workspaceRoots[0] as { alias: string; path: string };
   }
 
   private async handleApproval(request: { id: string; method: string; params: Record<string, unknown>; summary: string }): Promise<"accept" | "decline" | "cancel"> {

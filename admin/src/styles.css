@@ -1385,6 +1385,8 @@ td small {
 .bot-form label { display: flex; flex-direction: column; gap: 6px; color: #5b6b80; font-size: 11px; font-weight: 700; }
 .bot-form label.span-2 { grid-column: 1 / -1; }
 .bot-form select { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: #fff; color: #35465d; }
+.workspace-isolation-note { margin: -3px 0 16px; padding: 10px 12px; border: 1px solid #cfe0ff; border-radius: 10px; background: #f3f7ff; color: #45607f; font-size: 11px; line-height: 1.6; }
+.workspace-isolation-note code { color: #1f57b5; font-weight: 700; overflow-wrap: anywhere; }
 .bot-settings-section { margin: 14px 0; padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: #fafbfc; }
 .bot-settings-section > strong { font-size: 12px; color: #273a52; }
 .bot-settings-section > p { margin: 6px 0 10px; color: var(--muted); font-size: 10px; }

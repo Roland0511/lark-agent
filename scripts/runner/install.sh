@@ -217,7 +217,7 @@ fi
 if (( ${#WORKSPACES} == 0 )); then WORKSPACES+=("$PWD"); fi
 if [[ "$ASSUME_YES" != true && -r /dev/tty ]]; then
   while true; do
-    print -n -- "添加其他工作区绝对路径（直接回车结束）：" > /dev/tty
+    print -n -- "添加其他总工作区绝对路径（直接回车结束）：" > /dev/tty
     read extra < /dev/tty
     [[ -n "$extra" ]] || break
     WORKSPACES+=("$extra")
@@ -226,7 +226,7 @@ fi
 typeset -a CANONICAL_WORKSPACES
 CANONICAL_WORKSPACES=()
 for workspace in "${WORKSPACES[@]}"; do
-  canonical="$(cd "$workspace" 2>/dev/null && pwd -P)" || fail "工作区不存在：$workspace"
+  canonical="$(cd "$workspace" 2>/dev/null && pwd -P)" || fail "总工作区不存在：$workspace"
   CANONICAL_WORKSPACES+=("$canonical")
 done
 
@@ -279,7 +279,8 @@ print -- ""
 print -- "执行器：$EXECUTOR_ID"
 print -- "Codex Home：$CODEX_HOME_VALUE"
 print -- "Profile：$PROFILE"
-print -- "工作区：${(j:, :)CANONICAL_WORKSPACES}"
+print -- "总工作区：${(j:, :)CANONICAL_WORKSPACES}"
+print -- "机器人专属工作区：每个机器人首次执行任务时自动使用 <总工作区>/<App ID>/"
 print -- "控制面：$SERVER"
 if [[ "$ASSUME_YES" != true && -r /dev/tty ]]; then
   print -n -- "确认注册并安装？[Y/n] " > /dev/tty

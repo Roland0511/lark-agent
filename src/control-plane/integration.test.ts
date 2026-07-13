@@ -346,9 +346,9 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
     const claimResponse = await app.inject({ method: "POST", url: "/v1/tasks/claim", headers: { authorization: `Bearer ${sessionToken}` } });
     expect(claimResponse.statusCode).toBe(200);
-    const claim = claimResponse.json<{ id: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string }>();
+    const claim = claimResponse.json<{ id: string; botAppId: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string }>();
     expect(claim.id).toBe(task.id);
-    expect(claim).toMatchObject({ chatType: "group", turnIndex: 1, triggerMessageId: "om_root", requestedWorkspaceAlias: "repo", resolvedWorkspaceAlias: "repo" });
+    expect(claim).toMatchObject({ botAppId: "cli_bot", chatType: "group", turnIndex: 1, triggerMessageId: "om_root", requestedWorkspaceAlias: "repo", resolvedWorkspaceAlias: "repo" });
     expect(claim.attentionContext).toContain("首次激活回合");
     const claimedRow = await db.selectFrom("tasks").selectAll().where("id", "=", task.id).executeTakeFirstOrThrow();
     expect(claimedRow.executor_home_ref).toBe("worker-a:home");

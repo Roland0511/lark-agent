@@ -99,6 +99,7 @@ export type Signal = z.infer<typeof signalSchema>;
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
   botId: z.string().uuid(),
+  botAppId: z.string().regex(/^cli_[A-Za-z0-9]+$/),
   botDisplayName: z.string().min(1),
   roleInstructions: z.string().max(20_000),
   botConfigRevision: z.number().int().positive(),

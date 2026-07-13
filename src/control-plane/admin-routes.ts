@@ -113,7 +113,7 @@ export function registerAdminRoutes(
     let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").select([
       "tasks.id", "tasks.state", "tasks.revision", "tasks.executor_id", "tasks.requested_workspace_alias", "tasks.resolved_workspace_alias", "tasks.requester_id",
       "tasks.requester_role", "tasks.attempt", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
-      "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.display_name as bot_display_name", "conversations.chat_type", "conversations.room_seq"
+      "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_type", "conversations.room_seq"
     ]).orderBy("tasks.created_at", "desc").orderBy("tasks.id", "desc").limit(limit + 1);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
     if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
@@ -139,7 +139,7 @@ export function registerAdminRoutes(
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id", async (request) => {
     await requireAdmin(db, config, request);
     const task = await db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
-      .select(["bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
+      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
     const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;

@@ -202,7 +202,8 @@ case "$COMMAND" in
       print -- "控制面：$(json_value "$STATUS_FILE" online false | sed 's/true/在线/;s/false/离线/')"
       print -- "运行模式：$(json_value "$STATUS_FILE" operationalMode unknown)"
       print -- "活跃任务：$(json_value "$STATUS_FILE" activeTasks 0)"
-      print -- "工作区：$(json_value "$STATUS_FILE" workspaceAliasesText '')"
+      print -- "总工作区：$(json_value "$STATUS_FILE" workspaceAliasesText '')"
+      print -- "专属目录：每个机器人使用 <总工作区>/<App ID>/"
       rm -f "$STATUS_FILE"; STATUS_FILE=""
     else
       print -- "控制面：无法连接"

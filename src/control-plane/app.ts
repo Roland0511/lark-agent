@@ -121,7 +121,7 @@ export function buildControlPlane(
       const claimed = await repository.claimTask(principal);
       if (claimed) {
         const conversation = await db.selectFrom("conversations").innerJoin("bots", "bots.id", "conversations.bot_id")
-          .select(["conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot", "bots.display_name"])
+          .select(["conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot", "bots.app_id", "bots.display_name"])
           .where("conversations.id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
         const signals = await repository.taskSignals(claimed.task.id);
         const previous = claimed.task.turn_index > 1
@@ -143,6 +143,7 @@ export function buildControlPlane(
         return reply.send({
           id: claimed.task.id,
           botId: claimed.task.bot_id,
+          botAppId: conversation.app_id,
           botDisplayName: conversation.display_name,
           roleInstructions: conversation.role_instructions_snapshot,
           botConfigRevision: conversation.bot_config_revision,
