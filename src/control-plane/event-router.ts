@@ -41,7 +41,10 @@ export class EventRouter {
       .selectAll()
       .where("deleted_at", "is", null)
       .execute();
-    let senderBot = registeredBots.find((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id) ?? null;
+    // open_id is scoped to the receiving application, so a peer bot's event
+    // sender_id cannot be compared with a single globally stored bot_open_id.
+    // Resolve bot senders from the canonical App ID returned by message details.
+    let senderBot = registeredBots.find((item) => item.app_id === event.sender_id) ?? null;
 
     const displayNameCounts = new Map<string, number>();
     for (const item of registeredBots) displayNameCounts.set(item.display_name, (displayNameCounts.get(item.display_name) ?? 0) + 1);
@@ -55,7 +58,7 @@ export class EventRouter {
     const canUseOwnerMentionFastPath = fastMentionedBotIds.size > 0;
     const details = canUseOwnerMentionFastPath ? null : await this.lark.getMessage(event.message_id);
     if (!senderBot && details?.senderType === "app") {
-      senderBot = registeredBots.find((item) => item.app_id === details.senderId || item.bot_open_id === details.senderId) ?? null;
+      senderBot = registeredBots.find((item) => item.app_id === details.senderId) ?? null;
     }
     if (senderBot?.id === this.bot.id) {
       await this.markDiscarded(event.event_id, event.type);
