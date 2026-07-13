@@ -1,0 +1,7 @@
+packages:
+  - .
+onlyBuiltDependencies:
+  - esbuild
+allowBuilds:
+  '@larksuite/cli': true
+  esbuild: true

@@ -1,0 +1,60 @@
+{
+  "name": "lark-agent",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.5.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && vite build && node scripts/copy-assets.mjs",
+    "build:runner": "node scripts/build-runner.mjs",
+    "publish:runner": "sh scripts/publish-runner.sh",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.admin.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev:control": "tsx src/control-plane/main.ts",
+    "dev:admin": "vite",
+    "dev:worker": "tsx src/worker/main.ts",
+    "start:control": "node dist/control-plane/main.js",
+    "start:worker": "node dist/worker/main.js",
+    "migrate": "tsx src/db/migrate.ts",
+    "init:lark-volume": "node scripts/init-lark-cli-volume.mjs",
+    "check:public": "sh scripts/check-public-safety.sh"
+  },
+  "dependencies": {
+    "@fastify/cookie": "^11.1.1",
+    "@fastify/static": "^9.3.0",
+    "@larksuite/cli": "1.0.61",
+    "@tanstack/react-query": "^5.101.2",
+    "fastify": "^5.6.2",
+    "jose": "^6.1.0",
+    "kysely": "^0.28.8",
+    "lucide-react": "^1.24.0",
+    "pg": "^8.16.3",
+    "prom-client": "^15.1.3",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "react-router-dom": "^7.18.1",
+    "smol-toml": "^1.7.0",
+    "yaml": "^2.8.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/node": "^24.10.0",
+    "@types/pg": "^8.15.6",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "esbuild": "^0.25.12",
+    "@vitejs/plugin-react": "^6.0.3",
+    "jsdom": "^29.1.1",
+    "pg-mem": "^3.0.5",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.4",
+    "vitest": "^4.0.8"
+  }
+}

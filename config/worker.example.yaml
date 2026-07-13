@@ -1,0 +1,19 @@
+control_plane:
+  url: "https://agent.example.internal"
+  device_token_file: "/absolute/path/to/Lark Agent Runner/mac-example/credentials"
+
+executor:
+  id: "mac-he-lark-agent"
+  display_name: "Mac · Lark Agent"
+  codex_home: "/absolute/path/to/codex-home"
+  codex_profile: "lark-agent"
+  codex_binary: "codex"
+  runner_version: "0.1.0"
+  capacity: 1
+  app_launcher: "/absolute/path/to/lark-agent/scripts/open-codex-app.sh"
+  capabilities:
+    - codex
+    - app_handoff
+  workspace_roots:
+    - alias: "artist-toolbox"
+      path: "/absolute/path/to/workspace"

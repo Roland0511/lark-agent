@@ -1,0 +1,12 @@
+node_modules
+dist
+admin-dist
+coverage
+.git
+.env
+.env.*
+.private
+artifacts
+*.log
+screenlog.*
+config/worker.local.yaml

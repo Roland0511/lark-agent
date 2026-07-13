@@ -1,0 +1,73 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: lark_agent
+      POSTGRES_USER: lark_agent
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lark_agent -d lark_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  control:
+    build: .
+    environment:
+      HOST: 0.0.0.0
+      PORT: 3000
+      DATABASE_URL: postgresql://lark_agent:${POSTGRES_PASSWORD}@postgres:5432/lark_agent
+      SESSION_SIGNING_SECRET: ${SESSION_SIGNING_SECRET}
+      OWNER_OPEN_ID: ${OWNER_OPEN_ID}
+      BOT_APP_ID: ${BOT_APP_ID}
+      AGENT_DISPLAY_NAME: ${AGENT_DISPLAY_NAME:-Lark Agent}
+      ADMIN_ORIGIN: ${ADMIN_ORIGIN:-https://${AGENT_DOMAIN}}
+      ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}
+      ADMIN_IDLE_MINUTES: ${ADMIN_IDLE_MINUTES:-120}
+      METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:-}
+      ALERTS_ENABLED: ${ALERTS_ENABLED:-true}
+      WHITELIST_CHAT_IDS: ${WHITELIST_CHAT_IDS:-}
+      LARK_ENABLED: ${LARK_ENABLED:-false}
+      LARK_CARD_ACTIONS_ENABLED: ${LARK_CARD_ACTIONS_ENABLED:-false}
+      LARK_CLI_PATH: lark-cli
+      MESSAGE_RETENTION_DAYS: ${MESSAGE_RETENTION_DAYS:-30}
+      TRACE_RETENTION_DAYS: ${TRACE_RETENTION_DAYS:-180}
+      RUNNER_ARTIFACT_PUBLIC_BASE_URL: ${RUNNER_ARTIFACT_PUBLIC_BASE_URL:?RUNNER_ARTIFACT_PUBLIC_BASE_URL is required}
+      RUNNER_MANIFEST_REFRESH_SECONDS: ${RUNNER_MANIFEST_REFRESH_SECONDS:-300}
+    volumes:
+      - lark_cli_config:/home/agent/.lark-cli
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/readyz').then(r=>{if(!r.ok)process.exit(1)})"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2.10-alpine
+    environment:
+      AGENT_DOMAIN: ${AGENT_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      control:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles: ["proxy"]
+
+volumes:
+  postgres_data:
+  lark_cli_config:
+  caddy_data:
+  caddy_config:

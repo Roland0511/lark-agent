@@ -1,0 +1,4 @@
+services:
+  control:
+    ports:
+      - "${CONTROL_BIND_ADDRESS:-127.0.0.1}:${CONTROL_PORT:-3000}:3000"

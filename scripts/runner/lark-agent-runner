@@ -1,0 +1,256 @@
+#!/bin/zsh
+set -euo pipefail
+
+readonly INSTALL_ROOT="$HOME/Library/Application Support/Lark Agent Runner"
+readonly ENTRYPOINT="$HOME/.local/bin/lark-agent-runner"
+
+fail() { print -u2 -- "错误：$*"; exit 1; }
+warn() { print -u2 -- "警告：$*"; }
+
+usage() {
+  cat <<'EOF'
+lark-agent-runner - 管理本机 Lark Agent 执行器
+
+用法：
+  lark-agent-runner help
+  lark-agent-runner list
+  lark-agent-runner status [executor-id]
+  lark-agent-runner start [executor-id]
+  lark-agent-runner stop [executor-id] [--force]
+  lark-agent-runner restart [executor-id] [--force]
+  lark-agent-runner logs [executor-id] [--lines <数量>] [--no-follow]
+  lark-agent-runner uninstall [executor-id]
+
+说明：
+  - 本机只有一个执行器时，可以省略 executor-id。
+  - 同机存在多个执行器时，交互终端可选择，也可以显式指定 ID。
+  - stop 会持久禁用 launchd 服务，重启或重新登录后也不会自动恢复。
+  - stop/restart 遇到活跃任务时会拒绝；--force 会直接中断当前任务。
+  - start 只启动本机进程，不会覆盖后台设置的维护或停用模式。
+  - uninstall 会撤销设备凭据并删除本机文件，但后台保留历史记录。
+
+示例：
+  lark-agent-runner status mac-example
+  lark-agent-runner logs mac-example --lines 200 --no-follow
+  lark-agent-runner stop mac-example
+
+安装目录：~/Library/Application Support/Lark Agent Runner/
+日志目录：每个执行器安装目录下的 logs/
+EOF
+}
+
+service_loaded() {
+  launchctl print "gui/$UID/$1" >/dev/null 2>&1
+}
+
+service_disabled() {
+  launchctl print-disabled "gui/$UID" 2>/dev/null | grep -Eq '"'"$1"'" => (true|disabled)'
+}
+
+installed_dirs() {
+  local item
+  for item in "$INSTALL_ROOT"/*(N/); do
+    [[ -f "$item/installation.env" && -f "$item/config.yaml" ]] && print -r -- "$item"
+  done
+}
+
+select_install() {
+  local requested="${1:-}"
+  typeset -a installs
+  installs=(${(f)"$(installed_dirs)"})
+  (( ${#installs} > 0 )) || fail "没有找到已安装的执行器"
+  if [[ -n "$requested" ]]; then
+    [[ -d "$INSTALL_ROOT/$requested" && -f "$INSTALL_ROOT/$requested/installation.env" ]] || fail "执行器不存在：$requested"
+    print -r -- "$INSTALL_ROOT/$requested"
+    return
+  fi
+  if (( ${#installs} == 1 )); then
+    print -r -- "$installs[1]"
+    return
+  fi
+  [[ -r /dev/tty ]] || fail "检测到多个执行器，请显式指定 executor-id"
+  print -u2 -- "检测到多个执行器："
+  local index=1 item choice
+  for item in "${installs[@]}"; do print -u2 -- "  $index) ${item:t}"; (( index++ )); done
+  print -n -u2 -- "请选择序号："
+  read choice < /dev/tty
+  [[ "$choice" == <-> && "$choice" -ge 1 && "$choice" -le ${#installs} ]] || fail "选择无效"
+  print -r -- "$installs[$choice]"
+}
+
+load_install() {
+  INSTALL_DIR="$1"
+  [[ -f "$INSTALL_DIR/installation.env" && -f "$INSTALL_DIR/credentials" ]] || fail "安装目录不完整：${INSTALL_DIR:t}"
+  source "$INSTALL_DIR/installation.env"
+  CREDENTIAL="$(<"$INSTALL_DIR/credentials")"
+  [[ -n "$CREDENTIAL" ]] || fail "设备凭据为空：${INSTALL_DIR:t}"
+}
+
+api_request() {
+  local method="$1" route="$2" output="$3"
+  curl -fsS --connect-timeout 5 --max-time 15 --config - -X "$method" -o "$output" <<EOF
+header = "Authorization: Bearer $CREDENTIAL"
+url = "$CONTROL_PLANE_URL$route"
+EOF
+}
+
+fetch_status() {
+  STATUS_FILE="$(mktemp -t lark-agent-runner-status).json"
+  if ! api_request GET "/v1/runner/status/$EXECUTOR_ID" "$STATUS_FILE"; then
+    rm -f "$STATUS_FILE"
+    STATUS_FILE=""
+    return 1
+  fi
+}
+
+json_value() {
+  /usr/bin/plutil -extract "$2" raw -o - "$1" 2>/dev/null || print -r -- "${3:-}"
+}
+
+assert_safe_to_interrupt() {
+  [[ "${FORCE:-false}" == true ]] && return
+  fetch_status || fail "无法连接控制面确认活跃任务；如需强制操作请增加 --force"
+  local active
+  active="$(json_value "$STATUS_FILE" activeTasks 0)"
+  rm -f "$STATUS_FILE"; STATUS_FILE=""
+  (( active == 0 )) || fail "执行器仍有 $active 个活跃任务，请等待完成；如需中断请增加 --force"
+}
+
+wait_online() {
+  local attempt
+  for attempt in {1..30}; do
+    if fetch_status; then
+      local online
+      online="$(json_value "$STATUS_FILE" online false)"
+      rm -f "$STATUS_FILE"; STATUS_FILE=""
+      [[ "$online" == true ]] && return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+start_service() {
+  launchctl enable "gui/$UID/$LAUNCHD_LABEL"
+  if ! service_loaded "$LAUNCHD_LABEL"; then
+    launchctl bootstrap "gui/$UID" "$PLIST_PATH"
+  fi
+  launchctl kickstart -k "gui/$UID/$LAUNCHD_LABEL"
+}
+
+stop_service() {
+  launchctl disable "gui/$UID/$LAUNCHD_LABEL"
+  launchctl bootout "gui/$UID" "$PLIST_PATH" >/dev/null 2>&1 || true
+}
+
+COMMAND="${1:-help}"
+shift || true
+case "$COMMAND" in
+  help|--help|-h) usage; exit 0 ;;
+  list)
+    (( $# == 0 )) || fail "list 不接受参数"
+    typeset -a installs
+    installs=(${(f)"$(installed_dirs)"})
+    (( ${#installs} > 0 )) || fail "没有找到已安装的执行器"
+    printf '%-38s %-12s %-12s\n' "EXECUTOR ID" "VERSION" "LOCAL STATE"
+    local item version label local_state
+    for item in "${installs[@]}"; do
+      source "$item/installation.env"
+      version="$(<"$item/current/VERSION" 2>/dev/null || print unknown)"
+      if service_loaded "$LAUNCHD_LABEL"; then local_state="running"
+      elif service_disabled "$LAUNCHD_LABEL"; then local_state="stopped"
+      else local_state="not-loaded"; fi
+      printf '%-38s %-12s %-12s\n' "$EXECUTOR_ID" "$version" "$local_state"
+    done
+    exit 0
+    ;;
+  status|start|stop|restart|logs|uninstall) ;;
+  *) print -u2 -- "未知命令：$COMMAND"; print -u2 -- "请运行 lark-agent-runner help 查看可用命令。"; exit 2 ;;
+esac
+
+EXECUTOR_ARG=""
+FORCE=false
+LINES=100
+FOLLOW=true
+while (( $# )); do
+  case "$1" in
+    --force) FORCE=true; shift ;;
+    --lines) [[ "${2:-}" == <-> ]] || fail "--lines 需要正整数"; LINES="$2"; shift 2 ;;
+    --no-follow) FOLLOW=false; shift ;;
+    -*) fail "未知参数：$1" ;;
+    *) [[ -z "$EXECUTOR_ARG" ]] || fail "只能指定一个 executor-id"; EXECUTOR_ARG="$1"; shift ;;
+  esac
+done
+[[ "$COMMAND" == logs || "$LINES" == 100 ]] || fail "--lines 仅适用于 logs"
+[[ "$COMMAND" == logs || "$FOLLOW" == true ]] || fail "--no-follow 仅适用于 logs"
+[[ "$COMMAND" == stop || "$COMMAND" == restart || "$FORCE" == false ]] || fail "--force 仅适用于 stop 或 restart"
+
+INSTALL_DIR="$(select_install "$EXECUTOR_ARG")"
+load_install "$INSTALL_DIR"
+trap '[[ -z "${STATUS_FILE:-}" ]] || rm -f "$STATUS_FILE"' EXIT INT TERM
+
+case "$COMMAND" in
+  status)
+    if service_loaded "$LAUNCHD_LABEL"; then LOCAL_STATE="运行中"
+    elif service_disabled "$LAUNCHD_LABEL"; then LOCAL_STATE="已停止（持久）"
+    else LOCAL_STATE="未加载"; fi
+    print -- "执行器：$EXECUTOR_ID"
+    print -- "本机服务：$LOCAL_STATE"
+    print -- "Runner：$(<"$INSTALL_DIR/current/VERSION" 2>/dev/null || print unknown)"
+    print -- "Profile：$(sed -n "s/^  codex_profile: '\(.*\)'$/\1/p" "$INSTALL_DIR/config.yaml" | head -1)"
+    if fetch_status; then
+      print -- "控制面：$(json_value "$STATUS_FILE" online false | sed 's/true/在线/;s/false/离线/')"
+      print -- "运行模式：$(json_value "$STATUS_FILE" operationalMode unknown)"
+      print -- "活跃任务：$(json_value "$STATUS_FILE" activeTasks 0)"
+      print -- "工作区：$(json_value "$STATUS_FILE" workspaceAliasesText '')"
+      rm -f "$STATUS_FILE"; STATUS_FILE=""
+    else
+      print -- "控制面：无法连接"
+    fi
+    ;;
+  start)
+    start_service
+    wait_online || fail "服务已启动，但未在 30 秒内向控制面上线；请运行 lark-agent-runner logs $EXECUTOR_ID"
+    print -- "执行器 $EXECUTOR_ID 已启动并连接控制面。"
+    ;;
+  stop)
+    assert_safe_to_interrupt
+    stop_service
+    print -- "执行器 $EXECUTOR_ID 已持久停止。运行 start 才会恢复。"
+    ;;
+  restart)
+    assert_safe_to_interrupt
+    launchctl bootout "gui/$UID" "$PLIST_PATH" >/dev/null 2>&1 || true
+    start_service
+    wait_online || fail "服务已重启，但未在 30 秒内向控制面上线；请查看日志"
+    print -- "执行器 $EXECUTOR_ID 已重启。"
+    ;;
+  logs)
+    typeset -a tail_args log_files
+    tail_args=(-n "$LINES")
+    [[ "$FOLLOW" == true ]] && tail_args+=(-F)
+    log_files=("$INSTALL_DIR/logs/worker.log" "$INSTALL_DIR/logs/worker.err.log")
+    touch "${log_files[@]}"
+    tail "${tail_args[@]}" "${log_files[@]}"
+    ;;
+  uninstall)
+    fetch_status || fail "无法连接控制面，未执行卸载，以免留下有效设备凭据"
+    active="$(json_value "$STATUS_FILE" activeTasks 0)"
+    rm -f "$STATUS_FILE"; STATUS_FILE=""
+    (( active == 0 )) || fail "执行器仍有 $active 个活跃任务，完成后再卸载"
+    response="$(mktemp -t lark-agent-runner-uninstall).json"
+    if ! api_request DELETE "/v1/runner/credentials/current" "$response"; then
+      rm -f "$response"
+      fail "控制面未确认凭据撤销，未执行本机清理"
+    fi
+    rm -f "$response"
+    stop_service
+    rm -f "$PLIST_PATH"
+    rm -rf "$INSTALL_DIR"
+    if [[ -z "$(installed_dirs)" ]]; then
+      rm -f "$ENTRYPOINT"
+      rm -rf "$INSTALL_ROOT/bin"
+    fi
+    print -- "执行器 $EXECUTOR_ID 已卸载，设备凭据已撤销；后台历史记录已保留。"
+    ;;
+esac

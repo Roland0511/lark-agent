@@ -1,0 +1,147 @@
+# Lark Agent
+
+Lark Agent 是一个自托管的飞书消息 Agent 控制面。它通过飞书长连接接收消息，把信号送入 Agent 收件箱，再由固定绑定 `CODEX_HOME + profile` 的 macOS Runner 调用 Codex App Server 完成任务，并把回复发送回原私聊或群聊主消息流。
+
+项目包含：
+
+- Fastify + PostgreSQL 控制面，不依赖 Redis。
+- React 运维后台，可查看消息、Signal、注意力判断、Codex、草稿和发件箱的完整数据流。
+- 基于 `lark-cli event consume` 的飞书长连接，不要求公网事件回调地址。
+- GitLab Runner 式的一次性设备注册与 macOS `launchd` 常驻运行。
+- 每个 Runner 固定绑定 Codex Home、profile 和工作区，任务不会静默迁移。
+- CardKit 单消息流式回复、草稿新鲜度检查、幂等发件箱和故障诊断。
+
+## 架构
+
+```mermaid
+flowchart LR
+  F["飞书消息"] --> I["事件入口"]
+  I --> B["Agent 收件箱"]
+  B --> A["注意力判断"]
+  A --> Q["任务路由"]
+  Q --> W["macOS Runner"]
+  W --> C["Codex App Server"]
+  C --> D["草稿检查"]
+  D --> O["发件箱"]
+  O --> F
+```
+
+## 要求
+
+- Node.js 22 或更高版本，pnpm 11。
+- Docker 与 Docker Compose。
+- 飞书自建应用及 Bot 凭据。
+- 运行 Runner 的 macOS，已安装并配置 Codex CLI。
+- 可供目标 Mac 下载 Runner 产物的 HTTP(S) 地址。
+
+## 本地启动
+
+```bash
+cp .env.example .env
+pnpm install
+pnpm build
+docker compose up -d postgres control
+```
+
+如需由 Compose 暴露控制面端口：
+
+```bash
+docker compose -f compose.yaml -f compose.host.yaml up -d postgres control
+```
+
+如需同时运行示例 Caddy 入口：
+
+```bash
+docker compose --profile proxy up -d
+```
+
+首次启用飞书前，使用 App Secret 初始化独立的 `lark-cli` volume：
+
+```bash
+pnpm init:lark-volume
+```
+
+该脚本只在初始化阶段读取 `.env` 中的 `BOT_APP_SECRET`。长期运行的 `control` 容器不接收 App Secret。
+
+## 飞书配置
+
+至少订阅 `im.message.receive_v1`，并为机器人配置读取与发送消息所需权限。流式回复还需要 `cardkit:card:write`。卡片按钮回调是可选能力，可通过 `LARK_CARD_ACTIONS_ENABLED` 单独启用。
+
+私聊机器人发送：
+
+```text
+/帮助
+/连接控制台
+```
+
+`/连接控制台` 会返回一条两分钟有效、只能使用一次的身份确认链接。后台只接受 `OWNER_OPEN_ID` 对应的飞书身份。
+
+## 添加 Runner
+
+在后台“执行器”页面生成一次性安装指令。指令会包含控制面地址、十分钟有效的注册令牌和 Runner 产物地址：
+
+```bash
+curl -fsSL 'https://cdn.example.com/lark-agent/runner/install.sh' \
+  | /bin/zsh -s -- \
+    --artifact-base 'https://cdn.example.com/lark-agent' \
+    --server 'https://agent.example.com' \
+    --token '<one-time-token>'
+```
+
+安装器支持 macOS Apple Silicon 和 Intel，默认发现 `~/.codex`，优先选择 `he` profile，并将当前目录作为第一个工作区。安装后使用：
+
+```bash
+lark-agent-runner help
+lark-agent-runner status <executor-id>
+lark-agent-runner stop <executor-id>
+lark-agent-runner start <executor-id>
+lark-agent-runner logs <executor-id>
+```
+
+Runner 安装在 `~/Library/Application Support/Lark Agent Runner/`，设备凭据只保存在目标 Mac，控制面只保存哈希。
+
+## 发布 Runner
+
+发布机需要在环境中提供：
+
+```text
+RUNNER_ARTIFACT_PUBLIC_BASE_URL
+RUNNER_ARTIFACT_RSYNC_TARGET
+RUNNER_ARTIFACT_RSYNC_PASSWORD_FILE
+```
+
+密码文件必须为 `600`，不得提交到 Git。先做本地构建：
+
+```bash
+pnpm publish:runner --dry-run
+```
+
+正式发布会先上传不可变版本产物，从 CDN 回读校验 SHA-256，最后才更新 `manifest.json`：
+
+```bash
+pnpm publish:runner
+```
+
+## 开发验证
+
+```bash
+pnpm check:public
+pnpm typecheck
+TEST_DATABASE_URL=postgresql://... pnpm test
+pnpm build
+docker compose --env-file .env.example config --quiet
+```
+
+## 安全
+
+- `.env`、`.private/`、设备凭据、日志和构建产物均被 Git 忽略。
+- 控制面不会保存 Runner 的本机绝对路径，只保存工作区别名与配置指纹。
+- 飞书消息不能覆盖 Runner 的 `CODEX_HOME`、profile 或工作区。
+- 公开发布前运行 `pnpm check:public`，并建议额外使用 secret scanner 扫描。
+- 生产部署应限制控制台、PostgreSQL、指标和 Runner CDN 的网络访问范围。
+
+更多信息见 [SECURITY.md](SECURITY.md)。
+
+## License
+
+[MIT](LICENSE)
