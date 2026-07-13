@@ -2,7 +2,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { CodexAdapter } from "./codex-adapter.js";
+import { buildAttentionPrompt, CodexAdapter } from "./codex-adapter.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 
 async function fakeCodexConfig(): Promise<ResolvedWorkerConfig> {
@@ -80,6 +80,18 @@ rl.on('line', (line) => {
 }
 
 describe("CodexAdapter", () => {
+  it("treats a registered bot handing over the next turn as actionable input", () => {
+    const prompt = buildAttentionPrompt(
+      "当前机器人：Bot A\n上一回合等待理由：等待 Bot B 接龙后继续",
+      "[bot:Bot B|member|depth=1] 现在轮到 Bot A 数 2，Bot B 先等着"
+    );
+    expect(prompt).toContain("已注册机器人的最终回复与人类成员消息完全等价");
+    expect(prompt).toContain("说明轮到当前机器人");
+    expect(prompt).toContain("必须选择 consume 或 merge");
+    expect(prompt).toContain("当前机器人：Bot A");
+    expect(prompt).toContain("[bot:Bot B|member|depth=1]");
+  });
+
   it("starts app-server with fixed profile overrides and supports persistent and attention turns", async () => {
     const config = await fakeCodexConfig();
     const commentary: string[] = [];

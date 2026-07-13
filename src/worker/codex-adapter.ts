@@ -127,12 +127,7 @@ export class CodexAdapter {
     const threadId = await this.startEphemeralThread(cwd, policy.model);
     const result = await this.runTurn(
       threadId,
-      [
-        "你是消息注意力控制器。不要执行任务，只判断新信号是否值得进入主工作线程。",
-        `当前任务摘要：${taskSummary}`,
-        `新信号预览：${signalPreview}`,
-        "选择 consume、defer、dismiss 或 merge，并给出 0-100 优先级和简短理由。"
-      ].join("\n"),
+      buildAttentionPrompt(taskSummary, signalPreview),
       { model: policy.model, effort: policy.effort, outputSchema: {
         type: "object",
         additionalProperties: false,
@@ -319,6 +314,18 @@ export class CodexAdapter {
     this.collector = null;
     this.child = null;
   }
+}
+
+export function buildAttentionPrompt(taskSummary: string, signalPreview: string): string {
+  return [
+    "你是消息注意力控制器。不要执行任务，只判断新信号是否值得进入主工作线程。",
+    "已注册机器人的最终回复与人类成员消息完全等价；不得仅因来源是 bot、像状态提示或符合先前预期而忽略。",
+    "若信号明确点名当前机器人、说明轮到当前机器人、要求当前机器人行动，或给出接龙/协作所需的新一步，必须选择 consume 或 merge。协作方把下一轮交给当前机器人属于新的可执行输入，不是重复消息。",
+    "只有与当前会话无关，或对后续行为确实没有任何新增影响的信号，才可以 dismiss。",
+    `当前任务摘要：${taskSummary}`,
+    `新信号预览：${signalPreview}`,
+    "选择 consume、defer、dismiss 或 merge，并给出 0-100 优先级和简短理由。"
+  ].join("\n");
 }
 
 function messagePhase(value: unknown): "commentary" | "final_answer" | null {

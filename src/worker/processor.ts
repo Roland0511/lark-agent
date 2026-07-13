@@ -98,7 +98,7 @@ export class TaskProcessor {
             try {
               attention = await this.codex.attention(
                 workspace.path,
-                [`飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
+                [`当前机器人：${task.botDisplayName}`, `飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
                 signal.senderType === "bot"
                   ? `[bot:${signal.senderDisplayName ?? signal.senderId}|member|depth=${signal.botDialogueDepth}] ${signal.preview}`
                   : `[user:${signal.senderRole}] ${signal.preview}`,
