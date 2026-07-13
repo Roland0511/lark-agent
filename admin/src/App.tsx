@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { useMutation, useQuery, type QueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Activity, AlertTriangle, ArrowRight, Bot, CheckCircle2, ChevronRight, CircleGauge, Clock3, FileClock, Inbox,
@@ -194,6 +194,7 @@ function TaskDetail({ user }: { user: AdminUser }) {
 }
 
 function Workers({ user }: { user: AdminUser }) {
+  const queryClient = useQueryClient();
   const workers = useQuery({ queryKey: ["worker"], queryFn: () => api<AnyRecord>("/v1/admin/workers") });
   const release = useQuery({ queryKey: ["runner-release"], queryFn: () => api<AnyRecord>("/v1/admin/runner-release"), refetchInterval: 300_000 });
   const enrollments = useQuery({ queryKey: ["worker-enrollments"], queryFn: () => api<AnyRecord>("/v1/admin/worker-enrollments") });
@@ -202,7 +203,11 @@ function Workers({ user }: { user: AdminUser }) {
   const upgradeCommand = release.data?.installUrl && release.data?.publicBaseUrl ? `curl -fsSL '${release.data.installUrl}' | /bin/zsh -s -- --artifact-base '${release.data.publicBaseUrl}' --upgrade` : null;
   const recommendedVersion = release.data?.recommendedVersion as string | null | undefined;
   const recentEnrollments = enrollments.data?.items?.slice(0, 8) ?? [];
-  return <><PageTitle eyebrow="本地能力" title="执行器" description="通过一次性注册指令挂载 Mac；每个实例固定绑定一组 Codex Home 与 Profile。" action={<button className="primary-button" disabled={release.data?.source === "unavailable"} onClick={() => setAdding(true)}><Plus size={17} />添加执行器</button>} />
+  const openEnrollment = () => {
+    queryClient.removeQueries({ queryKey: ["new-worker-enrollment"] });
+    setAdding(true);
+  };
+  return <><PageTitle eyebrow="本地能力" title="执行器" description="通过一次性注册指令挂载 Mac；每个实例固定绑定一组 Codex Home 与 Profile。" action={<button className="primary-button" disabled={release.data?.source === "unavailable"} onClick={openEnrollment}><Plus size={17} />添加执行器</button>} />
     {release.data?.source === "unavailable" && <div className="inline-alert"><AlertTriangle size={17} />Runner CDN manifest 当前不可用，暂时不能生成可靠的安装指令。</div>}
     <div className="card-grid">{workers.data?.items.map((worker: AnyRecord) => { const updateAvailable = Boolean(recommendedVersion && worker.runner_version && recommendedVersion !== worker.runner_version); const managementAvailable = Boolean(recommendedVersion && worker.runner_version === recommendedVersion); return <article className="worker-card" key={worker.executor_id}><div className="worker-card-top"><div className="machine-icon"><Server /></div><div><h3>{worker.display_name}</h3><p>{worker.executor_id}</p></div><StateBadge state={worker.operational_mode !== "enabled" ? worker.operational_mode : worker.availability} /></div><div className="worker-health"><div><span>最近心跳</span><strong>{relativeTime(worker.last_seen_at)}</strong></div><div><span>当前任务</span><strong>{worker.activeTasks}</strong></div><div><span>容量</span><strong>{worker.capacity}</strong></div></div><dl className="detail-list"><Detail label="Profile" value={worker.codex_profile} /><Detail label="Codex 版本" value={worker.codex_version} /><Detail label="Runner" value={worker.runner_version ? `${worker.runner_version}${updateAvailable ? `（可升级至 ${recommendedVersion}）` : "（最新）"}` : "版本未知"} /><Detail label="架构" value={worker.architecture} /><Detail label="注册方式" value={worker.registration_source === "quick_install" ? "快速注册" : "尚未通过设备注册"} /><Detail label="设备凭据" value={worker.credentialActive ? `有效 · ${relativeTime(worker.credentialLastUsedAt)}` : "未注册或已撤销"} /><Detail label="工作区" value={worker.workspace_aliases.join("、")} /><Detail label="能力" value={worker.capabilities.join("、")} /></dl><RunnerManagement worker={worker} available={managementAvailable} upgradeCommand={updateAvailable && upgradeCommand ? `${upgradeCommand} --executor-id '${worker.executor_id}'` : null} /><div className="card-actions">{updateAvailable && upgradeCommand && <CopyButton value={`${upgradeCommand} --executor-id '${worker.executor_id}'`} label="复制升级指令" />}{worker.operational_mode === "enabled" ? <button className="secondary-button" onClick={() => setTarget({ worker, command: "maintenance" })}>进入维护</button> : <button className="secondary-button" disabled={!worker.credentialActive} onClick={() => setTarget({ worker, command: "enable" })}>重新启用</button>}{worker.operational_mode !== "disabled" && <button className="danger-button" onClick={() => setTarget({ worker, command: "disable" })}>停用</button>}{worker.credentialActive && <button className="danger-button" onClick={() => setTarget({ worker, command: "revoke_credentials" })}>撤销凭据</button>}{worker.operational_mode === "disabled" && <button className="danger-button" onClick={() => setTarget({ worker, command: "delete" })}><Trash2 size={16} />删除</button>}</div></article>; }) ?? <PageLoading />}</div>
     {recentEnrollments.length > 0 && <section className="panel enrollment-history"><PanelHead title="最近注册指令" subtitle="令牌只保存哈希，原始安装指令仅在创建时显示" /><div className="stack-list">{recentEnrollments.map((item: AnyRecord) => <div className="enrollment-row" key={item.id}><code>{shortId(item.id)}</code><span className={`state-badge state-${item.state}`}>{({ pending: "待使用", used: "已使用", expired: "已过期", revoked: "已撤销" } as AnyRecord)[item.state] ?? item.state}</span><span>{item.executorId ?? "尚未使用"}</span><time>{relativeTime(item.createdAt)}</time></div>)}</div></section>}
@@ -216,7 +221,15 @@ function RunnerManagement({ worker, available, upgradeCommand }: { worker: AnyRe
 }
 
 function EnrollmentDialog({ user, onClose }: { user: AdminUser; onClose(): void }) {
-  const enrollment = useQuery({ queryKey: ["new-worker-enrollment"], queryFn: () => api<AnyRecord>("/v1/admin/worker-enrollments", { method: "POST" }, user), staleTime: Infinity, retry: false });
+  const enrollment = useQuery({
+    queryKey: ["new-worker-enrollment"],
+    queryFn: () => api<AnyRecord>("/v1/admin/worker-enrollments", { method: "POST" }, user),
+    staleTime: Infinity,
+    retry: false,
+    refetchInterval: false,
+    refetchOnWindowFocus: false,
+    refetchOnReconnect: false
+  });
   return <Modal title="添加 Mac 执行器" onClose={onClose}>{enrollment.isLoading ? <PageLoading compact /> : enrollment.error ? <ErrorBox error={enrollment.error} /> : <div className="enrollment-dialog"><p>在目标 Mac 的工作区目录执行下面这条命令。安装器会检查 Codex、选择 Profile，并安装独立 Node 运行时和 launchd 服务。</p><pre>{enrollment.data?.command}</pre><div className="enrollment-expiry"><Clock3 size={15} />该指令将在 {new Date(enrollment.data?.expiresAt).toLocaleTimeString("zh-CN")} 失效，且只能使用一次。</div><div className="modal-actions"><button className="ghost-button" onClick={onClose}>关闭</button><CopyButton value={enrollment.data?.command ?? ""} label="复制安装指令" primary /></div></div>}</Modal>;
 }
 
