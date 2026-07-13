@@ -1359,6 +1359,41 @@ td small {
   margin-top: 14px;
 }
 
+.bot-routing-note {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 14px 16px;
+  border: 1px solid #cfe0ff;
+  border-radius: 12px;
+  background: #f4f8ff;
+  color: var(--blue);
+}
+.bot-routing-note div { display: flex; flex-direction: column; gap: 3px; }
+.bot-routing-note strong { font-size: 12px; }
+.bot-routing-note span { color: #617493; font-size: 11px; line-height: 1.5; }
+.bot-badges { display: flex; gap: 7px; flex-wrap: wrap; margin: 15px 0; }
+.bot-badges span { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; background: #edf3ff; color: #3c64a6; padding: 5px 8px; font-size: 9px; font-weight: 700; }
+.bot-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; margin: 16px 0; }
+.bot-form label { display: flex; flex-direction: column; gap: 6px; color: #5b6b80; font-size: 11px; font-weight: 700; }
+.bot-form label.span-2 { grid-column: 1 / -1; }
+.bot-form select { border: 1px solid var(--line); border-radius: 9px; padding: 10px 12px; background: #fff; color: #35465d; }
+.bot-settings-section { margin: 14px 0; padding: 13px; border: 1px solid var(--line); border-radius: 11px; background: #fafbfc; }
+.bot-settings-section > strong { font-size: 12px; color: #273a52; }
+.bot-settings-section > p { margin: 6px 0 10px; color: var(--muted); font-size: 10px; }
+.binding-command { display: flex; align-items: center; gap: 8px; margin-top: 9px; }
+.binding-command code { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; background: #142238; color: #e8f0ff; border-radius: 8px; padding: 10px; font-size: 10px; }
+.chat-checklist { max-height: 220px; overflow: auto; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 10px; }
+.chat-checklist label { display: flex; align-items: center; gap: 8px; padding: 9px; background: #fff; border: 1px solid var(--line); border-radius: 9px; }
+.chat-checklist label > span { min-width: 0; }
+.chat-checklist strong,.chat-checklist small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-checklist strong { font-size: 10px; }
+.chat-checklist small { color: var(--muted); font-size: 8px; margin-top: 2px; }
+.inline-field { display: flex; gap: 8px; margin-top: 9px; }
+.inline-field input { flex: 1; }
+.bot-control-row { display: flex; gap: 8px; flex-wrap: wrap; margin: 16px 0; padding-top: 14px; border-top: 1px solid var(--line); }
+
 .runner-management {
   margin-top: 16px;
   padding: 13px 14px;
@@ -1690,7 +1725,9 @@ td small {
 .modal {
   background: #fff;
   border-radius: 16px;
-  width: min(470px, 100%);
+  width: min(720px, 100%);
+  max-height: calc(100vh - 40px);
+  overflow: auto;
   padding: 22px;
   box-shadow: 0 22px 80px #07101f44;
 }

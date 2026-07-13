@@ -9,6 +9,10 @@ export interface CommandResult {
 }
 
 export async function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv = process.env): Promise<CommandResult> {
+  return runCommandWithInput(command, args, undefined, env);
+}
+
+export async function runCommandWithInput(command: string, args: string[], input?: string, env: NodeJS.ProcessEnv = process.env): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env: {
@@ -16,7 +20,7 @@ export async function runCommand(command: string, args: string[], env: NodeJS.Pr
         LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
         LARKSUITE_CLI_NO_SKILLS_NOTIFIER: "1"
       },
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["pipe", "pipe", "pipe"]
     });
     let stdout = "";
     let stderr = "";
@@ -26,6 +30,7 @@ export async function runCommand(command: string, args: string[], env: NodeJS.Pr
     child.stderr.on("data", (chunk: string) => (stderr += chunk));
     child.once("error", reject);
     child.once("close", (code) => resolve({ stdout, stderr, exitCode: code ?? -1 }));
+    child.stdin.end(input);
   });
 }
 
@@ -74,13 +79,15 @@ export class NdjsonConsumer {
     private readonly eventKey: string,
     private readonly onEvent: (event: unknown) => Promise<void>,
     private readonly onReady: (eventKey: string) => void,
-    private readonly onError: (error: Error) => void
+    private readonly onError: (error: Error) => void,
+    private readonly profileName?: string | null
   ) {}
 
   start(): void {
     if (this.child) return;
     this.stopping = false;
-    const child = spawn(this.command, ["event", "consume", this.eventKey, "--as", "bot"], {
+    const args = [...(this.profileName ? ["--profile", this.profileName] : []), "event", "consume", this.eventKey, "--as", "bot"];
+    const child = spawn(this.command, args, {
       env: {
         ...process.env,
         LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",

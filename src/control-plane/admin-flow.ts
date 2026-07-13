@@ -17,6 +17,7 @@ interface FlowQuery {
   chat_type?: string;
   executor?: string;
   workspace?: string;
+  bot?: string;
   q?: string;
   before?: string;
   limit?: string;
@@ -108,43 +109,46 @@ export function registerAdminFlowRoutes(
     const limit = Math.min(Math.max(Number(request.query.limit ?? 40), 1), 100);
     const start = since(request.query.range);
     if (view === "inbox") {
-      let query = db.selectFrom("signals").innerJoin("tasks", "tasks.id", "signals.task_id").innerJoin("conversations", "conversations.id", "signals.conversation_id")
-        .select(["signals.id", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.message_type", "signals.content", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
+      let query = db.selectFrom("signals").innerJoin("tasks", "tasks.id", "signals.task_id").innerJoin("conversations", "conversations.id", "signals.conversation_id").innerJoin("bots", "bots.id", "signals.bot_id")
+        .select(["signals.id", "signals.bot_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.message_type", "signals.content", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
         .orderBy(sql`CASE WHEN signals.decision IN ('pending','defer') THEN 0 ELSE 1 END`).orderBy("signals.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("signals.created_at", ">=", start);
       if (request.query.state) query = query.where("signals.decision", "=", request.query.state);
       if (request.query.chat_type) query = query.where("conversations.chat_type", "=", request.query.chat_type);
       if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
       if (request.query.workspace) query = query.where("tasks.resolved_workspace_alias", "=", request.query.workspace);
+      if (request.query.bot) query = query.where("signals.bot_id", "=", request.query.bot);
       if (request.query.q) query = query.where("signals.content", "ilike", `%${request.query.q.replace(/[%_]/g, "")}%`);
       if (request.query.before) query = query.where("signals.created_at", "<", new Date(request.query.before));
       const rows = await query.execute();
       return { items: rows.slice(0, limit).map((row) => ({ ...row, created_at: iso(row.created_at), decided_at: iso(row.decided_at), decisionSeconds: elapsed(row.created_at, row.decided_at), enteredCodex: Boolean(row.codex_thread_id) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
     if (view === "outbox") {
-      let query = db.selectFrom("outbox_messages").innerJoin("tasks", "tasks.id", "outbox_messages.task_id").innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+      let query = db.selectFrom("outbox_messages").innerJoin("tasks", "tasks.id", "outbox_messages.task_id").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
         .leftJoin("drafts", "drafts.id", "outbox_messages.draft_id").leftJoin("task_outputs", "task_outputs.task_id", "tasks.id")
-        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id"])
+        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.bot_id", "bots.display_name as bot_display_name", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id"])
         .orderBy(sql`CASE WHEN outbox_messages.state IN ('unknown','pending') THEN 0 ELSE 1 END`).orderBy("outbox_messages.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("outbox_messages.created_at", ">=", start);
       if (request.query.state) query = query.where("outbox_messages.state", "=", request.query.state);
       if (request.query.chat_type) query = query.where("conversations.chat_type", "=", request.query.chat_type);
       if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
       if (request.query.workspace) query = query.where("tasks.resolved_workspace_alias", "=", request.query.workspace);
+      if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
       if (request.query.q) query = query.where("outbox_messages.content", "ilike", `%${request.query.q.replace(/[%_]/g, "")}%`);
       if (request.query.before) query = query.where("outbox_messages.created_at", "<", new Date(request.query.before));
       const rows = await query.execute();
       return { items: rows.slice(0, limit).map((row) => ({ ...row, created_at: iso(row.created_at), updated_at: iso(row.updated_at), sent_at: iso(row.sent_at), deliverySeconds: elapsed(row.created_at, row.sent_at) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
 
-    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").selectAll("tasks")
-      .select(["conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at"])
+    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
+      .select(["bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at"])
       .orderBy(sql`CASE WHEN tasks.state IN ('completed','cancelled') THEN 1 ELSE 0 END`).orderBy("tasks.created_at", "desc").limit(limit + 1);
     if (start) query = query.where("tasks.created_at", ">=", start);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
     if (request.query.chat_type) query = query.where("conversations.chat_type", "=", request.query.chat_type);
     if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
     if (request.query.workspace) query = query.where("tasks.resolved_workspace_alias", "=", request.query.workspace);
+    if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
     if (request.query.q) {
       const prefix = `${request.query.q.replace(/[%_]/g, "")}%`;
       const contains = `%${request.query.q.replace(/[%_]/g, "")}%`;
@@ -207,7 +211,7 @@ export function registerAdminFlowRoutes(
       db.selectFrom("action_receipts").selectAll().where("task_id", "=", task.id).orderBy("created_at").execute(),
       db.selectFrom("tasks").select(["turn_index"]).where("conversation_id", "=", task.conversation_id).orderBy("turn_index", "desc").executeTakeFirstOrThrow()
     ]);
-    const processedEvents = signals.length ? await db.selectFrom("processed_events").selectAll().where("event_id", "in", signals.map((signal) => signal.event_id)).execute() : [];
+    const processedEvents = signals.length ? await db.selectFrom("processed_events").selectAll().where("bot_id", "=", task.bot_id).where("event_id", "in", signals.map((signal) => signal.event_id)).execute() : [];
     const numericalSequences = updates.map((x) => x.sequence).filter((value): value is number => typeof value === "number");
     const monotonic = numericalSequences.every((value, index) => index === 0 || value > numericalSequences[index - 1]!);
     const latestDraft = drafts.at(-1);

@@ -16,9 +16,9 @@ export function registerMetrics(app: FastifyInstance, db: Kysely<Database>, conf
   const outbox = new Gauge({ name: "lark_agent_outbox", help: "Outbox messages by state", labelNames: ["state"], registers: [registry] });
   const outputs = new Gauge({ name: "lark_agent_outputs", help: "Task reply outputs by state", labelNames: ["state"], registers: [registry] });
   const incidents = new Gauge({ name: "lark_agent_incidents_open", help: "Open incidents by severity", labelNames: ["severity"], registers: [registry] });
-  const consumers = new Gauge({ name: "lark_agent_consumer_ready", help: "Lark event consumer readiness", labelNames: ["event_key"], registers: [registry] });
-  const consumersEnabled = new Gauge({ name: "lark_agent_consumer_enabled", help: "Lark event consumer enabled state", labelNames: ["event_key"], registers: [registry] });
-  const consumersRequired = new Gauge({ name: "lark_agent_consumer_required", help: "Whether a Lark event consumer is required for core readiness", labelNames: ["event_key"], registers: [registry] });
+  const consumers = new Gauge({ name: "lark_agent_consumer_ready", help: "Lark event consumer readiness", labelNames: ["bot_id", "kind"], registers: [registry] });
+  const consumersEnabled = new Gauge({ name: "lark_agent_consumer_enabled", help: "Lark event consumer enabled state", labelNames: ["bot_id", "kind"], registers: [registry] });
+  const consumersRequired = new Gauge({ name: "lark_agent_consumer_required", help: "Whether a Lark event consumer is required for core readiness", labelNames: ["bot_id", "kind"], registers: [registry] });
   const awaitingFollowup = new Gauge({ name: "lark_agent_conversations_awaiting_followup", help: "Group conversations waiting for another message", registers: [registry] });
   const followupExpired = new Gauge({ name: "lark_agent_followup_expired_total", help: "Total follow-up conversations expired", registers: [registry] });
   const conversationTurns = new Gauge({ name: "lark_agent_conversation_turns_total", help: "Total group conversation turns created", registers: [registry] });
@@ -49,9 +49,12 @@ export function registerMetrics(app: FastifyInstance, db: Kysely<Database>, conf
     awaitingFollowup.set(awaitingRow.count); followupExpired.set(expiredRow.count); conversationTurns.set(turnsRow.count);
     const status = runtime.snapshot();
     Object.entries(status).forEach(([eventKey, value]) => {
-      consumers.set({ event_key: eventKey }, value.ready ? 1 : 0);
-      consumersEnabled.set({ event_key: eventKey }, value.enabled ? 1 : 0);
-      consumersRequired.set({ event_key: eventKey }, value.required ? 1 : 0);
+      const separator = eventKey.lastIndexOf(":");
+      const botId = separator > 0 ? eventKey.slice(0, separator) : "legacy";
+      const kind = separator > 0 ? eventKey.slice(separator + 1) : eventKey === "im.message.receive_v1" ? "message" : "card";
+      consumers.set({ bot_id: botId, kind }, value.ready ? 1 : 0);
+      consumersEnabled.set({ bot_id: botId, kind }, value.enabled ? 1 : 0);
+      consumersRequired.set({ bot_id: botId, kind }, value.required ? 1 : 0);
     });
     reply.header("content-type", registry.contentType);
     return registry.metrics();

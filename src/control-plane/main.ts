@@ -1,72 +1,24 @@
-import { z } from "zod";
 import { createDatabase } from "../db/database.js";
 import { loadControlPlaneConfig } from "./config.js";
 import { buildControlPlane } from "./app.js";
-import { NdjsonConsumer } from "../lark/cli.js";
-import type { LarkCardActionEvent, LarkMessageEvent } from "../shared/contracts.js";
 import { RetentionService } from "./retention.js";
 import { RuntimeStatus } from "./runtime-status.js";
 import { IncidentService } from "./incidents.js";
-
-const messageEventSchema = z.object({
-  type: z.literal("im.message.receive_v1"),
-  event_id: z.string(),
-  timestamp: z.string(),
-  message_id: z.string(),
-  chat_id: z.string(),
-  chat_type: z.enum(["p2p", "group"]),
-  sender_id: z.string(),
-  message_type: z.string(),
-  content: z.string(),
-  create_time: z.string()
-});
-
-const cardEventSchema = z.object({
-  type: z.literal("card.action.trigger"),
-  event_id: z.string(),
-  timestamp: z.string(),
-  operator_id: z.string(),
-  message_id: z.string(),
-  chat_id: z.string(),
-  action_tag: z.string(),
-  action_value: z.string(),
-  token: z.string()
-});
+import { bootstrapLegacyBot, BotRuntimeManager } from "./bot-runtime.js";
+import { registerBotAdminRoutes } from "./bot-admin-routes.js";
 
 const config = loadControlPlaneConfig();
 const db = createDatabase(config.databaseUrl);
-const consumers: NdjsonConsumer[] = [];
+await bootstrapLegacyBot(db, config);
 const runtime = new RuntimeStatus();
-runtime.configure("im.message.receive_v1", config.larkEnabled, true);
-runtime.configure("card.action.trigger", config.larkEnabled && config.larkCardActionsEnabled, false);
+let botRuntime: BotRuntimeManager | null = null;
 const { app, services } = buildControlPlane(db, config, undefined, {
-  isLarkReady: () => runtime.requiredReady(),
+  isLarkReady: () => botRuntime?.messageReady() ?? !config.larkEnabled,
   runtime
 });
-
-if (config.larkEnabled) {
-  const onReady = (eventKey: string) => {
-    runtime.ready(eventKey);
-    services.adminEvents.publish("runtime");
-    app.log.info({ eventKey }, "lark event consumer ready");
-  };
-  const onError = (eventKey: string) => (error: Error) => {
-    runtime.error(eventKey, error);
-    services.adminEvents.publish("runtime");
-    app.log.error({ err: error, eventKey }, "lark event consumer error");
-  };
-  consumers.push(
-    new NdjsonConsumer(config.larkCliPath, "im.message.receive_v1", async (event) => {
-      await services.router.handleMessage(messageEventSchema.parse(event) as LarkMessageEvent);
-    }, onReady, onError("im.message.receive_v1"))
-  );
-  if (config.larkCardActionsEnabled) {
-    consumers.push(new NdjsonConsumer(config.larkCliPath, "card.action.trigger", async (event) => {
-      await services.router.handleCardAction(cardEventSchema.parse(event) as LarkCardActionEvent);
-    }, onReady, onError("card.action.trigger")));
-  }
-  consumers.forEach((consumer) => consumer.start());
-}
+botRuntime = new BotRuntimeManager(db, config, services.repository, services.gateways, runtime, services.adminEvents, app.log);
+await botRuntime.startAll();
+registerBotAdminRoutes(app, db, config, { gateways: services.gateways, runtime, events: services.adminEvents, controller: botRuntime });
 
 const retention = new RetentionService(db, config.messageRetentionDays, config.traceRetentionDays);
 await retention.runOnce();
@@ -77,7 +29,7 @@ leaseTimer.unref();
 await services.repository.expireFollowupConversations();
 const followupTimer = setInterval(() => void services.repository.expireFollowupConversations().catch((error) => app.log.error({ err: error }, "follow-up expiry failed")), 30_000);
 followupTimer.unref();
-const incidentService = new IncidentService(db, config, services.lark, runtime, services.adminEvents);
+const incidentService = new IncidentService(db, config, services.gateways, runtime, services.adminEvents);
 await incidentService.evaluate();
 const incidentTimer = setInterval(() => void incidentService.evaluate().catch((error) => app.log.error({ err: error }, "incident evaluation failed")), 30_000);
 incidentTimer.unref();
@@ -89,7 +41,7 @@ async function shutdown(): Promise<void> {
   clearInterval(leaseTimer);
   clearInterval(followupTimer);
   clearInterval(incidentTimer);
-  await Promise.all(consumers.map((consumer) => consumer.stop()));
+  await botRuntime?.stopAll();
   await app.close();
   await db.destroy();
 }

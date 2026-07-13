@@ -240,6 +240,7 @@ export class ControlPlaneRepository {
       if (conversation.chat_type === "group" && pending.length) {
         const first = pending[0] as (typeof pending)[number];
         const next = await trx.insertInto("tasks").values({
+          bot_id: current.bot_id,
           conversation_id: conversation.id,
           state: current.executor_id ? "waiting_worker" : "queued",
           turn_index: current.turn_index + 1,
@@ -288,11 +289,11 @@ export class ControlPlaneRepository {
   }
 
   async expireFollowupConversations(): Promise<number> {
-    const candidates = await this.db.selectFrom("conversations").select(["id", "chat_id"]).where("active", "=", true).where("followup_expires_at", "<=", new Date()).execute();
+    const candidates = await this.db.selectFrom("conversations").select(["id", "bot_id", "chat_id"]).where("active", "=", true).where("followup_expires_at", "<=", new Date()).execute();
     let expired = 0;
     for (const candidate of candidates) {
       expired += await this.db.transaction().execute(async (trx) => {
-        await sql`select pg_advisory_xact_lock(hashtext(${candidate.chat_id}))`.execute(trx);
+        await sql`select pg_advisory_xact_lock(hashtext(${`${candidate.bot_id}:${candidate.chat_id}`}))`.execute(trx);
         const conversation = await trx.selectFrom("conversations").selectAll().where("id", "=", candidate.id).forUpdate().executeTakeFirst();
         if (!conversation?.active || !conversation.followup_expires_at || new Date(conversation.followup_expires_at) > new Date()) return 0;
         const activeTask = await trx.selectFrom("tasks").select("id").where("conversation_id", "=", conversation.id).where("state", "in", ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"]).executeTakeFirst();

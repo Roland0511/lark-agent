@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import pg from "pg";
+import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { createDatabase } from "../db/database.js";
 import type { ControlPlaneConfig } from "./config.js";
@@ -63,6 +64,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const singleUserFlowSql = await readFile(fileURLToPath(new URL("../db/migrations/008_single_user_flow.sql", import.meta.url)), "utf8");
     const runnerEnrollmentSql = await readFile(fileURLToPath(new URL("../db/migrations/009_runner_enrollment.sql", import.meta.url)), "utf8");
     const workerSoftDeleteSql = await readFile(fileURLToPath(new URL("../db/migrations/010_worker_soft_delete.sql", import.meta.url)), "utf8");
+    const multiBotSql = await readFile(fileURLToPath(new URL("../db/migrations/011_multi_bot.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -75,6 +77,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await client.query(singleUserFlowSql);
     await client.query(runnerEnrollmentSql);
     await client.query(workerSoftDeleteSql);
+    const multiBotApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'bot_id'");
+    if (multiBotApplied.rowCount === 0) await client.query(multiBotSql);
     await client.end();
   });
 
@@ -92,9 +96,14 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("tasks").execute();
     await db.deleteFrom("conversations").execute();
     await db.deleteFrom("processed_events").execute();
+    await db.deleteFrom("bot_owner_binding_tokens").execute();
+    await db.deleteFrom("bot_chat_bindings").execute();
     await db.deleteFrom("worker_device_credentials").execute();
     await db.deleteFrom("worker_enrollment_tokens").execute();
     await db.deleteFrom("workers").execute();
+    await db.deleteFrom("bots").where("id", "!=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, enabled: true, is_system: true, credential_state: "verified", deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.insertInto("bot_chat_bindings").values({ bot_id: "00000000-0000-0000-0000-000000000001", chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
   });
 
   afterAll(async () => {
@@ -884,13 +893,48 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect((await app.inject({ method: "POST", url: "/auth/lark/consume", payload: { token } })).statusCode).toBe(401);
   });
 
+  it("isolates the same group event by bot and fans ordinary follow-ups into every active bot inbox", async () => {
+    const second = await db.insertInto("bots").values({
+      app_id: "cli_bot_two", profile_name: "bot-two", bot_open_id: "cli_bot_two", display_name: "第二机器人",
+      role_instructions: "以第二角色回答", owner_open_id: "ou_owner", default_executor_id: null, default_workspace_alias: null,
+      enabled: true, is_system: false, config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    await db.insertInto("bot_chat_bindings").values({ bot_id: second.id, chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
+    const first = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    let details: LarkMessageDetails = {
+      messageId: "om_both", rootId: null, parentId: null, threadId: null, chatId: "oc_test", senderId: "ou_owner", senderType: "user",
+      messageType: "text", content: "@两个机器人 一起开始", createTime: "1",
+      mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }, { id: "cli_bot_two", idType: "app_id", name: "第二机器人" }]
+    };
+    const fakeLark = { getMessage: async () => details } as unknown as LarkGateway;
+    const firstRouter = new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60), first);
+    const secondRouter = new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60), second);
+    const event = (eventId: string, messageId: string): LarkMessageEvent => ({
+      type: "im.message.receive_v1", event_id: eventId, timestamp: "1", message_id: messageId, chat_id: "oc_test", chat_type: "group",
+      sender_id: "ou_owner", message_type: "text", content: details.content, create_time: "1"
+    });
+
+    await Promise.all([firstRouter.handleMessage(event("ev_shared", "om_both")), secondRouter.handleMessage(event("ev_shared", "om_both"))]);
+    expect(await db.selectFrom("processed_events").selectAll().where("event_id", "=", "ev_shared").execute()).toHaveLength(2);
+    expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(2);
+
+    details = { ...details, messageId: "om_followup_all", content: "没有 at 的普通续聊", mentions: [] };
+    await Promise.all([firstRouter.handleMessage(event("ev_followup_all", "om_followup_all")), secondRouter.handleMessage(event("ev_followup_all", "om_followup_all"))]);
+
+    details = { ...details, messageId: "om_first_only", content: "@Lark Agent 只问你", mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
+    await Promise.all([firstRouter.handleMessage(event("ev_first_only", "om_first_only")), secondRouter.handleMessage(event("ev_first_only", "om_first_only"))]);
+    const counts = await db.selectFrom("signals").select(["bot_id", sql<number>`count(*)::int`.as("count")]).groupBy("bot_id").orderBy("bot_id").execute();
+    expect(counts).toEqual(expect.arrayContaining([{ bot_id: first.id, count: 3 }, { bot_id: second.id, count: 2 }]));
+    expect(await db.selectFrom("processed_events").selectAll().where("bot_id", "=", second.id).where("event_id", "=", "ev_first_only").execute()).toHaveLength(0);
+  });
+
   it("protects Prometheus metrics with a dedicated bearer token", async () => {
     expect((await app.inject({ method: "GET", url: "/metrics" })).statusCode).toBe(401);
     const response = await app.inject({ method: "GET", url: "/metrics", headers: { authorization: "Bearer metrics-test-token" } });
     expect(response.statusCode).toBe(200);
     expect(response.body).toContain("lark_agent_tasks");
-    expect(response.body).toContain('lark_agent_consumer_enabled{event_key="card.action.trigger"} 0');
-    expect(response.body).toContain('lark_agent_consumer_required{event_key="im.message.receive_v1"} 1');
+    expect(response.body).toContain("lark_agent_consumer_enabled");
+    expect(response.body).toContain("lark_agent_consumer_required");
     expect(response.body).toContain("lark_agent_conversations_awaiting_followup");
     expect(response.body).toContain("lark_agent_followup_expired_total");
     expect(response.body).toContain("lark_agent_conversation_turns_total");

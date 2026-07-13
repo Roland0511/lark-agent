@@ -9,6 +9,7 @@ import { requireAdmin, requireCsrf, setNoStore } from "./admin-auth.js";
 import type { ControlPlaneRepository } from "./repository.js";
 import { AdminEventBus } from "./admin-events.js";
 import type { RuntimeStatus } from "./runtime-status.js";
+import type { BotGatewayRegistry } from "./bot-runtime.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -52,9 +53,9 @@ export function registerAdminRoutes(
   app: FastifyInstance,
   db: Kysely<Database>,
   config: ControlPlaneConfig,
-  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; events: AdminEventBus; runtime: RuntimeStatus }
+  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; gateways: BotGatewayRegistry; events: AdminEventBus; runtime: RuntimeStatus }
 ): void {
-  const { repository, lark, events, runtime } = dependencies;
+  const { repository, gateways, events, runtime } = dependencies;
   app.addHook("onSend", async (request, reply, payload) => {
     if (request.url.startsWith("/v1/admin")) setNoStore(reply);
     return payload;
@@ -70,7 +71,7 @@ export function registerAdminRoutes(
     await requireAdmin(db, config, request);
     const hours = request.query.window === "7d" ? 168 : 24;
     const since = new Date(Date.now() - hours * 3_600_000);
-    const [taskStates, workers, pendingApprovals, outboxUnknown, outputUnknown, heldDrafts, duration, incidents, throughput, awaitingFollowup] = await Promise.all([
+    const [taskStates, workers, pendingApprovals, outboxUnknown, outputUnknown, heldDrafts, duration, incidents, throughput, awaitingFollowup, bots] = await Promise.all([
       db.selectFrom("tasks").select(["state", sql<number>`count(*)::int`.as("count")]).groupBy("state").execute(),
       db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy("display_name").execute(),
       db.selectFrom("approvals").select(sql<number>`count(*)::int`.as("count")).where("state", "=", "pending").executeTakeFirstOrThrow(),
@@ -82,7 +83,8 @@ export function registerAdminRoutes(
       db.selectFrom("incidents").selectAll().where("state", "!=", "resolved").orderBy("severity", "asc").orderBy("last_seen_at", "desc").limit(8).execute(),
       db.selectFrom("tasks").select([sql<string>`date_trunc('hour', created_at)::text`.as("bucket"), sql<number>`count(*)::int`.as("count")])
         .where("created_at", ">", since).groupBy(sql`date_trunc('hour', created_at)`).orderBy(sql`date_trunc('hour', created_at)`).execute(),
-      db.selectFrom("conversations").select(sql<number>`count(*)::int`.as("count")).where("active", "=", true).where("followup_expires_at", "is not", null).executeTakeFirstOrThrow()
+      db.selectFrom("conversations").select(sql<number>`count(*)::int`.as("count")).where("active", "=", true).where("followup_expires_at", "is not", null).executeTakeFirstOrThrow(),
+      db.selectFrom("bots").select(["id", "display_name", "enabled", "is_system", "credential_state"]).where("deleted_at", "is", null).orderBy("display_name").execute()
     ]);
     const completed = taskStates.find((item) => item.state === "completed")?.count ?? 0;
     const failed = taskStates.find((item) => item.state === "failed")?.count ?? 0;
@@ -99,20 +101,22 @@ export function registerAdminRoutes(
         operationalMode: worker.operational_mode, lastSeenAt: iso(worker.last_seen_at), profile: worker.codex_profile
       })),
       consumers: runtime.snapshot(),
+      bots: bots.map((bot) => ({ id: bot.id, displayName: bot.display_name, enabled: bot.enabled, isSystem: bot.is_system, credentialState: bot.credential_state, message: runtime.snapshot([`${bot.id}:message`])[`${bot.id}:message`] })),
       incidents: incidents.map((item) => ({ ...item, first_seen_at: iso(item.first_seen_at), last_seen_at: iso(item.last_seen_at) })),
       throughput
     };
   });
 
-  app.get<{ Querystring: { state?: string; executor?: string; workspace?: string; q?: string; limit?: string; before?: string } }>("/v1/admin/tasks", async (request) => {
+  app.get<{ Querystring: { state?: string; bot?: string; executor?: string; workspace?: string; q?: string; limit?: string; before?: string } }>("/v1/admin/tasks", async (request) => {
     await requireAdmin(db, config, request);
     const limit = Math.min(Math.max(Number(request.query.limit ?? 30), 1), 100);
-    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").select([
+    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").select([
       "tasks.id", "tasks.state", "tasks.revision", "tasks.executor_id", "tasks.requested_workspace_alias", "tasks.resolved_workspace_alias", "tasks.requester_id",
       "tasks.requester_role", "tasks.attempt", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
-      "tasks.turn_index", "tasks.conversation_disposition", "conversations.chat_type", "conversations.room_seq"
+      "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.display_name as bot_display_name", "conversations.chat_type", "conversations.room_seq"
     ]).orderBy("tasks.created_at", "desc").orderBy("tasks.id", "desc").limit(limit + 1);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
+    if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
     if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
     if (request.query.workspace) query = query.where((eb) => eb.or([
       eb("tasks.resolved_workspace_alias", "=", request.query.workspace as string),
@@ -134,11 +138,11 @@ export function registerAdminRoutes(
 
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id", async (request) => {
     await requireAdmin(db, config, request);
-    const task = await db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").selectAll("tasks")
-      .select(["conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
+    const task = await db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
+      .select(["bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
-    const chatName = config.larkEnabled && task.chat_type === "group" ? await lark.getChatName(task.chat_id).catch(() => null) : null;
+    const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;
     const conversationTurns = await db.selectFrom("tasks").select(["id", "turn_index", "state", "conversation_disposition", "created_at", "completed_at"])
       .where("conversation_id", "=", task.conversation_id).orderBy("turn_index").execute();
     return {
@@ -288,7 +292,7 @@ export function registerAdminRoutes(
       .innerJoin("tasks", "tasks.id", "outbox_messages.task_id")
       .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
       .selectAll("outbox_messages")
-      .select("conversations.chat_id")
+      .select(["conversations.chat_id", "tasks.bot_id"])
       .where("outbox_messages.id", "=", request.params.id)
       .executeTakeFirst();
     if (!row || row.state !== "unknown") throw new AppError("只有发送结果不确定的消息可以处置", 409, "invalid_outbox_state");
@@ -297,7 +301,7 @@ export function registerAdminRoutes(
     if (body.command === "retry") {
       if (row.operation_kind !== "message_send") throw new AppError("流式回复结果不确定，禁止降级为新消息；请先核查任务输出记录", 409, "stream_output_unknown");
       try {
-        platformMessageId = await lark.sendMarkdownToChat(row.chat_id, row.content, row.idempotency_key);
+        platformMessageId = await (await gateways.gateway(row.bot_id)).sendMarkdownToChat(row.chat_id, row.content, row.idempotency_key);
         state = "sent";
       } catch (error) {
         await db.updateTable("outbox_messages").set({ last_error: errorMessage(error), updated_at: new Date(), attempt: row.attempt + 1 }).where("id", "=", row.id).execute();

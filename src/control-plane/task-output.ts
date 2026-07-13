@@ -6,6 +6,7 @@ import { LarkGateway, previewSummary } from "../lark/gateway.js";
 import { AppError, errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { CommentaryStreamUpdate } from "../shared/contracts.js";
+import { BotGatewayRegistry } from "./bot-runtime.js";
 
 type OutputRow = Awaited<ReturnType<TaskOutputService["getOutput"]>>;
 
@@ -15,7 +16,7 @@ export class TaskOutputService {
   constructor(
     private readonly db: Kysely<Database>,
     private readonly config: ControlPlaneConfig,
-    private readonly lark: LarkGateway
+    private readonly lark: LarkGateway | BotGatewayRegistry
   ) {}
 
   async streamCommentary(taskId: string, update: CommentaryStreamUpdate): Promise<{ messageId: string | null; ignored: boolean }> {
@@ -67,9 +68,10 @@ export class TaskOutputService {
           const failed = await this.getOutput(taskId);
           if (failed?.message_id || failed?.state === "unknown") throw error;
           const target = await this.deliveryTarget(taskId);
+          const gateway = await this.gatewayForTask(taskId);
           const messageId = target.chatType === "group"
-            ? await this.lark.replyMarkdownToMessage(target.rootMessageId, content, fallbackIdempotencyKey)
-            : await this.lark.sendMarkdownToChat(target.chatId, content, fallbackIdempotencyKey);
+            ? await gateway.replyMarkdownToMessage(target.rootMessageId, content, fallbackIdempotencyKey)
+            : await gateway.sendMarkdownToChat(target.chatId, content, fallbackIdempotencyKey);
           await this.ensureOutputRow(taskId);
           await this.db.updateTable("task_outputs").set({
             transport: "markdown_fallback", card_id: null, message_id: messageId, state: "completed", visible_phase: "final",
@@ -94,8 +96,9 @@ export class TaskOutputService {
     const createUuid = `card-create-${taskId}`;
     await this.recordOperation(taskId, "create_card", null, createUuid, content);
     let cardId: string;
+    const gateway = await this.gatewayForTask(taskId);
     try {
-      cardId = await this.lark.createCardEntity(content, streaming);
+      cardId = await gateway.createCardEntity(content, streaming);
       await this.completeOperation(createUuid);
       await this.db.updateTable("task_outputs").set({ card_id: cardId, current_content: content, current_content_hash: sha256(content), updated_at: new Date() }).where("task_id", "=", taskId).execute();
     } catch (error) {
@@ -108,8 +111,8 @@ export class TaskOutputService {
     try {
       const target = await this.deliveryTarget(taskId);
       const messageId = target.chatType === "group"
-        ? await this.lark.replyCardEntityToMessage(target.rootMessageId, cardId, sendUuid)
-        : await this.lark.sendCardEntityToChat(target.chatId, cardId, sendUuid);
+        ? await gateway.replyCardEntityToMessage(target.rootMessageId, cardId, sendUuid)
+        : await gateway.sendCardEntityToChat(target.chatId, cardId, sendUuid);
       await this.completeOperation(sendUuid);
       await this.db.updateTable("task_outputs").set({ message_id: messageId, state: streaming ? "streaming" : "completed", visible_phase: streaming ? "commentary" : "final", opened_at: new Date(), updated_at: new Date() }).where("task_id", "=", taskId).execute();
       await this.db.updateTable("conversations").set({ response_message_id: messageId, updated_at: new Date() }).where("id", "=", output.conversation_id).execute();
@@ -128,7 +131,7 @@ export class TaskOutputService {
     const requestUuid = randomUUID();
     await this.recordOperation(output.task_id, "update_content", sequence, requestUuid, content);
     try {
-      await this.lark.streamCardContent(output.card_id, output.element_id, content, sequence, requestUuid);
+      await (await this.gatewayForTask(output.task_id)).streamCardContent(output.card_id, output.element_id, content, sequence, requestUuid);
       await this.completeOperation(requestUuid);
       await this.db.updateTable("task_outputs").set({
         sequence, state: phase === "final" ? output.state : "streaming", visible_phase: phase,
@@ -151,7 +154,7 @@ export class TaskOutputService {
     const requestUuid = randomUUID();
     await this.recordOperation(output.task_id, "close_stream", sequence, requestUuid, summary);
     try {
-      await this.lark.closeCardStream(output.card_id, summary, sequence, requestUuid);
+      await (await this.gatewayForTask(output.task_id)).closeCardStream(output.card_id, summary, sequence, requestUuid);
       await this.completeOperation(requestUuid);
       await this.db.updateTable("task_outputs").set({ sequence, updated_at: new Date() }).where("task_id", "=", output.task_id).execute();
     } catch (error) {
@@ -173,6 +176,14 @@ export class TaskOutputService {
 
   private async conversationId(taskId: string): Promise<string> {
     return (await this.db.selectFrom("tasks").select("conversation_id").where("id", "=", taskId).executeTakeFirstOrThrow()).conversation_id;
+  }
+
+  private async gatewayForTask(taskId: string): Promise<LarkGateway> {
+    if (this.lark instanceof BotGatewayRegistry) {
+      const task = await this.db.selectFrom("tasks").select("bot_id").where("id", "=", taskId).executeTakeFirstOrThrow();
+      return this.lark.gateway(task.bot_id);
+    }
+    return this.lark;
   }
 
   private async deliveryTarget(taskId: string): Promise<{ chatId: string; chatType: string; rootMessageId: string }> {

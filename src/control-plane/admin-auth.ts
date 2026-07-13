@@ -16,8 +16,9 @@ export interface AdminPrincipal {
   csrfToken: string;
 }
 
-export function adminRoleFor(config: ControlPlaneConfig, openId: string): AdminPrincipal["role"] | null {
-  return openId === config.ownerOpenId ? "owner" : null;
+async function ownerRole(db: Kysely<Database>, _config: ControlPlaneConfig, openId: string): Promise<AdminPrincipal["role"] | null> {
+  const bot = await db.selectFrom("bots").select("id").where("owner_open_id", "=", openId).where("deleted_at", "is", null).executeTakeFirst();
+  return bot ? "owner" : null;
 }
 
 function cookieOptions(config: ControlPlaneConfig) {
@@ -46,7 +47,7 @@ export async function requireAdmin(
     .where("last_seen_at", ">", idleCutoff)
     .executeTakeFirst();
   if (!session) throw new AppError("控制台连接已过期，请重新连接", 401, "admin_session_expired");
-  const currentRole = adminRoleFor(config, session.open_id);
+  const currentRole = await ownerRole(db, config, session.open_id);
   if (!currentRole) throw new AppError("当前飞书身份不在控制台白名单", 403, "admin_forbidden");
   await db.updateTable("admin_sessions").set({ last_seen_at: now, role: currentRole }).where("token_hash", "=", session.token_hash).execute();
   return { openId: session.open_id, displayName: session.display_name, role: currentRole, csrfToken: session.csrf_token };
@@ -68,7 +69,7 @@ export function registerAdminAuth(app: FastifyInstance, db: Kysely<Database>, co
       .where("consumed_at", "is", null)
       .returningAll().executeTakeFirst();
     if (!consumed) throw new AppError("专属通行链接已过期或已经使用", 401, "admin_login_token_invalid");
-    const role = adminRoleFor(config, consumed.open_id);
+    const role = await ownerRole(db, config, consumed.open_id);
     if (!role) throw new AppError("当前飞书身份不在控制台白名单", 403, "admin_forbidden");
     const sessionToken = randomToken(48);
     const csrfToken = randomToken();

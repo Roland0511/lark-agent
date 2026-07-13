@@ -32,6 +32,7 @@ import { RuntimeStatus } from "./runtime-status.js";
 import { TaskOutputService } from "./task-output.js";
 import { registerAdminFlowRoutes } from "./admin-flow.js";
 import { registerRunnerRoutes, RunnerReleaseService } from "./runner-routes.js";
+import { BotGatewayRegistry } from "./bot-runtime.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -49,6 +50,7 @@ export interface ControlPlaneServices {
   drafts: DraftService;
   outputs: TaskOutputService;
   lark: LarkGateway;
+  gateways: BotGatewayRegistry;
   adminEvents: AdminEventBus;
   runtime: RuntimeStatus;
 }
@@ -61,22 +63,21 @@ export function buildControlPlane(
 ): { app: FastifyInstance; services: ControlPlaneServices } {
   const app = Fastify({
     forceCloseConnections: true,
-    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "body.token", "body.content", "body.text", "body.payload", "body.result"] }
+    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "body.token", "body.appSecret", "body.content", "body.text", "body.payload", "body.result"] }
   });
   const runtime = services?.runtime ?? readiness.runtime ?? new RuntimeStatus();
-  runtime.configure("im.message.receive_v1", config.larkEnabled, true);
-  runtime.configure("card.action.trigger", config.larkEnabled && config.larkCardActionsEnabled, false);
   const lark = services?.lark ?? new LarkGateway(config.larkCliPath);
+  const gateways = services?.gateways ?? new BotGatewayRegistry(db, config.larkCliPath, services?.lark);
   const repository = services?.repository ?? new ControlPlaneRepository(db, config.leaseSeconds);
   const router = services?.router ?? new EventRouter(db, config, lark, repository);
-  const outputs = services?.outputs ?? new TaskOutputService(db, config, lark);
-  const drafts = services?.drafts ?? new DraftService(db, config, lark, outputs);
+  const outputs = services?.outputs ?? new TaskOutputService(db, config, gateways);
+  const drafts = services?.drafts ?? new DraftService(db, config, gateways, outputs);
   const adminEvents = services?.adminEvents ?? new AdminEventBus();
   const runnerReleases = new RunnerReleaseService(config);
   const runnerManifestTimer = setInterval(() => void runnerReleases.current(true), config.runnerManifestRefreshSeconds * 1_000);
   runnerManifestTimer.unref();
   app.addHook("onClose", async () => clearInterval(runnerManifestTimer));
-  const resolvedServices = { repository, router, drafts, outputs, lark, adminEvents, runtime };
+  const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime };
 
   void app.register(cookie);
 
@@ -119,7 +120,9 @@ export function buildControlPlane(
     do {
       const claimed = await repository.claimTask(principal);
       if (claimed) {
-        const conversation = await db.selectFrom("conversations").select(["room_seq", "chat_type"]).where("id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
+        const conversation = await db.selectFrom("conversations").innerJoin("bots", "bots.id", "conversations.bot_id")
+          .select(["conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot", "bots.display_name"])
+          .where("conversations.id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
         const signals = await repository.taskSignals(claimed.task.id);
         const previous = claimed.task.turn_index > 1
           ? await db.selectFrom("tasks")
@@ -139,6 +142,10 @@ export function buildControlPlane(
           : "这是会话的首次激活回合。";
         return reply.send({
           id: claimed.task.id,
+          botId: claimed.task.bot_id,
+          botDisplayName: conversation.display_name,
+          roleInstructions: conversation.role_instructions_snapshot,
+          botConfigRevision: conversation.bot_config_revision,
           conversationId: claimed.task.conversation_id,
           state: claimed.task.state,
           leaseToken: claimed.leaseToken,
@@ -294,7 +301,7 @@ export function buildControlPlane(
 
   registerAdminAuth(app, db, config);
   registerRunnerRoutes(app, db, config, runnerReleases, adminEvents);
-  registerAdminRoutes(app, db, config, { repository, lark, events: adminEvents, runtime });
+  registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);
 

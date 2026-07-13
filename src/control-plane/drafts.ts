@@ -6,12 +6,13 @@ import { AppError, errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { LarkMessageDetails } from "../shared/contracts.js";
 import { TaskOutputService } from "./task-output.js";
+import { BotGatewayRegistry } from "./bot-runtime.js";
 
 export class DraftService {
   constructor(
     private readonly db: Kysely<Database>,
     private readonly config: ControlPlaneConfig,
-    private readonly lark: LarkGateway,
+    private readonly lark: LarkGateway | BotGatewayRegistry,
     private readonly outputs: TaskOutputService
   ) {}
 
@@ -87,7 +88,7 @@ export class DraftService {
     if (!this.config.larkEnabled) return;
     const [conversation, task] = await Promise.all([
       this.db.selectFrom("conversations").selectAll().where("id", "=", conversationId).executeTakeFirstOrThrow(),
-      this.db.selectFrom("tasks").select("created_at").where("id", "=", taskId).executeTakeFirstOrThrow()
+      this.db.selectFrom("tasks").select(["created_at", "bot_id"]).where("id", "=", taskId).executeTakeFirstOrThrow()
     ]);
     // A private top-level message is an independent task. Listing the whole P2P
     // chat would incorrectly merge later independent tasks into this one.
@@ -96,7 +97,8 @@ export class DraftService {
     const end = new Date();
     let pageToken: string | undefined;
     do {
-      const page = await this.lark.listChatMessages(conversation.chat_id, new Date(task.created_at), end, pageToken);
+      const gateway = this.lark instanceof BotGatewayRegistry ? await this.lark.gateway(task.bot_id) : this.lark;
+      const page = await gateway.listChatMessages(conversation.chat_id, new Date(task.created_at), end, pageToken);
       messages.push(...page.messages);
       pageToken = page.hasMore && page.pageToken ? page.pageToken : undefined;
     } while (pageToken && messages.length < 500);
@@ -108,19 +110,20 @@ export class DraftService {
       if (known) continue;
       const syntheticEventId = `refresh:${sha256(message.messageId).slice(0, 32)}`;
       await this.db.transaction().execute(async (trx) => {
-        const inserted = await trx.insertInto("processed_events").values({ event_id: syntheticEventId, event_type: "chat.refresh", status: "processed", processed_at: new Date() }).onConflict((conflict) => conflict.column("event_id").doNothing()).returning("event_id").executeTakeFirst();
+        const inserted = await trx.insertInto("processed_events").values({ bot_id: task.bot_id, event_id: syntheticEventId, event_type: "chat.refresh", status: "processed", processed_at: new Date() }).onConflict((conflict) => conflict.columns(["bot_id", "event_id"]).doNothing()).returning("event_id").executeTakeFirst();
         if (!inserted) return;
         const current = await trx.selectFrom("conversations").select("room_seq").where("id", "=", conversationId).forUpdate().executeTakeFirstOrThrow();
         const nextSeq = current.room_seq + 1;
         await trx.updateTable("conversations").set({ room_seq: nextSeq, updated_at: new Date() }).where("id", "=", conversationId).execute();
         await trx.insertInto("signals").values({
+          bot_id: task.bot_id,
           conversation_id: conversationId,
           task_id: taskId,
           event_id: syntheticEventId,
           seq: nextSeq,
           message_id: message.messageId,
           sender_id: message.senderId,
-          sender_role: message.senderId === this.config.ownerOpenId ? "owner" : "member",
+          sender_role: message.senderId === (await trx.selectFrom("bots").select("owner_open_id").where("id", "=", task.bot_id).executeTakeFirst())?.owner_open_id ? "owner" : "member",
           message_type: message.messageType,
           content: message.content,
           preview: message.content.slice(0, 500),

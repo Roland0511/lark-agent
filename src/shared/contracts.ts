@@ -98,6 +98,10 @@ export type Signal = z.infer<typeof signalSchema>;
 
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
+  botId: z.string().uuid(),
+  botDisplayName: z.string().min(1),
+  roleInstructions: z.string().max(20_000),
+  botConfigRevision: z.number().int().positive(),
   conversationId: z.string().uuid(),
   state: z.enum(taskStates),
   leaseToken: z.string(),

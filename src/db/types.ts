@@ -6,6 +6,7 @@ type NullableTimestamp = ColumnType<Date | null, Date | string | null | undefine
 type Json = ColumnType<unknown, string, string>;
 
 export interface ProcessedEventsTable {
+  bot_id: string;
   event_id: string;
   event_type: string;
   status: string;
@@ -15,6 +16,9 @@ export interface ProcessedEventsTable {
 
 export interface ConversationsTable {
   id: Generated<string>;
+  bot_id: string;
+  bot_config_revision: number;
+  role_instructions_snapshot: string;
   chat_id: string;
   chat_type: string;
   root_message_id: string;
@@ -29,6 +33,7 @@ export interface ConversationsTable {
 
 export interface TasksTable {
   id: Generated<string>;
+  bot_id: string;
   conversation_id: string;
   state: TaskState;
   turn_index: Generated<number>;
@@ -59,6 +64,7 @@ export interface TasksTable {
 
 export interface SignalsTable {
   id: Generated<string>;
+  bot_id: string;
   conversation_id: string;
   task_id: string;
   event_id: string;
@@ -270,7 +276,49 @@ export interface ChatPoliciesTable {
   updated_at: Timestamp;
 }
 
+export interface BotsTable {
+  id: Generated<string>;
+  app_id: string;
+  profile_name: string | null;
+  bot_open_id: string | null;
+  display_name: string;
+  role_instructions: string;
+  owner_open_id: string | null;
+  default_executor_id: string | null;
+  default_workspace_alias: string | null;
+  enabled: Generated<boolean>;
+  is_system: Generated<boolean>;
+  config_revision: Generated<number>;
+  credential_state: Generated<"pending" | "verified" | "error">;
+  credential_error: string | null;
+  deleted_at: NullableTimestamp;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface BotChatBindingsTable {
+  bot_id: string;
+  chat_id: string;
+  chat_name: string | null;
+  enabled: Generated<boolean>;
+  preferred_executor_id: string | null;
+  workspace_alias: string | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface BotOwnerBindingTokensTable {
+  token_hash: string;
+  bot_id: string;
+  expires_at: Timestamp;
+  consumed_at: NullableTimestamp;
+  created_at: Timestamp;
+}
+
 export interface Database {
+  bots: BotsTable;
+  bot_chat_bindings: BotChatBindingsTable;
+  bot_owner_binding_tokens: BotOwnerBindingTokensTable;
   processed_events: ProcessedEventsTable;
   conversations: ConversationsTable;
   tasks: TasksTable;

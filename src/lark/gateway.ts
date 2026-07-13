@@ -63,11 +63,20 @@ function messagesFromEnvelope(envelope: unknown): LarkMessageDetails[] {
 export class LarkGateway {
   constructor(
     private readonly cliPath = "lark-cli",
-    private readonly run: (command: string, args: string[]) => Promise<unknown> = runJsonCommand
+    private readonly run: (command: string, args: string[]) => Promise<unknown> = runJsonCommand,
+    private readonly profileName?: string | null
   ) {}
 
+  private args(args: string[]): string[] {
+    return this.profileName ? ["--profile", this.profileName, ...args] : args;
+  }
+
+  private invoke(args: string[]): Promise<unknown> {
+    return this.run(this.cliPath, this.args(args));
+  }
+
   async getMessage(messageId: string): Promise<LarkMessageDetails> {
-    const envelope = await this.run(this.cliPath, [
+    const envelope = await this.invoke([
       "api",
       "GET",
       `/open-apis/im/v1/messages/${messageId}`,
@@ -82,10 +91,28 @@ export class LarkGateway {
   }
 
   async getChatName(chatId: string): Promise<string | null> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "im", "chats", "get", "--chat-id", chatId, "--as", "bot", "--format", "json"
     ])) as LarkEnvelope;
     return envelope.data?.name || null;
+  }
+
+  async listJoinedChats(): Promise<Array<{ chatId: string; name: string }>> {
+    const result: Array<{ chatId: string; name: string }> = [];
+    let pageToken: string | undefined;
+    do {
+      const envelope = (await this.invoke([
+        "api", "GET", "/open-apis/im/v1/chats", "--as", "bot",
+        "--params", JSON.stringify({ page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) })
+      ])) as LarkEnvelope;
+      for (const raw of envelope.data?.items ?? []) {
+        const item = raw as Record<string, unknown>;
+        const chatId = String(item.chat_id ?? "");
+        if (chatId) result.push({ chatId, name: String(item.name ?? chatId) });
+      }
+      pageToken = envelope.data?.has_more && envelope.data.page_token ? envelope.data.page_token : undefined;
+    } while (pageToken && result.length < 500);
+    return result.slice(0, 500);
   }
 
   async listChatMessages(
@@ -114,7 +141,7 @@ export class LarkGateway {
       "json"
     ];
     if (pageToken) args.push("--page-token", pageToken);
-    const envelope = (await this.run(this.cliPath, args)) as LarkEnvelope;
+    const envelope = (await this.invoke(args)) as LarkEnvelope;
     return {
       messages: messagesFromEnvelope(envelope),
       hasMore: envelope.data?.has_more === true,
@@ -123,7 +150,7 @@ export class LarkGateway {
   }
 
   async sendMarkdownToChat(chatId: string, markdown: string, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "im",
       "+messages-send",
       "--chat-id",
@@ -141,7 +168,7 @@ export class LarkGateway {
   }
 
   async replyMarkdownToMessage(messageId: string, markdown: string, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "im",
       "+messages-reply",
       "--message-id",
@@ -159,7 +186,7 @@ export class LarkGateway {
   }
 
   async sendCardToChat(chatId: string, card: Record<string, unknown>, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "im",
       "+messages-send",
       "--chat-id",
@@ -179,7 +206,7 @@ export class LarkGateway {
   }
 
   async createCardEntity(content: string, streaming: boolean): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "api", "POST", "/open-apis/cardkit/v1/cards", "--as", "bot",
       "--data", JSON.stringify({ type: "card_json", data: JSON.stringify(replyCard(content, streaming)) })
     ])) as LarkEnvelope;
@@ -189,7 +216,7 @@ export class LarkGateway {
   }
 
   async sendCardEntityToChat(chatId: string, cardId: string, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "api", "POST", "/open-apis/im/v1/messages", "--as", "bot",
       "--params", JSON.stringify({ receive_id_type: "chat_id" }),
       "--data", JSON.stringify({
@@ -205,7 +232,7 @@ export class LarkGateway {
   }
 
   async replyCardEntityToMessage(messageId: string, cardId: string, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "im", "+messages-reply",
       "--message-id", messageId,
       "--msg-type", "interactive",
@@ -220,14 +247,14 @@ export class LarkGateway {
   }
 
   async streamCardContent(cardId: string, elementId: string, content: string, sequence: number, requestUuid: string): Promise<void> {
-    await this.run(this.cliPath, [
+    await this.invoke([
       "api", "PUT", `/open-apis/cardkit/v1/cards/${cardId}/elements/${elementId}/content`, "--as", "bot",
       "--data", JSON.stringify({ content, sequence, uuid: requestUuid })
     ]);
   }
 
   async closeCardStream(cardId: string, summary: string, sequence: number, requestUuid: string): Promise<void> {
-    await this.run(this.cliPath, [
+    await this.invoke([
       "api", "PATCH", `/open-apis/cardkit/v1/cards/${cardId}/settings`, "--as", "bot",
       "--data", JSON.stringify({
         settings: JSON.stringify({ config: { streaming_mode: false, summary: { content: summary } } }),
@@ -238,7 +265,7 @@ export class LarkGateway {
   }
 
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
-    await this.run(this.cliPath, [
+    await this.invoke([
       "api",
       "PATCH",
       `/open-apis/im/v1/messages/${messageId}`,
@@ -250,7 +277,7 @@ export class LarkGateway {
   }
 
   async sendCardToOpenId(openId: string, card: Record<string, unknown>, idempotencyKey: string): Promise<string> {
-    const envelope = (await this.run(this.cliPath, [
+    const envelope = (await this.invoke([
       "api", "POST", "/open-apis/im/v1/messages", "--as", "bot",
       "--params", JSON.stringify({ receive_id_type: "open_id" }),
       "--data", JSON.stringify({ receive_id: openId, msg_type: "interactive", content: JSON.stringify(card), uuid: idempotencyKey })
