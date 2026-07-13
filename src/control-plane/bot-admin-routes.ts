@@ -50,7 +50,8 @@ export function registerBotAdminRoutes(
     const workers = await db.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).execute();
     const candidates = executorId ? workers.filter((worker) => worker.executor_id === executorId) : workers;
     if (executorId && !candidates.length) throw new AppError("默认执行器不存在", 409, "bot_executor_not_found");
-    if (executorId && !workspaceAlias && candidates[0]?.workspace_aliases.length !== 1) {
+    const selectedAliases = Array.isArray(candidates[0]?.workspace_aliases) ? candidates[0].workspace_aliases.map(String) : [];
+    if (executorId && !workspaceAlias && selectedAliases.length !== 1) {
       throw new AppError("该执行器声明了多个总工作区，请明确选择一个", 409, "bot_workspace_required");
     }
     if (workspaceAlias && !candidates.some((worker) => Array.isArray(worker.workspace_aliases) && worker.workspace_aliases.map(String).includes(workspaceAlias))) {
