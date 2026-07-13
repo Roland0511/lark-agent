@@ -17,6 +17,7 @@ import { AdminEventBus } from "./admin-events.js";
 import { DraftService } from "./drafts.js";
 import { TaskOutputService } from "./task-output.js";
 import { AppError } from "../shared/errors.js";
+import { registerBotAdminRoutes } from "./bot-admin-routes.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -46,7 +47,17 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     runnerArtifactPublicBaseUrl: "https://cdn.example.test/home/cdn/lark-agent",
     runnerManifestRefreshSeconds: 300
   };
-  const { app } = buildControlPlane(db, config);
+  const { app, services } = buildControlPlane(db, config);
+  const reconciledBotIds: string[] = [];
+  registerBotAdminRoutes(app, db, config, {
+    gateways: services.gateways,
+    runtime: services.runtime,
+    events: services.adminEvents,
+    controller: {
+      reconcile: async (botId) => { reconciledBotIds.push(botId); },
+      suspend: async () => undefined
+    }
+  });
   const insertWorker = async () => db.insertInto("workers").values({
     executor_id: "worker-a", display_name: "Worker A", home_ref: "worker-a:home", codex_profile: "lark-agent",
     config_fingerprint: "a".repeat(64), codex_version: "test", capacity: 1,
@@ -83,6 +94,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   });
 
   beforeEach(async () => {
+    reconciledBotIds.length = 0;
     await db.deleteFrom("admin_sessions").execute();
     await db.deleteFrom("admin_login_tokens").execute();
     await db.deleteFrom("incidents").execute();
@@ -118,6 +130,24 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const admin = await app.inject({ method: "GET", url: "/admin" });
     expect(admin.statusCode).toBe(302);
     expect(admin.headers.location).toBe("/admin/");
+  });
+
+  it("reconnects one enabled bot without changing its configuration", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-reconnect-bot"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "reconnect-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const botId = "00000000-0000-0000-0000-000000000001";
+    const before = await db.selectFrom("bots").select(["enabled", "is_system", "config_revision"]).where("id", "=", botId).executeTakeFirstOrThrow();
+    const response = await app.inject({
+      method: "POST", url: `/v1/admin/bots/${botId}/commands`,
+      headers: { cookie: "lark_agent_admin_session=owner-reconnect-bot", "x-csrf-token": "reconnect-csrf" },
+      payload: { command: "reconnect" }
+    });
+    expect(response.statusCode).toBe(200);
+    expect(reconciledBotIds).toEqual([botId]);
+    expect(await db.selectFrom("bots").select(["enabled", "is_system", "config_revision"]).where("id", "=", botId).executeTakeFirstOrThrow()).toEqual(before);
   });
 
   it("reports device status and lets the bound credential unregister itself", async () => {

@@ -112,13 +112,35 @@ function Bots({ user }: { user: AdminUser }) {
   const continueSetup = (bot: AnyRecord) => { void bots.refetch(); setAdding(false); setEditing(bot); };
   return <><PageTitle eyebrow="飞书身份" title="机器人与角色" description="每个机器人拥有独立的飞书凭据、群绑定、角色要求和执行路由。" action={<button className="primary-button" onClick={() => setAdding(true)}><Plus size={17} />添加机器人</button>} />
     <div className="bot-routing-note"><GitBranch size={18} /><div><strong>群聊路由规则</strong><span>明确 @ 时只交给被提及机器人；普通续聊会进入该群所有活跃机器人的收件箱，由各 Agent 独立判断。</span></div></div>
-    <div className="card-grid">{bots.data?.items?.map((bot: AnyRecord) => { const message = bot.runtime?.[`${bot.id}:message`]; return <article className="worker-card bot-card" key={bot.id}><div className="worker-card-top"><div className="machine-icon"><Bot /></div><div><h3>{bot.displayName}</h3><p>{bot.appId}</p></div><StateBadge state={!bot.enabled ? "disabled" : message?.ready ? "online" : message?.state ?? "starting"} /></div>
-      <div className="bot-badges">{bot.isSystem && <span><ShieldCheck size={13} />系统通知</span>}<span>{bot.ownerBound ? "主人已绑定" : "等待主人绑定"}</span><span>配置 v{bot.configRevision}</span></div>
-      <dl className="detail-list"><Detail label="角色" value={bot.roleInstructions || "通用助理"} /><Detail label="默认执行器" value={bot.defaultExecutorId} /><Detail label="默认工作区" value={bot.defaultWorkspaceAlias} /><Detail label="已绑定群" value={`${bot.bindings?.filter((x: AnyRecord) => x.enabled).length ?? 0} 个`} /><Detail label="活跃会话" value={`${bot.activeConversations} 个`} /><Detail label="凭据" value={bot.credentialState === "verified" ? "已验证（只写）" : bot.credentialError ?? bot.credentialState} /></dl>
-      <div className="card-actions"><button className="secondary-button" onClick={() => setEditing(bot)}>配置</button></div></article>; }) ?? <PageLoading />}</div>
+    <div className="card-grid">{bots.data?.items?.map((bot: AnyRecord) => <BotCard key={bot.id} bot={bot} user={user} onEdit={() => setEditing(bot)} onRefreshed={() => void bots.refetch()} />) ?? <PageLoading />}</div>
     {adding && <AddBotDialog user={user} workers={workers.data?.items ?? []} onClose={() => setAdding(false)} onCreated={continueSetup} />}
     {editing && <BotSettingsDialog user={user} bot={editing} workers={workers.data?.items ?? []} onClose={() => setEditing(null)} onSaved={refresh} />}
   </>;
+}
+
+function BotCard({ bot, user, onEdit, onRefreshed }: { bot: AnyRecord; user: AdminUser; onEdit(): void; onRefreshed(): void }) {
+  const message = bot.runtime?.[`${bot.id}:message`];
+  const reconnect = useMutation({
+    mutationFn: () => api(`/v1/admin/bots/${bot.id}/commands`, { method: "POST", body: JSON.stringify({ command: "reconnect" }) }, user),
+    onSuccess: onRefreshed
+  });
+  const runtimeState = !bot.enabled ? "disabled" : message?.ready ? "online" : message?.state === "error" ? "error" : "starting";
+  const runtimeLabel = runtimeState === "error" ? "消息接入异常" : runtimeState === "starting" ? "正在连接" : undefined;
+  const runtimeError = runtimeState === "error" ? explainBotRuntimeError(message?.lastError) : null;
+  return <article className="worker-card bot-card"><div className="worker-card-top"><div className="machine-icon"><Bot /></div><div><h3>{bot.displayName}</h3><p>{bot.appId}</p></div><StateBadge state={runtimeState} label={runtimeLabel} /></div>
+    <div className="bot-badges">{bot.isSystem && <span><ShieldCheck size={13} />系统通知</span>}<span>{bot.ownerBound ? "主人已绑定" : "等待主人绑定"}</span><span>配置 v{bot.configRevision}</span></div>
+    {runtimeError && <div className="bot-runtime-alert"><AlertTriangle size={17} /><div><strong>消息消费者没有运行</strong><span>{runtimeError}</span></div></div>}
+    <dl className="detail-list"><Detail label="角色" value={bot.roleInstructions || "通用助理"} /><Detail label="默认执行器" value={bot.defaultExecutorId} /><Detail label="默认工作区" value={bot.defaultWorkspaceAlias} /><Detail label="已绑定群" value={`${bot.bindings?.filter((x: AnyRecord) => x.enabled).length ?? 0} 个`} /><Detail label="活跃会话" value={`${bot.activeConversations} 个`} /><Detail label="凭据" value={bot.credentialState === "verified" ? "已验证（只写）" : bot.credentialError ?? bot.credentialState} /></dl>
+    {reconnect.error && <ErrorBox error={reconnect.error} />}
+    <div className="card-actions">{runtimeError && <button className="secondary-button" disabled={reconnect.isPending} onClick={() => reconnect.mutate()}><RefreshCw size={15} />{reconnect.isPending ? "正在重连…" : "重新连接"}</button>}<button className="secondary-button" onClick={onEdit}>配置</button></div>
+  </article>;
+}
+
+function explainBotRuntimeError(error?: string | null): string {
+  if (!error) return "消息长连接未就绪。可以重新连接；如果仍失败，请检查飞书事件订阅和应用权限。";
+  if (/consumer exited with 2/i.test(error)) return "启动检查未通过（退出码 2）。常见原因是消息事件尚未订阅或配置刚修改尚未生效；可以先重新连接。";
+  if (/consumer exited with 3/i.test(error)) return "机器人认证失败（退出码 3）。请检查或轮换 App Secret 后重试。";
+  return error;
 }
 
 function AddBotDialog({ user, workers, onClose, onCreated }: { user: AdminUser; workers: AnyRecord[]; onClose(): void; onCreated(bot: AnyRecord): void }) {
@@ -316,7 +338,7 @@ function PageLoading({ compact = false }: { compact?: boolean }) { return <div c
 function PageTitle({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) { return <div className="page-title"><div><span className="eyebrow">{eyebrow}</span><h1>{title}</h1><p>{description}</p></div>{action}</div>; }
 function PanelHead({ title, subtitle, link }: { title: string; subtitle: string; link?: string }) { return <div className="panel-head"><div><h2>{title}</h2><p>{subtitle}</p></div>{link && <NavLink to={link}>查看全部 <ChevronRight size={15} /></NavLink>}</div>; }
 function Freshness() { return <div className="freshness"><span className="pulse" />实时更新</div>; }
-function StateBadge({ state }: { state: string }) { return <span className={`state-badge state-${state}`}>{displayState(state)}</span>; }
+function StateBadge({ state, label }: { state: string; label?: string | undefined }) { return <span className={`state-badge state-${state}`}>{label ?? displayState(state)}</span>; }
 function StatusDot({ state }: { state: string }) { return <span className={`status-dot ${state}`} />; }
 function SummaryStat({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function MiniBars({ values }: { values: number[] }) { const list = values.length ? values : Array(24).fill(0); const max = Math.max(...list, 1); return <div className="mini-bars" aria-label="过去24小时任务量">{list.map((v, i) => <span key={i} style={{ height: `${Math.max(5, v / max * 100)}%` }} title={`${v} 个任务`} />)}</div>; }

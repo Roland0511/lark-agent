@@ -59,12 +59,18 @@ export function isPermanentConsumerExit(code: number | null): boolean {
 }
 
 export function consumerExitError(eventKey: string, code: number | null, stderr: string): Error {
-  try {
-    const envelope = JSON.parse(stderr) as { error?: { message?: string; hint?: string } };
-    const detail = [envelope.error?.message, envelope.error?.hint].filter(Boolean).join("; ");
-    if (detail) return new Error(detail);
-  } catch {
-    // Fall back to the stable exit diagnostic when stderr is not one JSON object.
+  const jsonStart = stderr.indexOf("{");
+  const jsonEnd = stderr.lastIndexOf("}");
+  const embeddedJson = jsonStart >= 0 && jsonEnd > jsonStart ? stderr.slice(jsonStart, jsonEnd + 1) : "";
+  const candidates = [stderr, embeddedJson, ...stderr.split("\n").reverse()];
+  for (const candidate of candidates) {
+    try {
+      const envelope = JSON.parse(candidate) as { error?: { message?: string; hint?: string } };
+      const detail = [envelope.error?.message, envelope.error?.hint].filter(Boolean).join("; ");
+      if (detail) return new Error(detail);
+    } catch {
+      // lark-cli may mix progress lines and a JSON error envelope on stderr.
+    }
   }
   return new Error(`${eventKey} consumer exited with ${code ?? -1}`);
 }

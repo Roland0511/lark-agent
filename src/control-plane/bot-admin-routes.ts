@@ -26,7 +26,7 @@ const updateSchema = z.object({
   defaultExecutorId: z.string().max(128).nullable(),
   defaultWorkspaceAlias: z.string().max(128).nullable()
 });
-const commandSchema = z.object({ command: z.enum(["enable", "disable", "set_system"]) });
+const commandSchema = z.object({ command: z.enum(["enable", "disable", "set_system", "reconnect"]) });
 const credentialSchema = z.object({ appSecret: z.string().min(8).max(512) });
 const bindingsSchema = z.object({ bindings: z.array(z.object({
   chatId: z.string().min(1).max(128), chatName: z.string().max(256).nullable().default(null), enabled: z.boolean().default(true),
@@ -117,12 +117,13 @@ export function registerBotAdminRoutes(
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
     if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
     if (body.command === "disable" && bot.is_system) throw new AppError("请先指定其他系统通知机器人", 409, "system_bot_required");
+    if (body.command === "reconnect" && !bot.enabled) throw new AppError("机器人已停用，请先重新启用", 409, "bot_disabled");
     if (body.command === "set_system") {
       await db.transaction().execute(async (trx) => {
         await trx.updateTable("bots").set({ is_system: false, updated_at: new Date() }).where("is_system", "=", true).execute();
         await trx.updateTable("bots").set({ is_system: true, enabled: true, updated_at: new Date() }).where("id", "=", bot.id).execute();
       });
-    } else {
+    } else if (body.command !== "reconnect") {
       await db.updateTable("bots").set({ enabled: body.command === "enable", updated_at: new Date() }).where("id", "=", bot.id).execute();
     }
     await dependencies.controller.reconcile(bot.id);

@@ -466,6 +466,7 @@ a {
   color: #a86008;
 }
 .state-failed,
+.state-error,
 .state-cancelled,
 .state-offline,
 .state-disabled,
@@ -1375,6 +1376,11 @@ td small {
 .bot-routing-note span { color: #617493; font-size: 11px; line-height: 1.5; }
 .bot-badges { display: flex; gap: 7px; flex-wrap: wrap; margin: 15px 0; }
 .bot-badges span { display: inline-flex; align-items: center; gap: 4px; border-radius: 999px; background: #edf3ff; color: #3c64a6; padding: 5px 8px; font-size: 9px; font-weight: 700; }
+.bot-runtime-alert { display: flex; align-items: flex-start; gap: 9px; margin: 0 0 14px; padding: 11px 12px; border: 1px solid #f5c9ce; border-radius: 10px; background: #fff5f6; color: #a92734; }
+.bot-runtime-alert > svg { flex: 0 0 auto; margin-top: 1px; }
+.bot-runtime-alert > div { display: flex; min-width: 0; flex-direction: column; gap: 3px; }
+.bot-runtime-alert strong { font-size: 11px; }
+.bot-runtime-alert span { color: #8a4f56; font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
 .bot-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 13px; margin: 16px 0; }
 .bot-form label { display: flex; flex-direction: column; gap: 6px; color: #5b6b80; font-size: 11px; font-weight: 700; }
 .bot-form label.span-2 { grid-column: 1 / -1; }

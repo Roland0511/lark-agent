@@ -21,4 +21,13 @@ describe("lark-cli consumer exit policy", () => {
     expect(error.message).toBe("callback is not subscribed; subscribe it in the console");
   });
 
+  it("extracts a JSON error when lark-cli also writes progress lines", () => {
+    const error = consumerExitError("im.message.receive_v1", 2, [
+      "[event] consuming as bot-example",
+      JSON.stringify({ error: { message: "message event is not subscribed", hint: "subscribe it in the console" } }, null, 2),
+      "[event] stopped"
+    ].join("\n"));
+    expect(error.message).toBe("message event is not subscribed; subscribe it in the console");
+  });
+
 });
