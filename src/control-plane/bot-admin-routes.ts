@@ -9,6 +9,8 @@ import { AppError, errorMessage } from "../shared/errors.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { requireAdmin, requireCsrf } from "./admin-auth.js";
 import { BotGatewayRegistry, LarkProfileStore } from "./bot-runtime.js";
+import { LarkGateway } from "../lark/gateway.js";
+import { BotPermissionService, type BotPermissionCheck } from "./bot-permissions.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { AdminEventBus } from "./admin-events.js";
 
@@ -50,9 +52,35 @@ export function registerBotAdminRoutes(
   app: FastifyInstance,
   db: Kysely<Database>,
   config: ControlPlaneConfig,
-  dependencies: { gateways: BotGatewayRegistry; runtime: RuntimeStatus; events: AdminEventBus; controller: BotRuntimeController }
+  dependencies: { gateways: BotGatewayRegistry; runtime: RuntimeStatus; events: AdminEventBus; controller: BotRuntimeController; permissions?: BotPermissionService }
 ): void {
   const profiles = new LarkProfileStore(config.larkCliPath);
+  const permissions = dependencies.permissions ?? new BotPermissionService(async (profileName) => (
+    new LarkGateway(config.larkCliPath, undefined, profileName).listGrantedScopes()
+  ));
+  const persistPermissionCheck = async (botId: string, check: BotPermissionCheck) => {
+    await db.updateTable("bots").set({
+      permission_state: check.state,
+      permission_check: JSON.stringify(check),
+      permission_checked_at: new Date(check.checkedAt),
+      updated_at: new Date()
+    }).where("id", "=", botId).execute();
+  };
+  const checkBotPermissions = async (bot: { id: string; profile_name: string | null }) => {
+    const check = await permissions.check(bot.profile_name);
+    await persistPermissionCheck(bot.id, check);
+    return check;
+  };
+  const requireCompletePermissions = async (bot: { id: string; profile_name: string | null }) => {
+    const check = await checkBotPermissions(bot);
+    if (check.ok) return check;
+    const missing = check.items.filter((item) => item.status === "missing").map((item) => item.label);
+    throw new AppError(
+      check.state === "error" ? `应用权限检测失败：${check.error ?? "未知错误"}` : `应用权限不完整：${missing.join("、")}`,
+      409,
+      check.state === "error" ? "bot_permission_check_failed" : "bot_permissions_missing"
+    );
+  };
   const validateExecutionRoute = async (executorId: string | null, workspaceAlias: string | null) => {
     if (!executorId && !workspaceAlias) return;
     const workers = await db.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).execute();
@@ -80,6 +108,15 @@ export function registerBotAdminRoutes(
       return bot.default_workspace_alias ? aliases.includes(bot.default_workspace_alias) : aliases.length === 1;
     });
     const runtime = dependencies.runtime.snapshot([`${bot.id}:message`, `${bot.id}:card`]);
+    const messageRuntime = runtime[`${bot.id}:message`];
+    const permissionCheck = bot.permission_check && typeof bot.permission_check === "object" ? bot.permission_check : null;
+    const eventSubscription = !bot.enabled
+      ? { state: "disabled", label: "机器人已停用，未验证消息事件订阅" }
+      : messageRuntime?.ready
+        ? { state: "ready", label: "im.message.receive_v1 长连接正常" }
+        : messageRuntime?.state === "error"
+          ? { state: "error", label: "消息事件未就绪", error: messageRuntime.lastError ?? null }
+          : { state: "pending", label: "正在等待消息长连接就绪" };
     return {
       id: bot.id, appId: bot.app_id, displayName: bot.display_name, roleInstructions: bot.role_instructions,
       ownerBound: Boolean(bot.owner_open_id), defaultExecutorId: bot.default_executor_id, defaultWorkspaceAlias: bot.default_workspace_alias,
@@ -87,7 +124,9 @@ export function registerBotAdminRoutes(
       executionModel: bot.execution_model, executionReasoningEffort: bot.execution_reasoning_effort,
       routeWarning: !bot.default_executor_id && eligibleWorkers.length > 1 ? "存在多个可用执行器，请明确绑定默认执行器" : null,
       enabled: bot.enabled, isSystem: bot.is_system, configRevision: bot.config_revision, credentialState: bot.credential_state,
-      credentialError: bot.credential_error, credentialsConfigured: true, runtime, bindings: bindings.map((item) => ({
+      credentialError: bot.credential_error, credentialsConfigured: true,
+      permissionState: bot.permission_state, permissionCheck, permissionCheckedAt: bot.permission_checked_at ? new Date(bot.permission_checked_at).toISOString() : null,
+      eventSubscription, runtime, bindings: bindings.map((item) => ({
         chatId: item.chat_id, chatName: item.chat_name, enabled: item.enabled, preferredExecutorId: item.preferred_executor_id, workspaceAlias: item.workspace_alias
       })), credentialRotatable: Boolean(bot.profile_name), activeConversations: activeConversations.count, activeTasks: activeTasks.count,
       createdAt: new Date(bot.created_at).toISOString(), updatedAt: new Date(bot.updated_at).toISOString()
@@ -113,6 +152,7 @@ export function registerBotAdminRoutes(
     const profileName = `bot-${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     await profiles.add(profileName, body.appId, body.appSecret);
     try {
+      const permissionCheck = await permissions.check(profileName);
       const systemExists = await db.selectFrom("bots").select("id").where("is_system", "=", true).where("deleted_at", "is", null).executeTakeFirst();
       const bot = await db.insertInto("bots").values({
         app_id: body.appId, profile_name: profileName, bot_open_id: body.appId, display_name: body.displayName,
@@ -120,10 +160,12 @@ export function registerBotAdminRoutes(
         default_workspace_alias: body.defaultWorkspaceAlias,
         attention_model: body.attentionModel, attention_reasoning_effort: body.attentionReasoningEffort,
         execution_model: body.executionModel, execution_reasoning_effort: body.executionReasoningEffort,
-        enabled: true, is_system: !systemExists, config_revision: 1,
-        credential_state: "verified", credential_error: null, deleted_at: null, updated_at: new Date()
+        enabled: permissionCheck.ok, is_system: !systemExists, config_revision: 1,
+        credential_state: "verified", credential_error: null,
+        permission_state: permissionCheck.state, permission_check: JSON.stringify(permissionCheck), permission_checked_at: new Date(permissionCheck.checkedAt),
+        deleted_at: null, updated_at: new Date()
       }).returning("id").executeTakeFirstOrThrow();
-      await dependencies.controller.reconcile(bot.id);
+      if (permissionCheck.ok) await dependencies.controller.reconcile(bot.id);
       dependencies.events.publish("bot", bot.id);
       return reply.code(201).send(await view(bot.id));
     } catch (error) {
@@ -156,6 +198,7 @@ export function registerBotAdminRoutes(
     if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
     if (body.command === "disable" && bot.is_system) throw new AppError("请先指定其他系统通知机器人", 409, "system_bot_required");
     if (body.command === "reconnect" && !bot.enabled) throw new AppError("机器人已停用，请先重新启用", 409, "bot_disabled");
+    if (body.command === "enable" || body.command === "set_system") await requireCompletePermissions(bot);
     if (body.command === "set_system") {
       await db.transaction().execute(async (trx) => {
         await trx.updateTable("bots").set({ is_system: false, updated_at: new Date() }).where("is_system", "=", true).execute();
@@ -169,6 +212,16 @@ export function registerBotAdminRoutes(
     return view(bot.id);
   });
 
+  app.post<{ Params: { id: string } }>("/v1/admin/bots/:id/permission-check", async (request) => {
+    const principal = await requireAdmin(db, config, request); requireCsrf(request, principal);
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
+    if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
+    const check = await checkBotPermissions(bot);
+    if (check.ok && bot.enabled) await dependencies.controller.reconcile(bot.id);
+    dependencies.events.publish("bot", bot.id);
+    return view(bot.id);
+  });
+
   app.post<{ Params: { id: string } }>("/v1/admin/bots/:id/credentials", async (request) => {
     const principal = await requireAdmin(db, config, request); requireCsrf(request, principal);
     const body = credentialSchema.parse(request.body);
@@ -177,7 +230,12 @@ export function registerBotAdminRoutes(
     await dependencies.controller.suspend(bot.id);
     try {
       await profiles.rotate(bot.profile_name, bot.app_id, body.appSecret);
-      await db.updateTable("bots").set({ credential_state: "verified", credential_error: null, updated_at: new Date() }).where("id", "=", bot.id).execute();
+      const permissionCheck = await permissions.check(bot.profile_name);
+      await db.updateTable("bots").set({
+        credential_state: "verified", credential_error: null,
+        permission_state: permissionCheck.state, permission_check: JSON.stringify(permissionCheck), permission_checked_at: new Date(permissionCheck.checkedAt),
+        updated_at: new Date()
+      }).where("id", "=", bot.id).execute();
     } catch (error) {
       const restored = await profiles.verify(bot.profile_name, bot.app_id).then(() => true).catch(() => false);
       await db.updateTable("bots").set({ credential_state: restored ? "verified" : "error", credential_error: restored ? null : errorMessage(error).slice(0, 500), updated_at: new Date() }).where("id", "=", bot.id).execute();

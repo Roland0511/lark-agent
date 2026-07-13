@@ -73,7 +73,18 @@ pnpm init:lark-volume
 
 ## 飞书配置
 
-至少订阅 `im.message.receive_v1`，并为机器人配置读取与发送消息所需权限。流式回复还需要 `cardkit:card:write`。卡片按钮回调是可选能力，可通过 `LARK_CARD_ACTIONS_ENABLED` 单独启用。
+至少订阅 `im.message.receive_v1`。控制台添加机器人时会自动读取应用当前实际授权，并检查以下完整能力；已有机器人也可以在“机器人”页面随时重新检测：
+
+- 私聊消息：`im:message.p2p_msg:readonly`
+- 群内用户 @：`im:message.group_at_msg:readonly`
+- 群内普通用户消息：`im:message.group_msg`
+- 用户或机器人 @：`im:message.group_at_msg.include_bot:readonly`
+- 群内机器人普通消息：`im:message.group_bot_msg:readonly`
+- 消息读取与发送：`im:message`
+- 群聊信息读取：`im:chat:read`、`im:chat:readonly` 或 `im:chat` 其中之一
+- CardKit 单消息流式回复：`cardkit:card:write`
+
+部分能力兼容飞书历史权限名称或拆分权限组合，控制台会自动识别。权限开通后必须发布新的应用版本，再点击“重新检测”。凭据有效、应用权限完整和 `im.message.receive_v1` 事件长连接正常是三个独立状态；新机器人权限不完整时会保留配置但暂不启用。卡片按钮回调是可选能力，可通过 `LARK_CARD_ACTIONS_ENABLED` 单独启用。
 
 私聊机器人发送：
 
@@ -96,7 +107,7 @@ pnpm init:lark-volume
 
 再勾选该机器人可以处理的群，并按需设置角色提示词、默认执行器和默认总工作区。Runner 会在机器人首次执行任务时创建 `<总工作区>/<App ID>/`，并将它作为该机器人独立的 Codex 工作目录。群中明确
 `@` 某个已注册机器人时只路由给被提及者；没有明确提及机器人的普通续聊会进入该群
-所有活跃机器人各自的收件箱，由它们独立决定是否响应。已注册机器人的最终回复也按普通成员消息进入其他活跃机器人的收件箱；不会回灌给自己，也不会传播 commentary、审批或故障提示。由于飞书事件不会稳定推送普通机器人消息，这条链路由控制面在发件确认成功后按平台 `message_id` 幂等投递。
+所有活跃机器人各自的收件箱，由它们独立决定是否响应。已注册机器人的最终回复也通过飞书原生消息事件按普通成员消息进入其他活跃机器人的收件箱；不会回灌给自己，也不会传播 commentary、审批或故障提示。该能力依赖 `im:message.group_at_msg.include_bot:readonly` 和 `im:message.group_bot_msg:readonly`，不使用控制面内部投递。
 
 “机器人”页面可配置连续互聊的全局因果深度，默认 30 轮、范围 1–200。达到上限时当前回复仍会发送，但控制面停止继续传播，只在群内提示一次并等待人类消息；下一条人类消息会自动建立新的因果起点。角色与路由修改只影响新会话。
 

@@ -166,7 +166,8 @@ export class BotRuntimeManager {
   ) {}
 
   async startAll(): Promise<void> {
-    const bots = await this.db.selectFrom("bots").selectAll().where("enabled", "=", true).where("credential_state", "=", "verified").where("deleted_at", "is", null).execute();
+    const bots = await this.db.selectFrom("bots").selectAll().where("enabled", "=", true).where("credential_state", "=", "verified")
+      .where("permission_state", "in", ["unchecked", "valid"]).where("deleted_at", "is", null).execute();
     await Promise.all(bots.map((bot) => this.start(bot)));
   }
 
@@ -174,7 +175,7 @@ export class BotRuntimeManager {
     await this.stop(botId);
     this.gateways.invalidate(botId);
     const bot = await this.db.selectFrom("bots").selectAll().where("id", "=", botId).where("deleted_at", "is", null).executeTakeFirst();
-    if (bot?.enabled && bot.credential_state === "verified") await this.start(bot);
+    if (bot?.enabled && bot.credential_state === "verified" && ["unchecked", "valid"].includes(bot.permission_state)) await this.start(bot);
   }
 
   async suspend(botId: string): Promise<void> {

@@ -322,6 +322,9 @@ export interface BotsTable {
   config_revision: Generated<number>;
   credential_state: Generated<"pending" | "verified" | "error">;
   credential_error: string | null;
+  permission_state: Generated<"unchecked" | "valid" | "missing" | "error">;
+  permission_check: Json | null;
+  permission_checked_at: NullableTimestamp;
   deleted_at: NullableTimestamp;
   created_at: Timestamp;
   updated_at: Timestamp;

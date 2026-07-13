@@ -26,6 +26,7 @@ export class EventRouter {
       attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null,
       default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true,
       config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null,
+      permission_state: "unchecked", permission_check: null, permission_checked_at: null,
       created_at: new Date(), updated_at: new Date()
     },
     private readonly messageRouter = new MessageRouter(db),

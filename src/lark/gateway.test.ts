@@ -2,6 +2,20 @@ import { describe, expect, it } from "vitest";
 import { LarkGateway } from "./gateway.js";
 
 describe("LarkGateway main-chat messaging", () => {
+  it("lists only granted application scopes with the selected bot profile", async () => {
+    const calls: string[][] = [];
+    const gateway = new LarkGateway("lark-cli", async (_command, args) => {
+      calls.push(args);
+      return { data: { scopes: [
+        { scope_name: "im:message", grant_status: 1 },
+        { scope_name: "cardkit:card:write", grant_status: 2 },
+        { scope_name: "im:message", grant_status: 1 }
+      ] } };
+    }, "bot-profile");
+    await expect(gateway.listGrantedScopes()).resolves.toEqual(["im:message"]);
+    expect(calls[0]).toEqual(["--profile", "bot-profile", "api", "GET", "/open-apis/application/v6/scopes", "--as", "bot", "--format", "json"]);
+  });
+
   it("sends markdown and cards directly to a chat without thread reply arguments", async () => {
     const calls: string[][] = [];
     const gateway = new LarkGateway("lark-cli", async (_command, args) => {

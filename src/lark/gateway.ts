@@ -2,7 +2,7 @@ import type { LarkMessageDetails } from "../shared/contracts.js";
 import { runJsonCommand } from "./cli.js";
 
 interface LarkEnvelope {
-  data?: { items?: unknown[]; messages?: unknown[]; message_id?: string; card_id?: string; has_more?: boolean; page_token?: string; name?: string };
+  data?: { items?: unknown[]; messages?: unknown[]; scopes?: unknown[]; message_id?: string; card_id?: string; has_more?: boolean; page_token?: string; name?: string };
   items?: unknown[];
   messages?: unknown[];
   message_id?: string;
@@ -73,6 +73,18 @@ export class LarkGateway {
 
   private invoke(args: string[]): Promise<unknown> {
     return this.run(this.cliPath, this.args(args));
+  }
+
+  async listGrantedScopes(): Promise<string[]> {
+    const envelope = (await this.invoke([
+      "api", "GET", "/open-apis/application/v6/scopes", "--as", "bot", "--format", "json"
+    ])) as LarkEnvelope;
+    const scopes = (envelope.data?.scopes ?? []).flatMap((raw) => {
+      if (!raw || typeof raw !== "object") return [];
+      const item = raw as Record<string, unknown>;
+      return Number(item.grant_status) === 1 && typeof item.scope_name === "string" ? [item.scope_name] : [];
+    });
+    return [...new Set(scopes)].sort();
   }
 
   async getMessage(messageId: string): Promise<LarkMessageDetails> {

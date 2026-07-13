@@ -21,6 +21,7 @@ import { registerBotAdminRoutes } from "./bot-admin-routes.js";
 import { bootstrapLegacyBot, BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
 import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
+import { BotPermissionService } from "./bot-permissions.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -52,6 +53,11 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   };
   const { app, services } = buildControlPlane(db, config);
   const reconciledBotIds: string[] = [];
+  let grantedBotScopes = [
+    "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message.group_msg",
+    "im:message.group_at_msg.include_bot:readonly", "im:message.group_bot_msg:readonly",
+    "im:message", "im:chat:readonly", "cardkit:card:write"
+  ];
   registerBotAdminRoutes(app, db, config, {
     gateways: services.gateways,
     runtime: services.runtime,
@@ -59,7 +65,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     controller: {
       reconcile: async (botId) => { reconciledBotIds.push(botId); },
       suspend: async () => undefined
-    }
+    },
+    permissions: new BotPermissionService(async () => grantedBotScopes)
   });
   const insertWorker = async () => db.insertInto("workers").values({
     executor_id: "worker-a", display_name: "Worker A", home_ref: "worker-a:home", codex_profile: "lark-agent",
@@ -81,6 +88,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const multiBotSql = await readFile(fileURLToPath(new URL("../db/migrations/011_multi_bot.sql", import.meta.url)), "utf8");
     const latencyAndModelPolicySql = await readFile(fileURLToPath(new URL("../db/migrations/012_latency_and_model_policy.sql", import.meta.url)), "utf8");
     const botDialogueSql = await readFile(fileURLToPath(new URL("../db/migrations/013_bot_dialogue.sql", import.meta.url)), "utf8");
+    const botPermissionsSql = await readFile(fileURLToPath(new URL("../db/migrations/014_bot_permissions.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -99,11 +107,18 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (latencyPolicyApplied.rowCount === 0) await client.query(latencyAndModelPolicySql);
     const botDialogueApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'signals' AND column_name = 'sender_type'");
     if (botDialogueApplied.rowCount === 0) await client.query(botDialogueSql);
+    const botPermissionsApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'bots' AND column_name = 'permission_state'");
+    if (botPermissionsApplied.rowCount === 0) await client.query(botPermissionsSql);
     await client.end();
   });
 
   beforeEach(async () => {
     reconciledBotIds.length = 0;
+    grantedBotScopes = [
+      "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message.group_msg",
+      "im:message.group_at_msg.include_bot:readonly", "im:message.group_bot_msg:readonly",
+      "im:message", "im:chat:readonly", "cardkit:card:write"
+    ];
     await db.deleteFrom("admin_sessions").execute();
     await db.deleteFrom("admin_login_tokens").execute();
     await db.deleteFrom("incidents").execute();
@@ -125,7 +140,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("workers").execute();
     await db.deleteFrom("bots").where("id", "!=", "00000000-0000-0000-0000-000000000001").execute();
     await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 30, updated_at: new Date() }).where("id", "=", 1).execute();
-    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, credential_state: "verified", deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, credential_state: "verified", permission_state: "unchecked", permission_check: null, permission_checked_at: null, deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     await db.insertInto("bot_chat_bindings").values({ bot_id: "00000000-0000-0000-0000-000000000001", chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
   });
 
@@ -166,6 +181,31 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(response.statusCode).toBe(200);
     expect(reconciledBotIds).toEqual([botId]);
     expect(await db.selectFrom("bots").select(["enabled", "is_system", "config_revision"]).where("id", "=", botId).executeTakeFirstOrThrow()).toEqual(before);
+  });
+
+  it("checks existing bot permissions and blocks enabling until every capability is granted", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-check-bot-permissions"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "permission-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const botId = "00000000-0000-0000-0000-000000000001";
+    const headers = { cookie: "lark_agent_admin_session=owner-check-bot-permissions", "x-csrf-token": "permission-csrf" };
+    grantedBotScopes = grantedBotScopes.filter((scope) => scope !== "im:message.group_bot_msg:readonly");
+
+    const checked = await app.inject({ method: "POST", url: `/v1/admin/bots/${botId}/permission-check`, headers });
+    expect(checked.statusCode).toBe(200);
+    expect(checked.json()).toMatchObject({ permissionState: "missing", permissionCheck: { ok: false, missingScopes: ["im:message.group_bot_msg:readonly"] } });
+
+    await db.updateTable("bots").set({ enabled: false, is_system: false }).where("id", "=", botId).execute();
+    const blocked = await app.inject({ method: "POST", url: `/v1/admin/bots/${botId}/commands`, headers, payload: { command: "enable" } });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json<{ error: { code: string } }>().error.code).toBe("bot_permissions_missing");
+    expect((await db.selectFrom("bots").select("enabled").where("id", "=", botId).executeTakeFirstOrThrow()).enabled).toBe(false);
+
+    grantedBotScopes.push("im:message.group_bot_msg:readonly");
+    expect((await app.inject({ method: "POST", url: `/v1/admin/bots/${botId}/permission-check`, headers })).json()).toMatchObject({ permissionState: "valid" });
+    expect((await app.inject({ method: "POST", url: `/v1/admin/bots/${botId}/commands`, headers, payload: { command: "enable" } })).statusCode).toBe(200);
   });
 
   it("reports device status and lets the bound credential unregister itself", async () => {
