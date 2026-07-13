@@ -102,6 +102,12 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.destroy();
   });
 
+  it("redirects the site root to the admin console", async () => {
+    const response = await app.inject({ method: "GET", url: "/" });
+    expect(response.statusCode).toBe(302);
+    expect(response.headers.location).toBe("/admin");
+  });
+
   it("reports device status and lets the bound credential unregister itself", async () => {
     await insertWorker();
     const deviceToken = "device-token-self-unregister";

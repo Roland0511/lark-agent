@@ -92,6 +92,9 @@ export function buildControlPlane(
     if (config.larkEnabled && !readiness.isLarkReady()) throw new AppError("lark consumers are not ready", 503, "lark_not_ready");
     return { ok: true };
   });
+  app.get("/", async (_request, reply) => {
+    return reply.code(302).header("location", "/admin").send();
+  });
 
   app.post("/v1/worker-sessions", async (request, reply) => {
     const registration = workerRegistrationSchema.parse(request.body);
