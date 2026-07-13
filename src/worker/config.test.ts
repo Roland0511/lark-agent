@@ -43,11 +43,22 @@ describe("worker config", () => {
     expect(config.codexHome).toBe(data.codexHome);
     expect(config.codexProfile).toBe("lark-agent");
     expect(config.profileOverrides).toContain('approval_policy="on-request"');
+    expect(config.profileModel).toBe("test");
+    expect(config.profileReasoningEffort).toBeNull();
     expect(config.profileOverrides.every((value) => !value.startsWith("tui."))).toBe(true);
     expect(config.homeRef).toMatch(/^test-worker:[a-f0-9]{16}$/);
     expect(config.homeRef).not.toContain(data.codexHome);
     expect(config.configFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(config.capabilities).not.toContain("app_handoff");
+  });
+
+  it("reports the effective profile model and reasoning effort", async () => {
+    const data = await fixture('model = "base-model"\nmodel_reasoning_effort = "medium"\n');
+    const profilePath = join(data.codexHome, "lark-agent.config.toml");
+    await writeFile(profilePath, 'model = "profile-model"\nmodel_reasoning_effort = "high"\napproval_policy = "on-request"\n');
+    const config = await loadWorkerConfig(data.configFile, { TEST_DEVICE_TOKEN: ["test", "device", "token"].join("-") });
+    expect(config.profileModel).toBe("profile-model");
+    expect(config.profileReasoningEffort).toBe("high");
   });
 
   it("rejects legacy embedded profiles", async () => {

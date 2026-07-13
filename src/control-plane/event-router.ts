@@ -33,13 +33,39 @@ export class EventRouter {
     const receivedAt = new Date();
     const duplicate = await this.db.selectFrom("processed_events").select("event_id").where("bot_id", "=", this.bot.id).where("event_id", "=", event.event_id).executeTakeFirst();
     if (duplicate) return;
-    const details = await this.lark.getMessage(event.message_id);
-    if (details.senderType === "app") {
+    if (event.chat_type === "group") {
+      const binding = await this.db.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", this.bot.id).where("chat_id", "=", event.chat_id).where("enabled", "=", true).executeTakeFirst();
+      if (!binding) return;
+    }
+
+    const registeredBots = await this.db
+      .selectFrom("bots")
+      .select(["id", "app_id", "bot_open_id", "display_name", "owner_open_id"])
+      .where("deleted_at", "is", null)
+      .execute();
+    const knownBotSender = registeredBots.some((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id);
+    if (knownBotSender) {
+      await this.markDiscarded(event.event_id, event.type);
+      return;
+    }
+
+    const displayNameCounts = new Map<string, number>();
+    for (const item of registeredBots) displayNameCounts.set(item.display_name, (displayNameCounts.get(item.display_name) ?? 0) + 1);
+    const fastMentionedBotIds = new Set(
+      event.chat_type === "group" && event.sender_id === this.bot.owner_open_id
+        ? registeredBots
+            .filter((item) => displayNameCounts.get(item.display_name) === 1 && event.content.includes(`@${item.display_name}`))
+            .map((item) => item.id)
+        : []
+    );
+    const canUseOwnerMentionFastPath = fastMentionedBotIds.size > 0;
+    const details = canUseOwnerMentionFastPath ? null : await this.lark.getMessage(event.message_id);
+    if (details?.senderType === "app") {
       await this.markDiscarded(event.event_id, event.type);
       return;
     }
     if (event.chat_type === "p2p") {
-      const command = details.content.trim();
+      const command = event.content.trim();
       const binding = command.match(/^\/绑定控制台\s+([A-Za-z0-9_-]{20,256})$/);
       if (binding?.[1]) {
         await this.handleOwnerBinding(event, binding[1]);
@@ -54,18 +80,12 @@ export class EventRouter {
         return;
       }
     }
-    if (event.chat_type === "group") {
-      const binding = await this.db.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", this.bot.id).where("chat_id", "=", event.chat_id).where("enabled", "=", true).executeTakeFirst();
-      if (!binding) return;
-    }
-
-    const rootMessageId = details.rootId ?? details.messageId;
-    const mentionIds = new Set(details.mentions.map((mention) => mention.id));
-    const registeredBots = event.chat_type === "group" && mentionIds.size
-      ? await this.db.selectFrom("bots").select(["app_id", "bot_open_id"]).where("deleted_at", "is", null).execute()
-      : [];
-    const hasRegisteredBotMention = registeredBots.some((item) => mentionIds.has(item.app_id) || Boolean(item.bot_open_id && mentionIds.has(item.bot_open_id)));
-    const mentionsThisBot = mentionIds.has(this.bot.app_id) || Boolean(this.bot.bot_open_id && mentionIds.has(this.bot.bot_open_id));
+    const rootMessageId = details?.rootId ?? event.message_id;
+    const mentionIds = new Set(details?.mentions.map((mention) => mention.id) ?? []);
+    const hasRegisteredBotMention = canUseOwnerMentionFastPath || registeredBots.some((item) => mentionIds.has(item.app_id) || Boolean(item.bot_open_id && mentionIds.has(item.bot_open_id)));
+    const mentionsThisBot = canUseOwnerMentionFastPath
+      ? fastMentionedBotIds.has(this.bot.id)
+      : mentionIds.has(this.bot.app_id) || Boolean(this.bot.bot_open_id && mentionIds.has(this.bot.bot_open_id));
     if (event.chat_type === "group" && hasRegisteredBotMention && !mentionsThisBot) return;
     const explicitlyActivated = event.chat_type === "p2p" || mentionsThisBot;
 

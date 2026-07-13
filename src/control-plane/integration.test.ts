@@ -596,16 +596,17 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       createTime: "1",
       mentions: []
     };
-    const fakeLark = { getMessage: async () => details } as unknown as LarkGateway;
+    let getMessageCalls = 0;
+    const fakeLark = { getMessage: async () => { getMessageCalls += 1; return details; } } as unknown as LarkGateway;
     const router = new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60));
-    const event = (eventId: string, messageId: string, content: string): LarkMessageEvent => ({
+    const event = (eventId: string, messageId: string, content: string, senderId = "ou_member"): LarkMessageEvent => ({
       type: "im.message.receive_v1",
       event_id: eventId,
       timestamp: "1",
       message_id: messageId,
       chat_id: "oc_test",
       chat_type: "group",
-      sender_id: "ou_member",
+      sender_id: senderId,
       message_type: "text",
       content,
       create_time: "1"
@@ -617,7 +618,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(0);
 
     details = { ...details, messageId: "om_activated", content: "@Lark Agent handle this", mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
-    await router.handleMessage(event("ev_activated", "om_activated", "@Lark Agent handle this"));
+    await router.handleMessage(event("ev_activated", "om_activated", "@Lark Agent handle this", "ou_owner"));
+    expect(getMessageCalls).toBe(1);
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(1);
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
     const activatedConversation = await db.selectFrom("conversations").selectAll().executeTakeFirstOrThrow();

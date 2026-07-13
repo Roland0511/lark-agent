@@ -195,20 +195,23 @@ export class TaskProcessor {
       ["注意力判断", task.attentionModel, task.attentionReasoningEffort],
       ["正式执行", task.executionModel, task.executionReasoningEffort]
     ] as const) {
-      const model = modelId ? this.models.find((item) => item.id === modelId) : this.models.find((item) => item.isDefault);
+      const effectiveModelId = modelId ?? this.config.profileModel;
+      const effectiveEffort = effort ?? this.config.profileReasoningEffort;
+      const model = effectiveModelId ? this.models.find((item) => item.id === effectiveModelId) : this.models.find((item) => item.isDefault);
       if (!model) continue;
-      if (effort && model.supportedReasoningEfforts.length && !model.supportedReasoningEfforts.includes(effort)) {
-        return `${stage}模型 ${modelId ?? model.id} 不支持推理强度 ${effort}`;
+      if (effectiveEffort && model.supportedReasoningEfforts.length && !model.supportedReasoningEfforts.includes(effectiveEffort)) {
+        return `${stage}模型 ${effectiveModelId ?? model.id} 不支持推理强度 ${effectiveEffort}`;
       }
     }
     return null;
   }
 
   private observedModelPolicy(configuredModel: string | null, configuredEffort: string | null) {
-    const model = configuredModel ? this.models.find((item) => item.id === configuredModel) : this.models.find((item) => item.isDefault);
+    const effectiveModelId = configuredModel ?? this.config.profileModel;
+    const model = effectiveModelId ? this.models.find((item) => item.id === effectiveModelId) : this.models.find((item) => item.isDefault);
     return {
-      model: configuredModel ?? model?.id ?? null,
-      effort: configuredEffort ?? model?.defaultReasoningEffort ?? null,
+      model: effectiveModelId ?? model?.id ?? null,
+      effort: configuredEffort ?? this.config.profileReasoningEffort ?? model?.defaultReasoningEffort ?? null,
       inheritedModel: configuredModel === null,
       inheritedEffort: configuredEffort === null
     };

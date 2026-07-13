@@ -67,6 +67,8 @@ rl.on('line', (line) => {
     homeRef: "test:1234",
     codexProfile: "lark-agent",
     profileOverrides: ['model="test"'],
+    profileModel: "test",
+    profileReasoningEffort: "high",
     codexBinary: binary,
     codexVersion: "fake",
     configFingerprint: "a".repeat(64),

@@ -42,6 +42,8 @@ export interface ResolvedWorkerConfig {
   homeRef: string;
   codexProfile: string;
   profileOverrides: string[];
+  profileModel: string | null;
+  profileReasoningEffort: string | null;
   codexBinary: string;
   codexVersion: string;
   configFingerprint: string;
@@ -181,6 +183,10 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   const codexVersion = await commandVersion(raw.executor.codex_binary, codexHome);
   const protocolHash = await protocolFingerprint(raw.executor.codex_binary, codexHome);
   const overrides = profileOverrides(profileConfig);
+  const baseValues = baseConfig ? parseToml(baseConfig) as Record<string, unknown> : {};
+  const profileValues = parseToml(profileConfig) as Record<string, unknown>;
+  const effectiveModel = profileValues.model ?? baseValues.model;
+  const effectiveReasoningEffort = profileValues.model_reasoning_effort ?? baseValues.model_reasoning_effort;
   const configFingerprint = sha256([baseConfig, profileConfig, codexVersion, protocolHash].join("\n---\n"));
   return {
     controlPlaneUrl: raw.control_plane.url.replace(/\/$/, ""),
@@ -191,6 +197,8 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     homeRef: stableHomeRef(raw.executor.id, codexHome),
     codexProfile: raw.executor.codex_profile,
     profileOverrides: overrides,
+    profileModel: typeof effectiveModel === "string" ? effectiveModel : null,
+    profileReasoningEffort: typeof effectiveReasoningEffort === "string" ? effectiveReasoningEffort : null,
     codexBinary: raw.executor.codex_binary,
     codexVersion,
     configFingerprint,
