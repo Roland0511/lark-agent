@@ -129,7 +129,7 @@ function BotCard({ bot, user, onEdit, onRefreshed }: { bot: AnyRecord; user: Adm
   const runtimeError = runtimeState === "error" ? explainBotRuntimeError(message?.lastError) : null;
   return <article className="worker-card bot-card"><div className="worker-card-top"><div className="machine-icon"><Bot /></div><div><h3>{bot.displayName}</h3><p>{bot.appId}</p></div><StateBadge state={runtimeState} label={runtimeLabel} /></div>
     <div className="bot-badges">{bot.isSystem && <span><ShieldCheck size={13} />系统通知</span>}<span>{bot.ownerBound ? "主人已绑定" : "等待主人绑定"}</span><span>配置 v{bot.configRevision}</span></div>
-    {runtimeError && <div className="bot-runtime-alert"><AlertTriangle size={17} /><div><strong>消息消费者没有运行</strong><span>{runtimeError}</span></div></div>}
+    {runtimeError && <div className="bot-runtime-alert" title={message?.lastError ?? undefined}><AlertTriangle size={17} /><div><strong>消息消费者没有运行</strong><span>{runtimeError}</span></div></div>}
     <dl className="detail-list"><Detail label="角色" value={bot.roleInstructions || "通用助理"} /><Detail label="默认执行器" value={bot.defaultExecutorId} /><Detail label="默认工作区" value={bot.defaultWorkspaceAlias} /><Detail label="已绑定群" value={`${bot.bindings?.filter((x: AnyRecord) => x.enabled).length ?? 0} 个`} /><Detail label="活跃会话" value={`${bot.activeConversations} 个`} /><Detail label="凭据" value={bot.credentialState === "verified" ? "已验证（只写）" : bot.credentialError ?? bot.credentialState} /></dl>
     {reconnect.error && <ErrorBox error={reconnect.error} />}
     <div className="card-actions">{runtimeError && <button className="secondary-button" disabled={reconnect.isPending} onClick={() => reconnect.mutate()}><RefreshCw size={15} />{reconnect.isPending ? "正在重连…" : "重新连接"}</button>}<button className="secondary-button" onClick={onEdit}>配置</button></div>
@@ -138,6 +138,8 @@ function BotCard({ bot, user, onEdit, onRefreshed }: { bot: AnyRecord; user: Adm
 
 function explainBotRuntimeError(error?: string | null): string {
   if (!error) return "消息长连接未就绪。可以重新连接；如果仍失败，请检查飞书事件订阅和应用权限。";
+  if (/another event bus is already connected/i.test(error)) return "飞书平台检测到该应用还有另一个消息长连接。请停止占用连接的机器或进程，等待平台释放后再重新连接，避免消息被重复消费。";
+  if (/not subscribed/i.test(error)) return "飞书开发者后台尚未订阅所需的消息事件。完成订阅并发布应用版本后，再重新连接。";
   if (/consumer exited with 2/i.test(error)) return "启动检查未通过（退出码 2）。常见原因是消息事件尚未订阅或配置刚修改尚未生效；可以先重新连接。";
   if (/consumer exited with 3/i.test(error)) return "机器人认证失败（退出码 3）。请检查或轮换 App Secret 后重试。";
   return error;
