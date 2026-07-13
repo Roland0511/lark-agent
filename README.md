@@ -49,6 +49,11 @@ docker compose up -d postgres control
 docker compose -f compose.yaml -f compose.host.yaml up -d postgres control
 ```
 
+控制台支持挂载在 HTTPS 子路径。将 `ADMIN_ORIGIN` 设置为完整公开地址（例如
+`https://agent.example.internal/lark-agent`），并让反向代理把该路径前缀剥离后转发到 control；
+同时传递 `X-Forwarded-Prefix: /lark-agent`。后台静态资源、API、SSE、身份确认链接和
+Session Cookie 会保持在同一子路径内。
+
 如需同时运行示例 Caddy 入口：
 
 ```bash

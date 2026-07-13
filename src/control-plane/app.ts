@@ -93,7 +93,7 @@ export function buildControlPlane(
     return { ok: true };
   });
   app.get("/", async (_request, reply) => {
-    return reply.code(302).header("location", "/admin").send();
+    return reply.code(302).header("location", "/admin/").send();
   });
 
   app.post("/v1/worker-sessions", async (request, reply) => {
@@ -303,12 +303,18 @@ export function buildControlPlane(
   if (existsSync(adminAssets)) {
     void app.register(staticPlugin, { root: adminAssets, prefix: "/admin/assets/", decorateReply: false });
   }
-  const sendAdmin = async (_request: FastifyRequest, reply: import("fastify").FastifyReply) => {
+  const sendAdmin = async (request: FastifyRequest, reply: import("fastify").FastifyReply) => {
     if (!existsSync(resolve(adminRoot, "index.html"))) throw new AppError("运维后台尚未构建", 503, "admin_ui_unavailable");
     reply.type("text/html; charset=utf-8").header("cache-control", "no-store");
-    return readFile(resolve(adminRoot, "index.html"), "utf8");
+    const forwardedPrefix = typeof request.headers["x-forwarded-prefix"] === "string"
+      && /^\/[A-Za-z0-9/_-]*$/.test(request.headers["x-forwarded-prefix"])
+      ? request.headers["x-forwarded-prefix"].replace(/\/+$/, "")
+      : "";
+    const html = await readFile(resolve(adminRoot, "index.html"), "utf8");
+    return html.replace("<head>", `<head><base href="${forwardedPrefix}/admin/">`);
   };
-  app.get("/admin", sendAdmin);
+  app.get("/admin", async (_request, reply) => reply.code(302).header("location", "/admin/").send());
+  app.get("/admin/", sendAdmin);
   app.get("/admin/*", sendAdmin);
 
   return { app, services: resolvedServices };

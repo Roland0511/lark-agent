@@ -21,8 +21,9 @@ export function adminRoleFor(config: ControlPlaneConfig, openId: string): AdminP
 }
 
 function cookieOptions(config: ControlPlaneConfig) {
+  const path = new URL(config.adminOrigin).pathname.replace(/\/+$/, "") || "/";
   return {
-    path: "/",
+    path,
     httpOnly: true,
     secure: config.adminOrigin.startsWith("https://"),
     sameSite: "lax" as const

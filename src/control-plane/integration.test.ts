@@ -37,7 +37,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     traceRetentionDays: 180,
     leaseSeconds: 60,
     sessionMinutes: 60,
-    adminOrigin: "http://127.0.0.1:3000",
+    adminOrigin: "https://agent.example.test/lark-agent",
     adminSessionHours: 12,
     adminIdleMinutes: 120,
     metricsBearerToken: "metrics-test-token",
@@ -105,7 +105,10 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   it("redirects the site root to the admin console", async () => {
     const response = await app.inject({ method: "GET", url: "/" });
     expect(response.statusCode).toBe(302);
-    expect(response.headers.location).toBe("/admin");
+    expect(response.headers.location).toBe("/admin/");
+    const admin = await app.inject({ method: "GET", url: "/admin" });
+    expect(admin.statusCode).toBe(302);
+    expect(admin.headers.location).toBe("/admin/");
   });
 
   it("reports device status and lets the bound credential unregister itself", async () => {
@@ -834,7 +837,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("processed_events").select("status").where("event_id", "=", "ev_connect").executeTakeFirst()).toEqual({ status: "admin_login" });
     expect(replies).toHaveLength(1);
     expect(replyChats).toEqual(["oc_private"]);
-    expect(replies[0]).toContain("http://127.0.0.1:3000/admin/login#token=");
+    expect(replies[0]).toContain("https://agent.example.test/lark-agent/admin/login#token=");
     expect(replies[0]).toContain("仅可使用一次");
   });
 
@@ -873,6 +876,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const cookie = connected.headers["set-cookie"] as string;
     expect(cookie).toContain("lark_agent_admin_session=");
     expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("Secure");
+    expect(cookie).toContain("Path=/lark-agent");
     const me = await app.inject({ method: "GET", url: "/v1/admin/me", headers: { cookie: cookie.split(";")[0] as string } });
     expect(me.statusCode).toBe(200);
     expect(me.json<{ role: string }>().role).toBe("owner");

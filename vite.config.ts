@@ -4,7 +4,7 @@ import { resolve } from "node:path";
 
 export default defineConfig({
   root: resolve(__dirname, "admin"),
-  base: "/admin/",
+  base: "./",
   plugins: [react()],
   build: { outDir: resolve(__dirname, "admin-dist"), emptyOutDir: true },
   server: {

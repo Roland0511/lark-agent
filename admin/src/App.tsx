@@ -5,7 +5,7 @@ import {
   Activity, AlertTriangle, ArrowRight, Bot, CheckCircle2, ChevronRight, CircleGauge, Clock3, FileClock, Inbox,
   Check, Copy, GitBranch, LogOut, Menu, MessageCircle, Plus, RefreshCw, Search, Server, ShieldCheck, Sparkles, Trash2, Wifi, WifiOff, X
 } from "lucide-react";
-import { api, ApiError, commandBody, relativeTime, type AdminUser } from "./api";
+import { adminPath, api, ApiError, commandBody, publicPath, relativeTime, type AdminUser } from "./api";
 
 type AnyRecord = Record<string, any>;
 const stateLabel: Record<string, string> = {
@@ -19,7 +19,7 @@ export function App({ queryClient }: { queryClient: QueryClient }) {
   const me = useQuery({ queryKey: ["me"], queryFn: () => api<AdminUser>("/v1/admin/me"), retry: false, refetchInterval: false });
   useEffect(() => {
     if (!me.data) return;
-    const stream = new EventSource("/v1/admin/stream");
+    const stream = new EventSource(publicPath("/v1/admin/stream"));
     stream.addEventListener("change", (event) => {
       const change = JSON.parse((event as MessageEvent).data) as { type: string; id?: string };
       void queryClient.invalidateQueries({ queryKey: [change.type] });
@@ -44,8 +44,8 @@ function Login({ error }: { error?: string }) {
     setConnecting(true);
     void api<{ ok: boolean }>("/auth/lark/consume", { method: "POST", body: JSON.stringify({ token }) })
       .then(() => {
-        window.history.replaceState({}, "", "/admin");
-        window.location.replace("/admin");
+        window.history.replaceState({}, "", adminPath("/"));
+        window.location.replace(adminPath("/"));
       })
       .catch((reason: unknown) => {
         setConnecting(false);
