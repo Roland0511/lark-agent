@@ -63,6 +63,9 @@ function buildStageTimings(events: StageEvent[]) {
   const timings = latencyStageDefinitions.map((definition) => {
     const start = find(definition.start);
     const end = start ? find(definition.end, start.created_at) : undefined;
+    const completedWithoutCommentary = definition.key === "first_commentary" && start && !end
+      ? find(["execution.completed"], start.created_at)
+      : undefined;
     const startPayload = start?.payload && typeof start.payload === "object" ? start.payload as Record<string, unknown> : {};
     const endPayload = end?.payload && typeof end.payload === "object" ? end.payload as Record<string, unknown> : {};
     return {
@@ -71,7 +74,7 @@ function buildStageTimings(events: StageEvent[]) {
       startedAt: iso(start?.created_at),
       completedAt: iso(end?.created_at),
       durationSeconds: elapsed(start?.created_at, end?.created_at),
-      state: !start ? "not_started" : end ? "completed" : "running",
+      state: !start ? "not_started" : end ? "completed" : completedWithoutCommentary ? "skipped" : "running",
       model: typeof startPayload.model === "string" ? startPayload.model : null,
       effort: typeof startPayload.effort === "string" ? startPayload.effort : null,
       tokenUsage: endPayload.tokenUsage && typeof endPayload.tokenUsage === "object" ? endPayload.tokenUsage : null

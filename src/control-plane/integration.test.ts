@@ -931,6 +931,10 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       task_id: task.id, draft_id: draft.id, target_message_id: "om_flow", content: "检查完成", idempotency_key: "flow-outbox-1", state: "sent",
       platform_message_id: null, attempt: 1, sent_at: now, updated_at: now
     }).execute();
+    await db.insertInto("task_events").values([
+      { task_id: task.id, event_type: "execution.started", summary: "开始正式执行", created_at: new Date(now.getTime() - 1_000) },
+      { task_id: task.id, event_type: "execution.completed", summary: "正式执行完成", created_at: now }
+    ]).execute();
 
     const headers = { cookie: "lark_agent_admin_session=owner-flow-token" };
     const inbox = await app.inject({ method: "GET", url: "/v1/admin/flow/items?view=inbox&range=all", headers });
@@ -943,9 +947,11 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(outbox.json<{ items: Array<{ content: string }> }>().items[0]?.content).toBe("检查完成");
     const trace = await app.inject({ method: "GET", url: `/v1/admin/tasks/${task.id}/trace`, headers });
     expect(trace.statusCode).toBe(200);
-    const checks = trace.json<{ checks: Array<{ key: string; state: string }> }>().checks;
+    const traceBody = trace.json<{ checks: Array<{ key: string; state: string }>; stageTimings: Array<{ key: string; state: string }> }>();
+    const checks = traceBody.checks;
     expect(checks.find((item) => item.key === "codex")?.state).toBe("错误");
     expect(checks.find((item) => item.key === "platform")?.state).toBe("错误");
+    expect(traceBody.stageTimings.find((item) => item.key === "first_commentary")?.state).toBe("skipped");
     expect(trace.body).not.toContain("lease_token_hash");
     expect(trace.body).not.toContain("authorization_grant");
   });
