@@ -7,7 +7,8 @@ import { sha256 } from "../shared/crypto.js";
 import type { LarkMessageDetails } from "../shared/contracts.js";
 import { TaskOutputService } from "./task-output.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
-import { BotMessageFanoutService } from "./bot-message-fanout.js";
+import { botMessageContextForPlatformMessage } from "./bot-message-context.js";
+import type { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 
 export class DraftService {
   constructor(
@@ -15,7 +16,7 @@ export class DraftService {
     private readonly config: ControlPlaneConfig,
     private readonly lark: LarkGateway | BotGatewayRegistry,
     private readonly outputs: TaskOutputService,
-    private readonly fanout?: BotMessageFanoutService
+    private readonly dialogueGuard?: BotDialogueGuardService
   ) {}
 
   async submit(taskId: string, content: string, baseRoomSeq: number, force: boolean) {
@@ -84,20 +85,6 @@ export class DraftService {
         await trx.updateTable("outbox_messages").set({ state: "sent", platform_message_id: platformMessageId, sent_at: now, updated_at: now, attempt: outbox.attempt + 1 }).where("id", "=", outbox.id).execute();
         await trx.updateTable("drafts").set({ state: "sent", sent_at: now, updated_at: now }).where("id", "=", draft.id).execute();
       });
-      await this.fanout?.publishFinal(
-        task.id,
-        platformMessageId,
-        content,
-        baseRoomSeq,
-        delivery.transport === "cardkit" ? "interactive" : "text"
-      ).catch(async (error) => {
-        await this.db.insertInto("task_events").values({
-          task_id: task.id,
-          event_type: "bot.fanout.failed",
-          summary: "机器人最终回复投递到其他收件箱失败",
-          payload: JSON.stringify({ error: errorMessage(error).slice(0, 500), platformMessageId })
-        }).execute();
-      });
       return { draft, sent: true, held: false, platformMessageId };
     } catch (error) {
       await this.db.updateTable("outbox_messages").set({ state: "unknown", last_error: errorMessage(error), updated_at: new Date(), attempt: outbox.attempt + 1 }).where("id", "=", outbox.id).execute();
@@ -142,7 +129,8 @@ export class DraftService {
       const known = await this.db.selectFrom("signals").select("id").where("bot_id", "=", task.bot_id).where("message_id", "=", message.messageId).executeTakeFirst();
       if (known) continue;
       const syntheticEventId = `refresh:${sha256(message.messageId).slice(0, 32)}`;
-      const context = senderBot ? await this.fanout?.contextForPlatformMessage(senderBot.id, message.messageId) : null;
+      const context = senderBot ? await botMessageContextForPlatformMessage(this.db, senderBot.id, message.messageId) : null;
+      if (senderBot && context && await this.dialogueGuard?.guardIfNeeded(senderBot.id, conversation.chat_id, context)) continue;
       await this.db.transaction().execute(async (trx) => {
         const inserted = await trx.insertInto("processed_events").values({ bot_id: task.bot_id, event_id: syntheticEventId, event_type: "chat.refresh", status: "processed", processed_at: new Date() }).onConflict((conflict) => conflict.columns(["bot_id", "event_id"]).doNothing()).returning("event_id").executeTakeFirst();
         if (!inserted) return;

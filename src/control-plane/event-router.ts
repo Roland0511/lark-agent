@@ -9,6 +9,8 @@ import { AppError } from "../shared/errors.js";
 import type { ControlPlaneRepository } from "./repository.js";
 import { legacyBotId, type BotRow } from "./bot-types.js";
 import { MessageRouter } from "./message-router.js";
+import { botMessageContextForPlatformMessage } from "./bot-message-context.js";
+import type { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 
 const helpCommands = new Set(["/help", "/帮助"]);
 
@@ -26,7 +28,8 @@ export class EventRouter {
       config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null,
       created_at: new Date(), updated_at: new Date()
     },
-    private readonly messageRouter = new MessageRouter(db)
+    private readonly messageRouter = new MessageRouter(db),
+    private readonly dialogueGuard?: BotDialogueGuardService
   ) {}
 
   async handleMessage(event: LarkMessageEvent): Promise<void> {
@@ -38,11 +41,7 @@ export class EventRouter {
       .selectAll()
       .where("deleted_at", "is", null)
       .execute();
-    const senderBot = registeredBots.find((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id) ?? null;
-    if (senderBot?.id === this.bot.id) {
-      await this.markDiscarded(event.event_id, event.type);
-      return;
-    }
+    let senderBot = registeredBots.find((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id) ?? null;
 
     const displayNameCounts = new Map<string, number>();
     for (const item of registeredBots) displayNameCounts.set(item.display_name, (displayNameCounts.get(item.display_name) ?? 0) + 1);
@@ -55,6 +54,13 @@ export class EventRouter {
     );
     const canUseOwnerMentionFastPath = fastMentionedBotIds.size > 0;
     const details = canUseOwnerMentionFastPath ? null : await this.lark.getMessage(event.message_id);
+    if (!senderBot && details?.senderType === "app") {
+      senderBot = registeredBots.find((item) => item.app_id === details.senderId || item.bot_open_id === details.senderId) ?? null;
+    }
+    if (senderBot?.id === this.bot.id) {
+      await this.markDiscarded(event.event_id, event.type);
+      return;
+    }
     if (details?.senderType === "app" && !senderBot) {
       await this.markDiscarded(event.event_id, event.type);
       return;
@@ -76,14 +82,29 @@ export class EventRouter {
       }
     }
     const rootMessageId = details?.rootId ?? event.message_id;
-    const mentionIds = new Set(details?.mentions.map((mention) => mention.id) ?? []);
-    const hasRegisteredBotMention = canUseOwnerMentionFastPath || registeredBots.some((item) => mentionIds.has(item.app_id) || Boolean(item.bot_open_id && mentionIds.has(item.bot_open_id)));
+    const mentions = details?.mentions ?? [];
+    const mentionedBotIds = canUseOwnerMentionFastPath
+      ? fastMentionedBotIds
+      : new Set(registeredBots.filter((item) => mentions.some((mention) =>
+          mention.id === item.app_id
+          || Boolean(item.bot_open_id && mention.id === item.bot_open_id)
+          || (displayNameCounts.get(item.display_name) === 1 && mention.name === item.display_name)
+        )).map((item) => item.id));
+    const hasRegisteredBotMention = mentionedBotIds.size > 0;
     const mentionsThisBot = canUseOwnerMentionFastPath
       ? fastMentionedBotIds.has(this.bot.id)
-      : mentionIds.has(this.bot.app_id) || Boolean(this.bot.bot_open_id && mentionIds.has(this.bot.bot_open_id));
+      : mentionedBotIds.has(this.bot.id);
     if (event.chat_type === "group" && hasRegisteredBotMention && !mentionsThisBot) return;
     const explicitlyActivated = event.chat_type === "p2p" || mentionsThisBot;
-    const sourceContext = senderBot ? await this.botMessageContext(senderBot.id, event.message_id) : null;
+    const sourceContext = senderBot ? await botMessageContextForPlatformMessage(this.db, senderBot.id, event.message_id) : null;
+    if (senderBot && await this.dialogueGuard?.isSystemNotice(event.message_id)) {
+      await this.markDiscarded(event.event_id, event.type);
+      return;
+    }
+    if (senderBot && sourceContext && await this.dialogueGuard?.guardIfNeeded(senderBot.id, event.chat_id, sourceContext)) {
+      await this.markDiscarded(event.event_id, event.type);
+      return;
+    }
     await this.messageRouter.route(this.bot, {
       eventId: event.event_id,
       eventType: event.type,
@@ -104,18 +125,6 @@ export class EventRouter {
       explicitlyActivated,
       receivedAt: new Date()
     });
-  }
-
-  private async botMessageContext(senderBotId: string, messageId: string): Promise<{ originMessageId: string; botDialogueDepth: number } | null> {
-    const output = await this.db.selectFrom("task_outputs").innerJoin("tasks", "tasks.id", "task_outputs.task_id")
-      .select(["tasks.id"]).where("tasks.bot_id", "=", senderBotId).where("task_outputs.message_id", "=", messageId).executeTakeFirst();
-    if (!output) return null;
-    const signals = await this.db.selectFrom("signals").select(["origin_message_id", "bot_dialogue_depth", "sender_type", "created_at"])
-      .where("task_id", "=", output.id).orderBy("seq").execute();
-    const latestUser = signals.filter((signal) => signal.sender_type === "user").at(-1);
-    if (latestUser) return { originMessageId: latestUser.origin_message_id, botDialogueDepth: 1 };
-    const deepest = signals.toSorted((a, b) => b.bot_dialogue_depth - a.bot_dialogue_depth)[0];
-    return deepest ? { originMessageId: deepest.origin_message_id, botDialogueDepth: deepest.bot_dialogue_depth + 1 } : null;
   }
 
   async handleCardAction(event: LarkCardActionEvent): Promise<void> {

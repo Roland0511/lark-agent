@@ -10,7 +10,6 @@ import type { ControlPlaneRepository } from "./repository.js";
 import { AdminEventBus } from "./admin-events.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { BotGatewayRegistry } from "./bot-runtime.js";
-import type { BotMessageFanoutService } from "./bot-message-fanout.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -55,9 +54,9 @@ export function registerAdminRoutes(
   app: FastifyInstance,
   db: Kysely<Database>,
   config: ControlPlaneConfig,
-  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; gateways: BotGatewayRegistry; events: AdminEventBus; runtime: RuntimeStatus; fanout: BotMessageFanoutService }
+  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; gateways: BotGatewayRegistry; events: AdminEventBus; runtime: RuntimeStatus }
 ): void {
-  const { repository, gateways, events, runtime, fanout } = dependencies;
+  const { repository, gateways, events, runtime } = dependencies;
   app.addHook("onSend", async (request, reply, payload) => {
     if (request.url.startsWith("/v1/admin")) setNoStore(reply);
     return payload;
@@ -338,13 +337,6 @@ export function registerAdminRoutes(
       }
     } else state = body.command === "mark_sent" ? "sent" : "discarded";
     await db.updateTable("outbox_messages").set({ state, platform_message_id: platformMessageId, updated_at: new Date(), sent_at: state === "sent" ? new Date() : row.sent_at, attempt: body.command === "retry" ? row.attempt + 1 : row.attempt }).where("id", "=", row.id).execute();
-    const confirmedMessageId = platformMessageId ?? row.output_message_id;
-    if (state === "sent" && confirmedMessageId && row.operation_kind !== "bot_dialogue_guard" && row.chat_type === "group") {
-      const maxSignal = await db.selectFrom("signals").select(sql<number>`coalesce(max(seq), 0)::int`.as("seq")).where("task_id", "=", row.task_id).executeTakeFirstOrThrow();
-      await fanout.publishFinal(row.task_id, confirmedMessageId, row.content, row.base_room_seq ?? maxSignal.seq, row.transport === "cardkit" ? "interactive" : "text").catch(async (error) => {
-        await db.insertInto("task_events").values({ task_id: row.task_id, event_type: "bot.fanout.failed", summary: "人工确认发件后投递机器人收件箱失败", payload: JSON.stringify({ error: errorMessage(error).slice(0, 500), confirmedMessageId }) }).execute();
-      });
-    }
     events.publish("outbox", row.id);
     return { ok: true, state };
   });

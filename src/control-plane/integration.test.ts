@@ -20,7 +20,7 @@ import { AppError } from "../shared/errors.js";
 import { registerBotAdminRoutes } from "./bot-admin-routes.js";
 import { bootstrapLegacyBot, BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
-import { BotMessageFanoutService } from "./bot-message-fanout.js";
+import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -1068,7 +1068,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("processed_events").selectAll().where("bot_id", "=", second.id).where("event_id", "=", "ev_first_only").execute()).toHaveLength(0);
   });
 
-  it("treats registered bot final replies as member signals, deduplicates them, and enforces the causal depth guard", async () => {
+  it("routes native registered-bot events by canonical app id, deduplicates them, and enforces the causal depth guard", async () => {
     const second = await db.insertInto("bots").values({
       app_id: "cli_bot_two", profile_name: "bot-two", bot_open_id: "cli_bot_two", display_name: "第二机器人",
       role_instructions: "以第二角色回答", owner_open_id: "ou_owner", default_executor_id: null, default_workspace_alias: null,
@@ -1091,30 +1091,52 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60), second).handleMessage(humanEvent)
     ]);
     const sourceTask = await db.selectFrom("tasks").selectAll().where("bot_id", "=", first.id).executeTakeFirstOrThrow();
+    await db.insertInto("task_outputs").values({
+      task_id: sourceTask.id, conversation_id: sourceTask.conversation_id, card_id: "card-native", message_id: "om_bot_reply_1",
+      visible_phase: "final", current_content: "第一机器人的最终回复", current_content_hash: null, last_item_id: null,
+      last_error: null, opened_at: new Date(), closed_at: new Date()
+    }).execute();
     const guardMessages: string[] = [];
     const outbound = { sendMarkdownToChat: async (_chatId: string, content: string) => { guardMessages.push(content); return "om_guard_notice"; } } as unknown as LarkGateway;
-    const fanout = new BotMessageFanoutService(db, new BotGatewayRegistry(db, "lark-cli", outbound), new MessageRouter(db));
-
-    await fanout.publishFinal(sourceTask.id, "om_bot_reply_1", "第一机器人的最终回复", 1, "interactive");
-    await fanout.publishFinal(sourceTask.id, "om_bot_reply_1", "第一机器人的最终回复", 1, "interactive");
+    const guard = new BotDialogueGuardService(db, new BotGatewayRegistry(db, "lark-cli", outbound));
+    let botDetails: LarkMessageDetails = {
+      messageId: "om_bot_reply_1", rootId: null, parentId: null, threadId: null, chatId: "oc_test",
+      senderId: first.app_id, senderType: "app", messageType: "interactive", content: "第一机器人的最终回复",
+      createTime: "2", mentions: []
+    };
+    const nativeLark = { getMessage: async () => botDetails } as unknown as LarkGateway;
+    const secondRouter = new EventRouter(db, config, nativeLark, new ControlPlaneRepository(db, 60), second, new MessageRouter(db), guard);
+    const botEvent = (eventId: string, messageId: string, content: string): LarkMessageEvent => ({
+      type: "im.message.receive_v1", event_id: eventId, timestamp: "2", message_id: messageId, chat_id: "oc_test",
+      chat_type: "group", sender_id: "ou_peer_scoped_sender", message_type: "interactive", content, create_time: "2"
+    });
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", botDetails.content));
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", botDetails.content));
     const botSignal = await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").executeTakeFirstOrThrow();
-    expect(botSignal).toMatchObject({ sender_type: "bot", sender_bot_id: first.id, sender_display_name: first.display_name, sender_role: "member", ingress_source: "internal", origin_message_id: "om_human_origin", bot_dialogue_depth: 1 });
+    expect(botSignal).toMatchObject({ sender_id: "ou_peer_scoped_sender", sender_type: "bot", sender_bot_id: first.id, sender_display_name: first.display_name, sender_role: "member", ingress_source: "lark", origin_message_id: "om_human_origin", bot_dialogue_depth: 1 });
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", first.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(0);
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(1);
 
     const secondConversation = await db.selectFrom("conversations").select("id").where("bot_id", "=", second.id).executeTakeFirstOrThrow();
     await db.updateTable("tasks").set({ state: "completed", completed_at: new Date(), updated_at: new Date() }).where("conversation_id", "=", secondConversation.id).execute();
     await db.updateTable("conversations").set({ active: false, followup_expires_at: null, updated_at: new Date() }).where("id", "=", secondConversation.id).execute();
-    await fanout.publishFinal(sourceTask.id, "om_bot_reply_2", "@第二机器人 请继续", 1, "interactive");
+    await db.updateTable("task_outputs").set({ message_id: "om_bot_reply_2", current_content: "@第二机器人 请继续" }).where("task_id", "=", sourceTask.id).execute();
+    botDetails = { ...botDetails, messageId: "om_bot_reply_2", content: "@第二机器人 请继续", mentions: [{ id: "ou_receiver_scoped", idType: "open_id", name: second.display_name }] };
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_2", "om_bot_reply_2", botDetails.content));
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_2").execute()).toHaveLength(1);
     expect(await db.selectFrom("conversations").selectAll().where("bot_id", "=", second.id).where("active", "=", true).execute()).toHaveLength(1);
 
     await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 1, updated_at: new Date() }).where("id", "=", 1).execute();
-    await fanout.publishFinal(sourceTask.id, "om_guarded_1", "达到上限", 1, "interactive");
-    await fanout.publishFinal(sourceTask.id, "om_guarded_2", "不会重复提示", 1, "interactive");
+    await db.updateTable("task_outputs").set({ message_id: "om_guarded_1", current_content: "达到上限" }).where("task_id", "=", sourceTask.id).execute();
+    botDetails = { ...botDetails, messageId: "om_guarded_1", content: "达到上限", mentions: [] };
+    await secondRouter.handleMessage(botEvent("ev_guarded_1", "om_guarded_1", botDetails.content));
+    await db.updateTable("task_outputs").set({ message_id: "om_guarded_2", current_content: "不会重复提示" }).where("task_id", "=", sourceTask.id).execute();
+    botDetails = { ...botDetails, messageId: "om_guarded_2", content: "不会重复提示" };
+    await secondRouter.handleMessage(botEvent("ev_guarded_2", "om_guarded_2", botDetails.content));
     expect(guardMessages).toHaveLength(1);
     expect(await db.selectFrom("bot_dialogue_guards").selectAll().where("chat_id", "=", "oc_test").where("origin_message_id", "=", "om_human_origin").execute()).toHaveLength(1);
     expect(await db.selectFrom("outbox_messages").selectAll().where("operation_kind", "=", "bot_dialogue_guard").execute()).toHaveLength(1);
+    expect(await db.selectFrom("signals").selectAll().where("message_id", "in", ["om_guarded_1", "om_guarded_2"]).execute()).toHaveLength(0);
   });
 
   it("protects Prometheus metrics with a dedicated bearer token", async () => {
@@ -1127,7 +1149,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(response.body).toContain("lark_agent_conversations_awaiting_followup");
     expect(response.body).toContain("lark_agent_followup_expired_total");
     expect(response.body).toContain("lark_agent_conversation_turns_total");
-    expect(response.body).toContain("lark_agent_bot_message_fanout_total");
+    expect(response.body).toContain("lark_agent_bot_message_events_total");
     expect(response.body).toContain("lark_agent_bot_dialogue_guard_total");
     expect(response.body).not.toContain("ou_owner");
   });

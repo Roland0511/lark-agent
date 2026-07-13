@@ -16,7 +16,7 @@ const { app, services } = buildControlPlane(db, config, undefined, {
   isLarkReady: () => botRuntime?.messageReady() ?? !config.larkEnabled,
   runtime
 });
-botRuntime = new BotRuntimeManager(db, config, services.repository, services.gateways, runtime, services.adminEvents, app.log, services.messageRouter);
+botRuntime = new BotRuntimeManager(db, config, services.repository, services.gateways, runtime, services.adminEvents, app.log, services.messageRouter, services.dialogueGuard);
 await botRuntime.startAll();
 registerBotAdminRoutes(app, db, config, { gateways: services.gateways, runtime, events: services.adminEvents, controller: botRuntime });
 

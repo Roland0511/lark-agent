@@ -36,7 +36,7 @@ import { registerAdminFlowRoutes } from "./admin-flow.js";
 import { registerRunnerRoutes, RunnerReleaseService } from "./runner-routes.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
-import { BotMessageFanoutService } from "./bot-message-fanout.js";
+import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -58,7 +58,7 @@ export interface ControlPlaneServices {
   adminEvents: AdminEventBus;
   runtime: RuntimeStatus;
   messageRouter: MessageRouter;
-  fanout: BotMessageFanoutService;
+  dialogueGuard: BotDialogueGuardService;
 }
 
 export function buildControlPlane(
@@ -77,15 +77,15 @@ export function buildControlPlane(
   const repository = services?.repository ?? new ControlPlaneRepository(db, config.leaseSeconds);
   const adminEvents = services?.adminEvents ?? new AdminEventBus();
   const messageRouter = services?.messageRouter ?? new MessageRouter(db);
-  const fanout = services?.fanout ?? new BotMessageFanoutService(db, gateways, messageRouter, adminEvents);
-  const router = services?.router ?? new EventRouter(db, config, lark, repository, undefined, messageRouter);
+  const dialogueGuard = services?.dialogueGuard ?? new BotDialogueGuardService(db, gateways, adminEvents);
+  const router = services?.router ?? new EventRouter(db, config, lark, repository, undefined, messageRouter, dialogueGuard);
   const outputs = services?.outputs ?? new TaskOutputService(db, config, gateways);
-  const drafts = services?.drafts ?? new DraftService(db, config, gateways, outputs, fanout);
+  const drafts = services?.drafts ?? new DraftService(db, config, gateways, outputs, dialogueGuard);
   const runnerReleases = new RunnerReleaseService(config);
   const runnerManifestTimer = setInterval(() => void runnerReleases.current(true), config.runnerManifestRefreshSeconds * 1_000);
   runnerManifestTimer.unref();
   app.addHook("onClose", async () => clearInterval(runnerManifestTimer));
-  const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime, messageRouter, fanout };
+  const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime, messageRouter, dialogueGuard };
 
   void app.register(cookie);
 
@@ -351,7 +351,7 @@ export function buildControlPlane(
 
   registerAdminAuth(app, db, config);
   registerRunnerRoutes(app, db, config, runnerReleases, adminEvents);
-  registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime, fanout });
+  registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);
 
