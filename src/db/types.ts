@@ -19,6 +19,10 @@ export interface ConversationsTable {
   bot_id: string;
   bot_config_revision: number;
   role_instructions_snapshot: string;
+  attention_model_snapshot: string | null;
+  attention_reasoning_effort_snapshot: string | null;
+  execution_model_snapshot: string | null;
+  execution_reasoning_effort_snapshot: string | null;
   chat_id: string;
   chat_type: string;
   root_message_id: string;
@@ -92,6 +96,8 @@ export interface WorkersTable {
   capacity: number;
   workspace_aliases: Json;
   capabilities: Json;
+  model_catalog: ColumnType<unknown, string | undefined, string>;
+  model_catalog_updated_at: NullableTimestamp;
   runner_version: string | null;
   architecture: string | null;
   registration_source: Generated<"unregistered" | "quick_install">;
@@ -283,6 +289,10 @@ export interface BotsTable {
   bot_open_id: string | null;
   display_name: string;
   role_instructions: string;
+  attention_model: string | null;
+  attention_reasoning_effort: string | null;
+  execution_model: string | null;
+  execution_reasoning_effort: string | null;
   owner_open_id: string | null;
   default_executor_id: string | null;
   default_workspace_alias: string | null;

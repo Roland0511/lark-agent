@@ -21,12 +21,15 @@ rl.on('line', (line) => {
   if (msg.method === 'initialized') return;
   if (msg.method === 'thread/start') return send({ id: msg.id, result: { thread: { id: 'thr_' + nextThread++ } } });
   if (msg.method === 'thread/resume') return send({ id: msg.id, result: { thread: { id: msg.params.threadId } } });
+  if (msg.method === 'model/list') return send({ id: msg.id, result: { data: [{ id: 'exec-model', model: 'exec-model', displayName: 'Execution Model', isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }] }], nextCursor: null } });
   if (msg.method === 'turn/start') {
     const turnId = 'turn_' + nextTurn++;
     send({ id: msg.id, result: { turn: { id: turnId } } });
     const prompt = msg.params.input?.[0]?.text;
     const isStructuredTask = Boolean(msg.params.outputSchema) && prompt === 'structured';
     const isAttention = Boolean(msg.params.outputSchema) && !isStructuredTask;
+    if (isStructuredTask && (msg.params.model !== 'exec-model' || msg.params.effort !== 'high')) return send({ id: msg.id, error: { code: -1, message: 'execution policy missing' } });
+    if (isAttention && (msg.params.model !== 'attention-model' || msg.params.effort !== 'low')) return send({ id: msg.id, error: { code: -1, message: 'attention policy missing' } });
     if (isStructuredTask) {
       const text = JSON.stringify({ reply: '2', disposition: 'awaiting_followup', rationale: 'counting continues' });
       send({ method: 'item/started', params: { item: { id: 'comment_' + turnId, type: 'agentMessage', text: '', phase: 'commentary' } } });
@@ -48,6 +51,7 @@ rl.on('line', (line) => {
       send({ method: 'item/agentMessage/delta', params: { itemId: 'final_' + turnId, delta: 'done' } });
       send({ method: 'item/completed', params: { item: { id: 'final_' + turnId, type: 'agentMessage', text: 'done', phase: 'final_answer' } } });
     }
+    send({ method: 'thread/tokenUsage/updated', params: { threadId: 'thr_1', turnId, tokenUsage: { last: { inputTokens: 12, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 1, totalTokens: 15 }, total: { inputTokens: 12, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
   }
 });
@@ -77,19 +81,22 @@ describe("CodexAdapter", () => {
   it("starts app-server with fixed profile overrides and supports persistent and attention turns", async () => {
     const config = await fakeCodexConfig();
     const commentary: string[] = [];
-    const adapter = new CodexAdapter(config, async () => "decline", undefined, async (update) => { commentary.push(update.text); });
+    const activity: string[] = [];
+    const adapter = new CodexAdapter(config, async () => "decline", undefined, async (update) => { commentary.push(update.text); }, (method) => activity.push(method));
     await adapter.start();
+    await expect(adapter.listModels()).resolves.toEqual([{ id: "exec-model", displayName: "Execution Model", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["medium", "high"] }]);
     const threadId = await adapter.startOrResumeThread(config.codexHome, null);
     expect(threadId).toBe("thr_1");
     await expect(adapter.runTurn(threadId, "work")).resolves.toEqual({ turnId: "turn_1", text: "done" });
     await expect(adapter.runTurn(threadId, "structured", {
-      outputSchema: { type: "object" }, publishCommentary: true
+      outputSchema: { type: "object" }, publishCommentary: true, model: "exec-model", effort: "high"
     })).resolves.toEqual({
       turnId: "turn_2",
       text: JSON.stringify({ reply: "2", disposition: "awaiting_followup", rationale: "counting continues" })
     });
-    await expect(adapter.attention(config.codexHome, "task", "signal")).resolves.toEqual({ decision: "consume", priority: 80, rationale: "relevant" });
+    await expect(adapter.attention(config.codexHome, "task", "signal", { model: "attention-model", effort: "low" })).resolves.toEqual({ decision: "consume", priority: 80, rationale: "relevant" });
     expect(commentary).toEqual(["checking", "structured checking"]);
+    expect(activity).toContain("thread/tokenUsage/updated");
     await adapter.stop();
   });
 });

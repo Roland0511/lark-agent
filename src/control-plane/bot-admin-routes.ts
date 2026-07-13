@@ -18,13 +18,21 @@ const createSchema = z.object({
   appSecret: z.string().min(8).max(512),
   roleInstructions: z.string().max(20_000).default(""),
   defaultExecutorId: z.string().max(128).nullable().default(null),
-  defaultWorkspaceAlias: z.string().max(128).nullable().default(null)
+  defaultWorkspaceAlias: z.string().max(128).nullable().default(null),
+  attentionModel: z.string().trim().min(1).max(256).nullable().default(null),
+  attentionReasoningEffort: z.string().trim().min(1).max(32).nullable().default(null),
+  executionModel: z.string().trim().min(1).max(256).nullable().default(null),
+  executionReasoningEffort: z.string().trim().min(1).max(32).nullable().default(null)
 });
 const updateSchema = z.object({
   displayName: z.string().trim().min(1).max(64),
   roleInstructions: z.string().max(20_000),
   defaultExecutorId: z.string().max(128).nullable(),
-  defaultWorkspaceAlias: z.string().max(128).nullable()
+  defaultWorkspaceAlias: z.string().max(128).nullable(),
+  attentionModel: z.string().trim().min(1).max(256).nullable(),
+  attentionReasoningEffort: z.string().trim().min(1).max(32).nullable(),
+  executionModel: z.string().trim().min(1).max(256).nullable(),
+  executionReasoningEffort: z.string().trim().min(1).max(32).nullable()
 });
 const commandSchema = z.object({ command: z.enum(["enable", "disable", "set_system", "reconnect"]) });
 const credentialSchema = z.object({ appSecret: z.string().min(8).max(512) });
@@ -61,15 +69,23 @@ export function registerBotAdminRoutes(
   const view = async (botId: string) => {
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", botId).where("deleted_at", "is", null).executeTakeFirst();
     if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
-    const [bindings, activeConversations, activeTasks] = await Promise.all([
+    const [bindings, activeConversations, activeTasks, enabledWorkers] = await Promise.all([
       db.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", bot.id).orderBy("chat_name").execute(),
       db.selectFrom("conversations").select(sql<number>`count(*)::int`.as("count")).where("bot_id", "=", bot.id).where("active", "=", true).executeTakeFirstOrThrow(),
-      db.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count")).where("bot_id", "=", bot.id).where("state", "in", ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"]).executeTakeFirstOrThrow()
+      db.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count")).where("bot_id", "=", bot.id).where("state", "in", ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"]).executeTakeFirstOrThrow(),
+      db.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).where("operational_mode", "=", "enabled").execute()
     ]);
+    const eligibleWorkers = enabledWorkers.filter((worker) => {
+      const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
+      return bot.default_workspace_alias ? aliases.includes(bot.default_workspace_alias) : aliases.length === 1;
+    });
     const runtime = dependencies.runtime.snapshot([`${bot.id}:message`, `${bot.id}:card`]);
     return {
       id: bot.id, appId: bot.app_id, displayName: bot.display_name, roleInstructions: bot.role_instructions,
       ownerBound: Boolean(bot.owner_open_id), defaultExecutorId: bot.default_executor_id, defaultWorkspaceAlias: bot.default_workspace_alias,
+      attentionModel: bot.attention_model, attentionReasoningEffort: bot.attention_reasoning_effort,
+      executionModel: bot.execution_model, executionReasoningEffort: bot.execution_reasoning_effort,
+      routeWarning: !bot.default_executor_id && eligibleWorkers.length > 1 ? "存在多个可用执行器，请明确绑定默认执行器" : null,
       enabled: bot.enabled, isSystem: bot.is_system, configRevision: bot.config_revision, credentialState: bot.credential_state,
       credentialError: bot.credential_error, credentialsConfigured: true, runtime, bindings: bindings.map((item) => ({
         chatId: item.chat_id, chatName: item.chat_name, enabled: item.enabled, preferredExecutorId: item.preferred_executor_id, workspaceAlias: item.workspace_alias
@@ -101,7 +117,10 @@ export function registerBotAdminRoutes(
       const bot = await db.insertInto("bots").values({
         app_id: body.appId, profile_name: profileName, bot_open_id: body.appId, display_name: body.displayName,
         role_instructions: body.roleInstructions, owner_open_id: null, default_executor_id: body.defaultExecutorId,
-        default_workspace_alias: body.defaultWorkspaceAlias, enabled: true, is_system: !systemExists, config_revision: 1,
+        default_workspace_alias: body.defaultWorkspaceAlias,
+        attention_model: body.attentionModel, attention_reasoning_effort: body.attentionReasoningEffort,
+        execution_model: body.executionModel, execution_reasoning_effort: body.executionReasoningEffort,
+        enabled: true, is_system: !systemExists, config_revision: 1,
         credential_state: "verified", credential_error: null, deleted_at: null, updated_at: new Date()
       }).returning("id").executeTakeFirstOrThrow();
       await dependencies.controller.reconcile(bot.id);
@@ -119,7 +138,10 @@ export function registerBotAdminRoutes(
     await validateExecutionRoute(body.defaultExecutorId, body.defaultWorkspaceAlias);
     const updated = await db.updateTable("bots").set({
       display_name: body.displayName, role_instructions: body.roleInstructions, default_executor_id: body.defaultExecutorId,
-      default_workspace_alias: body.defaultWorkspaceAlias, config_revision: sql`config_revision + 1`, updated_at: new Date()
+      default_workspace_alias: body.defaultWorkspaceAlias,
+      attention_model: body.attentionModel, attention_reasoning_effort: body.attentionReasoningEffort,
+      execution_model: body.executionModel, execution_reasoning_effort: body.executionReasoningEffort,
+      config_revision: sql`config_revision + 1`, updated_at: new Date()
     }).where("id", "=", request.params.id).where("deleted_at", "is", null).returning("id").executeTakeFirst();
     if (!updated) throw new AppError("机器人不存在", 404, "bot_not_found");
     await dependencies.controller.reconcile(updated.id);

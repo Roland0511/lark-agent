@@ -87,6 +87,25 @@ export class ControlPlaneRepository {
           AND (executor_config_fingerprint IS NULL OR executor_config_fingerprint = ${principal.configFingerprint})
           AND (preferred_executor_id IS NULL OR preferred_executor_id = ${principal.executorId})
           AND (
+            preferred_executor_id IS NOT NULL
+            OR 1 = (
+              SELECT count(*)
+              FROM workers eligible_worker
+              WHERE eligible_worker.deleted_at IS NULL
+                AND eligible_worker.operational_mode = 'enabled'
+                AND (tasks.executor_id IS NULL OR tasks.executor_id = eligible_worker.executor_id)
+                AND (tasks.executor_config_fingerprint IS NULL OR tasks.executor_config_fingerprint = eligible_worker.config_fingerprint)
+                AND (
+                  eligible_worker.workspace_aliases ? COALESCE(tasks.requested_workspace_alias, tasks.resolved_workspace_alias)
+                  OR (
+                    tasks.requested_workspace_alias IS NULL
+                    AND tasks.resolved_workspace_alias IS NULL
+                    AND jsonb_array_length(eligible_worker.workspace_aliases) = 1
+                  )
+                )
+            )
+          )
+          AND (
             COALESCE(requested_workspace_alias, resolved_workspace_alias) = ANY(${sql.val(aliases)}::text[])
             OR (
               requested_workspace_alias IS NULL
@@ -117,7 +136,31 @@ export class ControlPlaneRepository {
     `.execute(this.db);
     const task = result.rows[0];
     if (!task) return null;
+    await this.recordTaskEvent(task.id, "task.claimed", "任务已被执行器领取", {
+      executorId: principal.executorId,
+      attempt: task.attempt,
+      resolvedWorkspaceAlias: task.resolved_workspace_alias
+    });
     return { task, leaseToken, leaseExpiresAt };
+  }
+
+  async rejectInvalidClaim(taskId: string, leaseToken: string, detail: string): Promise<void> {
+    await this.db.transaction().execute(async (trx) => {
+      const task = await trx.updateTable("tasks").set({
+        state: "waiting_input",
+        summary: `任务领取契约无效：${detail}`.slice(0, 5_000),
+        lease_token_hash: null,
+        lease_expires_at: null,
+        revision: sql`revision + 1`,
+        updated_at: new Date()
+      }).where("id", "=", taskId).where("lease_token_hash", "=", sha256(leaseToken)).returning("id").executeTakeFirst();
+      if (task) await trx.insertInto("task_events").values({
+        task_id: task.id,
+        event_type: "task.contract_invalid",
+        summary: "任务领取响应未通过共享契约校验，已安全暂停",
+        payload: JSON.stringify({ detail: detail.slice(0, 1_000) })
+      }).execute();
+    });
   }
 
   async touchWorker(executorId: string): Promise<void> {
@@ -125,21 +168,34 @@ export class ControlPlaneRepository {
   }
 
   async recoverExpiredLeases(): Promise<number> {
-    const result = await this.db
-      .updateTable("tasks")
-      .set((eb) => ({
+    return this.db.transaction().execute(async (trx) => {
+      const now = new Date();
+      const paused = await trx.updateTable("tasks").set({
+        state: "waiting_input",
+        lease_token_hash: null,
+        lease_expires_at: null,
+        summary: "任务在 Codex thread 建立前连续 3 次租约过期，已停止自动重领",
+        updated_at: now,
+        revision: sql`revision + 1`
+      }).where("state", "=", "running").where("lease_expires_at", "<", now)
+        .where("codex_thread_id", "is", null).where("attempt", ">=", 3).returning("id").execute();
+      if (paused.length) await trx.insertInto("task_events").values(paused.map((task) => ({
+        task_id: task.id,
+        event_type: "task.lease_recovery_stopped",
+        summary: "领取后尚未启动 Codex，连续租约过期，已安全暂停",
+        payload: JSON.stringify({ threshold: 3 })
+      }))).execute();
+      const requeued = await trx.updateTable("tasks").set((eb) => ({
         state: "waiting_worker",
         preferred_executor_id: eb.ref("executor_id"),
         lease_token_hash: null,
         lease_expires_at: null,
         summary: "执行器租约已过期，等待原执行器恢复",
-        updated_at: new Date(),
+        updated_at: now,
         revision: sql`revision + 1`
-      }))
-      .where("state", "=", "running")
-      .where("lease_expires_at", "<", new Date())
-      .executeTakeFirst();
-    return Number(result.numUpdatedRows);
+      })).where("state", "=", "running").where("lease_expires_at", "<", now).executeTakeFirst();
+      return paused.length + Number(requeued.numUpdatedRows);
+    });
   }
 
   async heartbeat(taskId: string, executorId: string, leaseToken: string): Promise<{ leaseExpiresAt: Date; state: string }> {
@@ -228,6 +284,12 @@ export class ControlPlaneRepository {
         updated_at: now,
         completed_at: state === "completed" || state === "failed" ? now : null
       }).where("id", "=", taskId).execute();
+      if (state === "completed") await trx.insertInto("task_events").values({
+        task_id: taskId,
+        event_type: "task.completed",
+        summary: "任务回合已完成",
+        payload: JSON.stringify({ disposition: storedDisposition, processedRoomSeq: lifecycle?.processedRoomSeq ?? null })
+      }).execute();
 
       if (state !== "completed") {
         await trx.updateTable("conversations").set({ active: state !== "failed", updated_at: now }).where("id", "=", conversation.id).execute();

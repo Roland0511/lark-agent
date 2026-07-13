@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import type { ClaimedTask, Signal } from "../shared/contracts.js";
+import type { AttentionResult, ClaimedTask, Signal } from "../shared/contracts.js";
 import { taskTurnResultSchema, type TaskTurnResult } from "../shared/contracts.js";
 import { errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
@@ -14,7 +14,12 @@ export class TaskProcessor {
   private commentaryTimer: NodeJS.Timeout | null = null;
   private commentaryPending: { itemId: string; text: string; ordinal: number } | null = null;
   private commentaryLastSentAt = 0;
+  private firstCommentaryRecorded = false;
   private commentaryChain: Promise<void> = Promise.resolve();
+  private models: Awaited<ReturnType<CodexAdapter["listModels"]>> = [];
+  private lastCodexActivityAt = 0;
+  private currentCodexStage: "attention" | "execution" | null = null;
+  private latestTokenUsage: Record<string, number> | null = null;
   private codex: CodexAdapter;
 
   constructor(private readonly config: ResolvedWorkerConfig, private readonly client: ControlPlaneClient) {
@@ -22,12 +27,18 @@ export class TaskProcessor {
       config,
       async (request) => this.handleApproval(request),
       async (item) => this.handleCompletedItem(item),
-      async (update) => this.handleCommentary(update)
+      async (update) => this.handleCommentary(update),
+      (method, params) => this.handleCodexActivity(method, params)
     );
   }
 
   async start(): Promise<void> {
     await this.codex.start();
+  }
+
+  async modelCatalog() {
+    this.models = await this.codex.listModels();
+    return this.models;
   }
 
   async stop(): Promise<void> {
@@ -43,6 +54,11 @@ export class TaskProcessor {
     let heartbeatTimer: NodeJS.Timeout | null = null;
     let controlState: "human_owned" | "cancelled" | null = null;
     try {
+      const policyError = this.validateModelPolicy(task);
+      if (policyError) {
+        await this.client.result(task, "waiting_input", policyError);
+        return;
+      }
       const workspace = await resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
       let stoppedByControl = false;
       heartbeatTimer = setInterval(() => {
@@ -58,8 +74,8 @@ export class TaskProcessor {
         }).catch(() => undefined);
       }, 20_000);
 
-      const threadId = await this.codex.startOrResumeThread(workspace.path, task.codexThreadId);
-      await this.client.event(task.id, task.leaseToken, "codex.thread", "Codex 线程已就绪", { threadId, executorId: this.config.executorId, homeRef: this.config.homeRef, profile: this.config.codexProfile, workspaceAlias: workspace.alias });
+      const threadId = await this.codex.startOrResumeThread(workspace.path, task.codexThreadId, task.executionModel);
+      await this.client.event(task.id, task.leaseToken, "codex.thread.ready", "Codex 线程已就绪", { threadId, executorId: this.config.executorId, homeRef: this.config.homeRef, profile: this.config.codexProfile, workspaceAlias: workspace.alias, ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort) });
       let baseRoomSeq = task.roomSeq;
       this.currentBaseRoomSeq = baseRoomSeq;
       let signals = task.signals;
@@ -72,12 +88,26 @@ export class TaskProcessor {
         for (const signal of signals) {
           let decision = signal.decision;
           if (decision === "pending") {
-            const attention = await this.codex.attention(
-              workspace.path,
-              [`飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
-              signal.preview
-            );
+            this.currentCodexStage = "attention";
+            this.latestTokenUsage = null;
+            await this.client.event(task.id, task.leaseToken, "attention.started", "开始注意力判断", this.observedModelPolicy(task.attentionModel, task.attentionReasoningEffort));
+            const attentionSlowTimer = setTimeout(() => {
+              void this.client.event(task.id, task.leaseToken, "attention.slow", "注意力判断已超过 15 秒", { thresholdSeconds: 15 }).catch(() => undefined);
+            }, 15_000);
+            let attention: AttentionResult;
+            try {
+              attention = await this.codex.attention(
+                workspace.path,
+                [`飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
+                signal.preview,
+                { model: task.attentionModel, effort: task.attentionReasoningEffort }
+              );
+            } finally {
+              clearTimeout(attentionSlowTimer);
+            }
             await this.client.decideSignal(task.id, signal.id, task.leaseToken, attention);
+            await this.client.event(task.id, task.leaseToken, "attention.completed", "注意力判断完成", { decision: attention.decision, priority: attention.priority, ...this.observedModelPolicy(task.attentionModel, task.attentionReasoningEffort), tokenUsage: this.latestTokenUsage });
+            this.currentCodexStage = null;
             decision = attention.decision;
           }
           if (decision === "consume" || decision === "merge") consumed.push(signal);
@@ -96,7 +126,21 @@ export class TaskProcessor {
           return;
         }
         const prompt = buildTaskPrompt(task, consumed, revision > 0);
-        const turn = await this.codex.runTurn(threadId, prompt, { outputSchema: taskTurnOutputSchema, publishCommentary: true });
+        this.currentCodexStage = "execution";
+        this.latestTokenUsage = null;
+        await this.client.event(task.id, task.leaseToken, "execution.started", "开始正式 Codex 回合", this.observedModelPolicy(task.executionModel, task.executionReasoningEffort));
+        let turn: Awaited<ReturnType<CodexAdapter["runTurn"]>>;
+        try {
+          turn = await this.runExecutionTurn(task, threadId, prompt);
+        } catch (error) {
+          if (error instanceof CodexStallError) {
+            await this.client.result(task, "waiting_input", "正式 Codex 回合连续 10 分钟没有任何事件，已中断并等待人工检查。" );
+            return;
+          }
+          throw error;
+        }
+        await this.client.event(task.id, task.leaseToken, "execution.completed", "正式 Codex 回合完成", { ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort), tokenUsage: this.latestTokenUsage });
+        this.currentCodexStage = null;
         try {
           turnResult = taskTurnResultSchema.parse(parseStructuredResult(turn.text));
         } catch (error) {
@@ -122,6 +166,10 @@ export class TaskProcessor {
     } catch (error) {
       if (controlState === "human_owned" || controlState === "cancelled") return;
       const summary = errorMessage(error);
+      if (/model|reasoning effort|reasoning_effort|推理强度/i.test(summary)) {
+        await this.client.result(task, "waiting_input", `所选模型或推理强度不可用：${summary.slice(0, 4_500)}`).catch(() => undefined);
+        return;
+      }
       try {
         await this.client.result(task, "failed", summary.slice(0, 5_000));
       } catch {
@@ -133,6 +181,77 @@ export class TaskProcessor {
       await this.flushCommentary().catch(() => undefined);
       this.currentTask = null;
       this.currentBaseRoomSeq = 0;
+      this.commentaryPending = null;
+      this.commentaryLastSentAt = 0;
+      this.firstCommentaryRecorded = false;
+      this.commentaryChain = Promise.resolve();
+      this.currentCodexStage = null;
+      this.latestTokenUsage = null;
+    }
+  }
+
+  private validateModelPolicy(task: ClaimedTask): string | null {
+    for (const [stage, modelId, effort] of [
+      ["注意力判断", task.attentionModel, task.attentionReasoningEffort],
+      ["正式执行", task.executionModel, task.executionReasoningEffort]
+    ] as const) {
+      const model = modelId ? this.models.find((item) => item.id === modelId) : this.models.find((item) => item.isDefault);
+      if (!model) continue;
+      if (effort && model.supportedReasoningEfforts.length && !model.supportedReasoningEfforts.includes(effort)) {
+        return `${stage}模型 ${modelId ?? model.id} 不支持推理强度 ${effort}`;
+      }
+    }
+    return null;
+  }
+
+  private observedModelPolicy(configuredModel: string | null, configuredEffort: string | null) {
+    const model = configuredModel ? this.models.find((item) => item.id === configuredModel) : this.models.find((item) => item.isDefault);
+    return {
+      model: configuredModel ?? model?.id ?? null,
+      effort: configuredEffort ?? model?.defaultReasoningEffort ?? null,
+      inheritedModel: configuredModel === null,
+      inheritedEffort: configuredEffort === null
+    };
+  }
+
+  private handleCodexActivity(method: string, params: Record<string, unknown>): void {
+    this.lastCodexActivityAt = Date.now();
+    if (method !== "thread/tokenUsage/updated" || !this.currentCodexStage) return;
+    const tokenUsage = params.tokenUsage as Record<string, unknown> | undefined;
+    const last = tokenUsage?.last as Record<string, unknown> | undefined;
+    if (!last) return;
+    const usage: Record<string, number> = {};
+    for (const key of ["inputTokens", "cachedInputTokens", "outputTokens", "reasoningOutputTokens", "totalTokens"]) {
+      if (typeof last[key] === "number" && Number.isFinite(last[key])) usage[key] = last[key] as number;
+    }
+    if (Object.keys(usage).length) this.latestTokenUsage = usage;
+  }
+
+  private async runExecutionTurn(task: ClaimedTask, threadId: string, prompt: string) {
+    this.lastCodexActivityAt = Date.now();
+    let slowReported = false;
+    let rejectStall!: (error: Error) => void;
+    const stalled = new Promise<never>((_resolve, reject) => { rejectStall = reject; });
+    const watchdog = setInterval(() => {
+      const quietMs = Date.now() - this.lastCodexActivityAt;
+      if (quietMs >= 60_000 && !slowReported) {
+        slowReported = true;
+        void this.client.event(task.id, task.leaseToken, "execution.slow", "正式执行超过 60 秒没有新的 App Server 事件", { quietSeconds: Math.round(quietMs / 1_000) }).catch(() => undefined);
+      }
+      if (quietMs >= 10 * 60_000) {
+        clearInterval(watchdog);
+        const active = this.codex.activeTurn();
+        if (active) void this.codex.interrupt(active.threadId, active.turnId).catch(() => undefined);
+        rejectStall(new CodexStallError());
+      }
+    }, 5_000);
+    try {
+      return await Promise.race([
+        this.codex.runTurn(threadId, prompt, { outputSchema: taskTurnOutputSchema, publishCommentary: true, model: task.executionModel, effort: task.executionReasoningEffort }),
+        stalled
+      ]);
+    } finally {
+      clearInterval(watchdog);
     }
   }
 
@@ -173,6 +292,10 @@ export class TaskProcessor {
 
   private async handleCommentary(update: { itemId: string; text: string; ordinal: number }): Promise<void> {
     if (!this.currentTask) return;
+    if (!this.firstCommentaryRecorded) {
+      this.firstCommentaryRecorded = true;
+      await this.client.event(this.currentTask.id, this.currentTask.leaseToken, "execution.first_commentary", "Codex 产生首条 commentary");
+    }
     this.commentaryPending = update;
     const wait = Math.max(0, 500 - (Date.now() - this.commentaryLastSentAt));
     if (wait === 0) {
@@ -200,6 +323,10 @@ export class TaskProcessor {
     this.commentaryChain = this.commentaryChain.then(() => this.client.streamCommentary(task, pending, this.currentBaseRoomSeq));
     return this.commentaryChain;
   }
+}
+
+class CodexStallError extends Error {
+  constructor() { super("Codex execution stalled"); }
 }
 
 function buildTaskPrompt(task: ClaimedTask, signals: Signal[], revision: boolean): string {

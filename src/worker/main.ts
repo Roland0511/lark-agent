@@ -36,6 +36,11 @@ let configChanged = false;
 
 await client.createSession();
 await processor.start();
+const catalog = await processor.modelCatalog().catch((error) => {
+  process.stderr.write(`worker model catalog unavailable: ${errorMessage(error)}\n`);
+  return [];
+});
+await client.reportModelCatalog(catalog);
 process.stdout.write(`worker ${config.executorId} ready home_ref=${config.homeRef} profile=${config.codexProfile}\n`);
 
 const configTimer = setInterval(() => {

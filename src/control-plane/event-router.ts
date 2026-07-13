@@ -22,6 +22,7 @@ export class EventRouter {
     private readonly bot: BotRow = {
       id: legacyBotId, app_id: config.botAppId, profile_name: null, bot_open_id: config.botAppId,
       display_name: config.agentDisplayName, role_instructions: "", owner_open_id: config.ownerOpenId,
+      attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null,
       default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true,
       config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null,
       created_at: new Date(), updated_at: new Date()
@@ -29,6 +30,7 @@ export class EventRouter {
   ) {}
 
   async handleMessage(event: LarkMessageEvent): Promise<void> {
+    const receivedAt = new Date();
     const duplicate = await this.db.selectFrom("processed_events").select("event_id").where("bot_id", "=", this.bot.id).where("event_id", "=", event.event_id).executeTakeFirst();
     if (duplicate) return;
     const details = await this.lark.getMessage(event.message_id);
@@ -108,6 +110,10 @@ export class EventRouter {
             bot_id: this.bot.id,
             bot_config_revision: this.bot.config_revision,
             role_instructions_snapshot: this.bot.role_instructions,
+            attention_model_snapshot: this.bot.attention_model,
+            attention_reasoning_effort_snapshot: this.bot.attention_reasoning_effort,
+            execution_model_snapshot: this.bot.execution_model,
+            execution_reasoning_effort_snapshot: this.bot.execution_reasoning_effort,
             chat_id: event.chat_id,
             chat_type: event.chat_type,
             root_message_id: rootMessageId,
@@ -133,12 +139,24 @@ export class EventRouter {
         const owner = event.sender_id === this.bot.owner_open_id;
         const previous = await trx.selectFrom("tasks").selectAll().where("conversation_id", "=", conversation.id).orderBy("turn_index", "desc").executeTakeFirst();
         if (previous && !conversation.active) return;
+        const requestedWorkspaceAlias = previous?.requested_workspace_alias ?? policy?.workspace_alias ?? this.bot.default_workspace_alias;
+        let preferredExecutorId = previous?.executor_id ?? previous?.preferred_executor_id ?? policy?.preferred_executor_id ?? this.bot.default_executor_id;
+        let routeAmbiguous = false;
+        if (!preferredExecutorId) {
+          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).where("operational_mode", "=", "enabled").execute();
+          const eligible = workers.filter((worker) => {
+            const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
+            return requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1;
+          });
+          if (eligible.length === 1) preferredExecutorId = eligible[0]!.executor_id;
+          else if (eligible.length > 1) routeAmbiguous = true;
+        }
         task = await trx
           .insertInto("tasks")
           .values({
             bot_id: this.bot.id,
             conversation_id: conversation.id,
-            state: previous ? "waiting_worker" : "queued",
+            state: routeAmbiguous ? "waiting_input" : previous ? "waiting_worker" : "queued",
             turn_index: (previous?.turn_index ?? 0) + 1,
             trigger_message_id: event.message_id,
             conversation_disposition: null,
@@ -146,9 +164,9 @@ export class EventRouter {
             requester_id: event.sender_id,
             requester_role: owner ? "owner" : "member",
             authorization_grant: JSON.stringify(authorizationFromMessage(event.content, owner)),
-            requested_workspace_alias: previous?.requested_workspace_alias ?? policy?.workspace_alias ?? this.bot.default_workspace_alias,
+            requested_workspace_alias: requestedWorkspaceAlias,
             resolved_workspace_alias: previous?.resolved_workspace_alias ?? null,
-            preferred_executor_id: previous?.executor_id ?? previous?.preferred_executor_id ?? policy?.preferred_executor_id ?? this.bot.default_executor_id,
+            preferred_executor_id: preferredExecutorId,
             executor_id: previous?.executor_id ?? null,
             codex_thread_id: previous?.codex_thread_id ?? null,
             executor_home_ref: previous?.executor_home_ref ?? null,
@@ -157,13 +175,19 @@ export class EventRouter {
             codex_version: previous?.codex_version ?? null,
             lease_token_hash: null,
             lease_expires_at: null,
-            summary: null,
+            summary: routeAmbiguous ? "存在多个可用执行器，请先为机器人或群绑定默认执行器" : null,
             completed_at: null,
             updated_at: new Date()
           })
           .returningAll()
           .executeTakeFirstOrThrow();
         createdTaskId = task.id;
+        await trx.insertInto("task_events").values({
+          task_id: task.id,
+          event_type: "task.created",
+          summary: routeAmbiguous ? "任务已创建，但执行器路由不明确" : "任务已创建",
+          payload: JSON.stringify({ preferredExecutorId, requestedWorkspaceAlias, routeAmbiguous })
+        }).execute();
       }
       const nextSeq = conversation.room_seq + 1;
       await trx.updateTable("conversations").set({ room_seq: nextSeq, active: true, thread_id: null, updated_at: new Date() }).where("id", "=", conversation.id).execute();
@@ -187,6 +211,13 @@ export class EventRouter {
           decided_at: null
         })
         .execute();
+      await trx.insertInto("task_events").values({
+        task_id: task.id,
+        event_type: "event.received",
+        summary: "飞书事件已进入任务收件箱",
+        payload: JSON.stringify({ eventId: event.event_id, messageId: event.message_id, seq: nextSeq }),
+        created_at: receivedAt
+      }).execute();
     });
 
     void createdTaskId;

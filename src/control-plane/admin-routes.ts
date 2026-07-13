@@ -139,7 +139,7 @@ export function registerAdminRoutes(
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id", async (request) => {
     await requireAdmin(db, config, request);
     const task = await db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
-      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
+      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "bots.default_executor_id as bot_default_executor_id", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at", "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot", "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
     const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;
@@ -150,6 +150,7 @@ export function registerAdminRoutes(
       chat_name: chatName,
       created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), lease_expires_at: iso(task.lease_expires_at),
       followup_expires_at: iso(task.followup_expires_at),
+      route_mismatch: Boolean(task.bot_default_executor_id && task.executor_id && task.bot_default_executor_id !== task.executor_id),
       conversation_turns: conversationTurns.map((turn) => ({ ...turn, created_at: iso(turn.created_at), completed_at: iso(turn.completed_at) })),
       worker: worker ? { ...worker, capabilities: parseJsonArray(worker.capabilities), last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at) } : null
     };
@@ -211,6 +212,8 @@ export function registerAdminRoutes(
       .groupBy("executor_id").execute();
     return { items: rows.map((worker) => ({
       ...worker, workspace_aliases: parseJsonArray(worker.workspace_aliases), capabilities: parseJsonArray(worker.capabilities),
+      model_catalog: Array.isArray(worker.model_catalog) ? worker.model_catalog : [],
+      model_catalog_updated_at: iso(worker.model_catalog_updated_at),
       last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at), activeTasks: active.find((x) => x.executor_id === worker.executor_id)?.count ?? 0,
       credentialActive: (credentials.find((x) => x.executor_id === worker.executor_id)?.active_count ?? 0) > 0,
       credentialLastUsedAt: iso(credentials.find((x) => x.executor_id === worker.executor_id)?.last_used_at ?? null)

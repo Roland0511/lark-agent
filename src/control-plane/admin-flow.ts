@@ -9,6 +9,23 @@ import { AppError } from "../shared/errors.js";
 const flowStages = ["message", "inbox", "attention", "routing", "codex", "draft", "outbox", "reply"] as const;
 type FlowStage = (typeof flowStages)[number];
 
+interface StageEvent {
+  event_type: string;
+  created_at: Date | string;
+  payload?: unknown;
+}
+
+const latencyStageDefinitions = [
+  { key: "event_to_task", label: "事件到任务创建", start: ["event.received"], end: ["task.created"] },
+  { key: "event_to_claim", label: "事件到领取", start: ["event.received"], end: ["task.claimed"] },
+  { key: "thread_ready", label: "Codex Thread 就绪", start: ["task.claimed"], end: ["codex.thread.ready", "codex.thread"] },
+  { key: "attention", label: "注意力判断", start: ["attention.started"], end: ["attention.completed"] },
+  { key: "execution", label: "正式执行", start: ["execution.started"], end: ["execution.completed"] },
+  { key: "first_commentary", label: "首条 Commentary", start: ["execution.started"], end: ["execution.first_commentary"] },
+  { key: "delivery", label: "草稿检查与发送", start: ["draft.checked"], end: ["card.finalized"] },
+  { key: "total", label: "端到端", start: ["event.received"], end: ["task.completed"] }
+] as const;
+
 interface FlowQuery {
   view?: "flow" | "inbox" | "outbox";
   range?: "1h" | "24h" | "7d" | "all";
@@ -38,7 +55,41 @@ function ageSeconds(value: Date | string | null | undefined): number | null {
 
 function elapsed(start: Date | string | null | undefined, end: Date | string | null | undefined): number | null {
   if (!start || !end) return null;
-  return Math.max(0, Math.round((new Date(end).getTime() - new Date(start).getTime()) / 1_000));
+  return Math.max(0, Math.round(new Date(end).getTime() - new Date(start).getTime()) / 1_000);
+}
+
+function buildStageTimings(events: StageEvent[]) {
+  const find = (types: readonly string[], after?: Date | string | null) => events.find((event) => types.includes(event.event_type) && (!after || new Date(event.created_at) >= new Date(after)));
+  const timings = latencyStageDefinitions.map((definition) => {
+    const start = find(definition.start);
+    const end = start ? find(definition.end, start.created_at) : undefined;
+    const startPayload = start?.payload && typeof start.payload === "object" ? start.payload as Record<string, unknown> : {};
+    const endPayload = end?.payload && typeof end.payload === "object" ? end.payload as Record<string, unknown> : {};
+    return {
+      key: definition.key,
+      label: definition.label,
+      startedAt: iso(start?.created_at),
+      completedAt: iso(end?.created_at),
+      durationSeconds: elapsed(start?.created_at, end?.created_at),
+      state: !start ? "not_started" : end ? "completed" : "running",
+      model: typeof startPayload.model === "string" ? startPayload.model : null,
+      effort: typeof startPayload.effort === "string" ? startPayload.effort : null,
+      tokenUsage: endPayload.tokenUsage && typeof endPayload.tokenUsage === "object" ? endPayload.tokenUsage : null
+    };
+  });
+  const completed = timings.filter((timing) => timing.durationSeconds != null && timing.key !== "total");
+  const slowest = completed.sort((left, right) => (right.durationSeconds ?? 0) - (left.durationSeconds ?? 0))[0] ?? null;
+  const total = timings.find((timing) => timing.key === "total")?.durationSeconds ?? completed.reduce((sum, timing) => sum + (timing.durationSeconds ?? 0), 0);
+  return {
+    timings,
+    bottleneck: slowest ? { ...slowest, share: total > 0 ? (slowest.durationSeconds ?? 0) / total : null } : null
+  };
+}
+
+function percentile(values: number[], ratio: number): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  return sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * ratio) - 1))] ?? null;
 }
 
 function redactSecrets(value: unknown): unknown {
@@ -81,13 +132,14 @@ export function registerAdminFlowRoutes(
   app.get<{ Querystring: { range?: string } }>("/v1/admin/flow/summary", async (request) => {
     await requireAdmin(db, config, request);
     const start = since(request.query.range);
-    const [signals, tasks, drafts, approvals, outputs, outbox] = await Promise.all([
+    const [signals, tasks, drafts, approvals, outputs, outbox, taskEvents] = await Promise.all([
       db.selectFrom("signals").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
       db.selectFrom("tasks").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
       db.selectFrom("drafts").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
       db.selectFrom("approvals").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
       db.selectFrom("task_outputs").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
-      db.selectFrom("outbox_messages").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute()
+      db.selectFrom("outbox_messages").selectAll().where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute(),
+      db.selectFrom("task_events").select(["task_id", "event_type", "created_at"]).where((eb) => start ? eb("created_at", ">=", start) : eb.val(true)).execute()
     ]);
     const oldest = (dates: Array<Date | string>) => dates.length ? ageSeconds(dates.sort((a, b) => +new Date(a) - +new Date(b))[0]) : null;
     const summaries = [
@@ -100,7 +152,20 @@ export function registerAdminFlowRoutes(
       { stage: "outbox", active: outbox.filter((x) => x.state === "pending" || x.state === "unknown").length + outputs.filter((x) => ["pending", "streaming", "held", "unknown"].includes(x.state)).length, passed: outbox.filter((x) => x.state === "sent").length, warnings: outputs.filter((x) => x.state === "held").length, failed: outbox.filter((x) => x.state === "unknown").length + outputs.filter((x) => x.state === "failed" || x.state === "unknown").length, oldestWaitingSeconds: oldest(outbox.filter((x) => x.state === "pending" || x.state === "unknown").map((x) => x.created_at)), healthy: true },
       { stage: "reply", active: 0, passed: outbox.filter((x) => x.state === "sent" && x.platform_message_id).length, warnings: 0, failed: outbox.filter((x) => x.state === "sent" && !x.platform_message_id).length, oldestWaitingSeconds: null, healthy: true }
     ];
-    return { stages: summaries };
+    const eventsByTask = new Map<string, StageEvent[]>();
+    for (const event of taskEvents) eventsByTask.set(event.task_id, [...(eventsByTask.get(event.task_id) ?? []), event]);
+    const durations = new Map<string, number[]>();
+    for (const taskStageEvents of eventsByTask.values()) {
+      for (const timing of buildStageTimings(taskStageEvents).timings) {
+        if (timing.durationSeconds == null) continue;
+        durations.set(timing.key, [...(durations.get(timing.key) ?? []), timing.durationSeconds]);
+      }
+    }
+    const latencyStages = latencyStageDefinitions.map((definition) => {
+      const values = durations.get(definition.key) ?? [];
+      return { key: definition.key, label: definition.label, count: values.length, p50Seconds: percentile(values, 0.5), p95Seconds: percentile(values, 0.95) };
+    });
+    return { stages: summaries, latencyStages };
   });
 
   app.get<{ Querystring: FlowQuery }>("/v1/admin/flow/items", async (request) => {
@@ -179,13 +244,17 @@ export function registerAdminFlowRoutes(
       const taskOutbox = outbox.filter((x) => x.task_id === task.id).at(-1);
       const decisions = taskSignals.map((x) => x.decision);
       const stage = currentStage(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state);
+      const latency = buildStageTimings(taskEvents);
+      const codexEvent = taskEvents.find((event) => event.event_type === "codex.thread.ready" || event.event_type === "codex.thread");
       return {
         ...publicTask(task),
         created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), followup_expires_at: iso(task.followup_expires_at),
         currentStage: stage, health: flowHealth(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state),
         signal: taskSignals.at(-1) ? { ...taskSignals.at(-1), created_at: iso(taskSignals.at(-1)?.created_at), decided_at: iso(taskSignals.at(-1)?.decided_at) } : null,
         signalCount: taskSignals.length,
-        codexEvent: taskEvents.find((x) => x.event_type === "codex.thread") ? { ...taskEvents.find((x) => x.event_type === "codex.thread"), created_at: iso(taskEvents.find((x) => x.event_type === "codex.thread")?.created_at) } : null,
+        codexEvent: codexEvent ? { ...codexEvent, created_at: iso(codexEvent.created_at) } : null,
+        stageTimings: latency.timings,
+        bottleneck: latency.bottleneck,
         draft: taskDraft ? { ...taskDraft, created_at: iso(taskDraft.created_at), sent_at: iso(taskDraft.sent_at) } : null,
         approval: taskApproval ? { ...taskApproval, created_at: iso(taskApproval.created_at), decided_at: iso(taskApproval.decided_at) } : null,
         output: taskOutput ? { ...taskOutput, created_at: iso(taskOutput.created_at), opened_at: iso(taskOutput.opened_at), closed_at: iso(taskOutput.closed_at) } : null,
@@ -200,7 +269,7 @@ export function registerAdminFlowRoutes(
     const task = await db.selectFrom("tasks").selectAll().where("id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const conversation = await db.selectFrom("conversations").selectAll().where("id", "=", task.conversation_id).executeTakeFirstOrThrow();
-    const bot = await db.selectFrom("bots").select(["app_id", "display_name"]).where("id", "=", task.bot_id).executeTakeFirstOrThrow();
+    const bot = await db.selectFrom("bots").select(["app_id", "display_name", "default_executor_id"]).where("id", "=", task.bot_id).executeTakeFirstOrThrow();
     const [signals, events, drafts, approvals, output, updates, outbox, actions, latestTurn] = await Promise.all([
       db.selectFrom("signals").selectAll().where("task_id", "=", task.id).orderBy("seq").execute(),
       db.selectFrom("task_events").selectAll().where("task_id", "=", task.id).orderBy("created_at").execute(),
@@ -223,6 +292,7 @@ export function registerAdminFlowRoutes(
     const firstSignal = signals[0];
     const lastSignal = signals.at(-1);
     const codexEvent = events.find((event) => event.event_type.includes("codex"));
+    const latency = buildStageTimings(events);
     const firstUpdate = updates[0];
     const lastUpdate = updates.at(-1);
     const checks = [
@@ -238,7 +308,7 @@ export function registerAdminFlowRoutes(
       check("lifecycle", !isLatest || lifecycleConsistent(task, conversation.active, conversation.followup_expires_at), "错误", `Conversation active=${conversation.active} · disposition=${task.conversation_disposition ?? "未判断"}`, task.created_at, task.completed_at, [task.conversation_id, task.id])
     ];
     return redactSecrets({
-      task: { ...publicTask(task), bot_app_id: bot.app_id, bot_display_name: bot.display_name, created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at) },
+      task: { ...publicTask(task), bot_app_id: bot.app_id, bot_display_name: bot.display_name, bot_default_executor_id: bot.default_executor_id, route_mismatch: Boolean(bot.default_executor_id && task.executor_id && bot.default_executor_id !== task.executor_id), created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at) },
       conversation: { ...conversation, created_at: iso(conversation.created_at), updated_at: iso(conversation.updated_at), followup_expires_at: iso(conversation.followup_expires_at) },
       processed_events: processedEvents.map((x) => ({ ...x, received_at: iso(x.received_at), processed_at: iso(x.processed_at) })),
       signals: signals.map((x) => ({ ...x, created_at: iso(x.created_at), decided_at: iso(x.decided_at) })),
@@ -249,7 +319,9 @@ export function registerAdminFlowRoutes(
       updates: updates.map((x) => ({ ...x, created_at: iso(x.created_at), updated_at: iso(x.updated_at), sent_at: iso(x.sent_at) })),
       outbox: outbox.map((x) => ({ ...x, created_at: iso(x.created_at), updated_at: iso(x.updated_at), sent_at: iso(x.sent_at) })),
       actions: actions.map((x) => ({ ...x, created_at: iso(x.created_at) })),
-      checks
+      checks,
+      stageTimings: latency.timings,
+      bottleneck: latency.bottleneck
     });
   });
 }

@@ -21,6 +21,12 @@ export class DraftService {
     await this.reconcileUnseenMessages(task.id, task.conversation_id);
     const conversation = await this.db.selectFrom("conversations").selectAll().where("id", "=", task.conversation_id).executeTakeFirstOrThrow();
     const held = conversation.room_seq !== baseRoomSeq || force;
+    await this.db.insertInto("task_events").values({
+      task_id: task.id,
+      event_type: "draft.checked",
+      summary: held ? "草稿版本已过期，进入搁置" : "草稿新鲜度检查通过",
+      payload: JSON.stringify({ baseRoomSeq, observedRoomSeq: conversation.room_seq, held, force })
+    }).execute();
     const draft = await this.db
       .insertInto("drafts")
       .values({

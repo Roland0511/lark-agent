@@ -77,6 +77,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const runnerEnrollmentSql = await readFile(fileURLToPath(new URL("../db/migrations/009_runner_enrollment.sql", import.meta.url)), "utf8");
     const workerSoftDeleteSql = await readFile(fileURLToPath(new URL("../db/migrations/010_worker_soft_delete.sql", import.meta.url)), "utf8");
     const multiBotSql = await readFile(fileURLToPath(new URL("../db/migrations/011_multi_bot.sql", import.meta.url)), "utf8");
+    const latencyAndModelPolicySql = await readFile(fileURLToPath(new URL("../db/migrations/012_latency_and_model_policy.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -91,6 +92,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await client.query(workerSoftDeleteSql);
     const multiBotApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'tasks' AND column_name = 'bot_id'");
     if (multiBotApplied.rowCount === 0) await client.query(multiBotSql);
+    const latencyPolicyApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'conversations' AND column_name = 'attention_model_snapshot'");
+    if (latencyPolicyApplied.rowCount === 0) await client.query(latencyAndModelPolicySql);
     await client.end();
   });
 
@@ -115,7 +118,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("worker_enrollment_tokens").execute();
     await db.deleteFrom("workers").execute();
     await db.deleteFrom("bots").where("id", "!=", "00000000-0000-0000-0000-000000000001").execute();
-    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, enabled: true, is_system: true, credential_state: "verified", deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, credential_state: "verified", deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     await db.insertInto("bot_chat_bindings").values({ bot_id: "00000000-0000-0000-0000-000000000001", chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
   });
 
@@ -431,6 +434,57 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       .toEqual({ state: "queued", resolved_workspace_alias: null });
   });
 
+  it("does not let multiple eligible executors race for an unbound task", async () => {
+    await insertWorker();
+    await db.insertInto("workers").values({
+      executor_id: "worker-b", display_name: "Worker B", home_ref: "worker-b:home", codex_profile: "lark-agent",
+      config_fingerprint: "b".repeat(64), codex_version: "test", capacity: 1,
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+    }).execute();
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_ambiguous_executor", chat_type: "group", root_message_id: "om_ambiguous_executor", thread_id: null,
+      room_seq: 1, active: true, response_message_id: null, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_ambiguous_executor", state: "queued", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", preferred_executor_id: null, executor_id: null, codex_thread_id: null,
+      executor_home_ref: null, executor_profile: null, executor_config_fingerprint: null, codex_version: null,
+      lease_token_hash: null, lease_expires_at: null, summary: null, completed_at: null, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+
+    await expect(repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) })).resolves.toBeNull();
+    await expect(repository.claimTask({ executorId: "worker-b", homeRef: "worker-b:home", codexProfile: "lark-agent", configFingerprint: "b".repeat(64) })).resolves.toBeNull();
+    expect((await db.selectFrom("tasks").select("state").where("id", "=", task.id).executeTakeFirstOrThrow()).state).toBe("queued");
+  });
+
+  it("pauses a task after three pre-thread lease expirations and creates an incident", async () => {
+    await insertWorker();
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_lease_loop", chat_type: "group", root_message_id: "om_lease_loop", thread_id: null,
+      room_seq: 1, active: true, response_message_id: null, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_lease_loop", state: "running", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: "worker-a", executor_id: "worker-a", codex_thread_id: null,
+      executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64), codex_version: "test",
+      lease_token_hash: sha256("expired"), lease_expires_at: new Date(Date.now() - 1_000), attempt: 3, summary: null, completed_at: null, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+
+    await expect(repository.recoverExpiredLeases()).resolves.toBe(1);
+    expect(await db.selectFrom("tasks").select(["state", "lease_token_hash", "lease_expires_at"]).where("id", "=", task.id).executeTakeFirstOrThrow())
+      .toEqual({ state: "waiting_input", lease_token_hash: null, lease_expires_at: null });
+    expect((await db.selectFrom("task_events").select("event_type").where("task_id", "=", task.id).executeTakeFirstOrThrow()).event_type).toBe("task.lease_recovery_stopped");
+
+    const incidents = new IncidentService(db, config, services.lark, services.runtime, services.adminEvents);
+    await incidents.evaluate();
+    expect(await db.selectFrom("incidents").select(["kind", "related_id"]).where("kind", "=", "lease_recovery_stopped").executeTakeFirstOrThrow())
+      .toEqual({ kind: "lease_recovery_stopped", related_id: task.id });
+  });
+
   it("keeps commentary and final answer in one CardKit message with monotonic sequence", async () => {
     const calls: Array<{ kind: string; sequence?: number; content?: string }> = [];
     const cardLark = {
@@ -590,6 +644,38 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await router.handleMessage(event("ev_reactivate", "om_reactivate", "@Lark Agent next task"));
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(2);
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(2);
+  });
+
+  it("pauses a newly activated group task when multiple executors are eligible but none is bound", async () => {
+    await insertWorker();
+    await db.updateTable("bots").set({
+      attention_model: "attention-fast", attention_reasoning_effort: "low",
+      execution_model: "execution-deep", execution_reasoning_effort: "high"
+    }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.insertInto("workers").values({
+      executor_id: "worker-b", display_name: "Worker B", home_ref: "worker-b:home", codex_profile: "lark-agent",
+      config_fingerprint: "b".repeat(64), codex_version: "test", capacity: 1,
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+    }).execute();
+    const details: LarkMessageDetails = {
+      messageId: "om_route_ambiguous", rootId: null, parentId: null, threadId: null, chatId: "oc_test",
+      senderId: "ou_owner", senderType: "user", messageType: "text", content: "@Lark Agent 测试路由",
+      createTime: "1", mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }]
+    };
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const router = new EventRouter(db, config, { getMessage: async () => details } as unknown as LarkGateway, new ControlPlaneRepository(db, 60), bot);
+    await router.handleMessage({
+      type: "im.message.receive_v1", event_id: "ev_route_ambiguous", timestamp: "1", message_id: details.messageId,
+      chat_id: details.chatId, chat_type: "group", sender_id: details.senderId, message_type: "text", content: details.content, create_time: "1"
+    });
+
+    const task = await db.selectFrom("tasks").select(["state", "preferred_executor_id", "summary"]).executeTakeFirstOrThrow();
+    expect(task).toMatchObject({ state: "waiting_input", preferred_executor_id: null });
+    expect(task.summary).toContain("多个可用执行器");
+    expect(await db.selectFrom("conversations").select(["attention_model_snapshot", "attention_reasoning_effort_snapshot", "execution_model_snapshot", "execution_reasoning_effort_snapshot"]).executeTakeFirstOrThrow())
+      .toEqual({ attention_model_snapshot: "attention-fast", attention_reasoning_effort_snapshot: "low", execution_model_snapshot: "execution-deep", execution_reasoning_effort_snapshot: "high" });
+    expect((await db.selectFrom("task_events").select(["event_type", "summary"]).where("event_type", "=", "task.created").executeTakeFirstOrThrow()).summary)
+      .toContain("路由不明确");
   });
 
   it("keeps an awaiting group conversation active and creates the next turn on an ordinary message", async () => {

@@ -63,6 +63,7 @@ export class TaskOutputService {
         try {
           output = await this.openCard(taskId, content, false);
           await this.db.updateTable("task_outputs").set({ state: "completed", visible_phase: "final", closed_at: new Date(), updated_at: new Date() }).where("task_id", "=", taskId).execute();
+          await this.recordStage(taskId, "card.finalized", "CardKit 最终回复已完成", { streaming: false });
           return { messageId: output.message_id ?? "", transport: "cardkit" };
         } catch (error) {
           const failed = await this.getOutput(taskId);
@@ -85,6 +86,7 @@ export class TaskOutputService {
       output = await this.updateContent(output, content, "final", output.last_ordinal);
       await this.closeStream(output, previewSummary(content));
       await this.db.updateTable("task_outputs").set({ state: "completed", visible_phase: "final", closed_at: new Date(), updated_at: new Date() }).where("task_id", "=", taskId).execute();
+      await this.recordStage(taskId, "card.finalized", "CardKit 流式回复已关闭", { streaming: true, sequence: output.sequence + 1 });
       return { messageId: output.message_id ?? "", transport: "cardkit" };
     });
   }
@@ -101,6 +103,7 @@ export class TaskOutputService {
       cardId = await gateway.createCardEntity(content, streaming);
       await this.completeOperation(createUuid);
       await this.db.updateTable("task_outputs").set({ card_id: cardId, current_content: content, current_content_hash: sha256(content), updated_at: new Date() }).where("task_id", "=", taskId).execute();
+      await this.recordStage(taskId, "card.created", "CardKit 卡片实体已创建", { streaming });
     } catch (error) {
       await this.failOperation(createUuid, error, "failed");
       await this.db.updateTable("task_outputs").set({ state: "failed", last_error: errorMessage(error), updated_at: new Date() }).where("task_id", "=", taskId).execute();
@@ -116,6 +119,7 @@ export class TaskOutputService {
       await this.completeOperation(sendUuid);
       await this.db.updateTable("task_outputs").set({ message_id: messageId, state: streaming ? "streaming" : "completed", visible_phase: streaming ? "commentary" : "final", opened_at: new Date(), updated_at: new Date() }).where("task_id", "=", taskId).execute();
       await this.db.updateTable("conversations").set({ response_message_id: messageId, updated_at: new Date() }).where("id", "=", output.conversation_id).execute();
+      await this.recordStage(taskId, "card.sent", "CardKit 已发送到飞书", { streaming, messageId });
       return (await this.getOutput(taskId)) as NonNullable<OutputRow>;
     } catch (error) {
       const state = isDefiniteLarkRejection(error) ? "failed" : "unknown";
@@ -210,6 +214,10 @@ export class TaskOutputService {
 
   private async failOperation(requestUuid: string, error: unknown, state: "failed" | "unknown"): Promise<void> {
     await this.db.updateTable("task_output_updates").set({ state, attempt: 1, last_error: errorMessage(error), updated_at: new Date() }).where("request_uuid", "=", requestUuid).execute();
+  }
+
+  private async recordStage(taskId: string, eventType: string, summary: string, payload: Record<string, unknown>): Promise<void> {
+    await this.db.insertInto("task_events").values({ task_id: taskId, event_type: eventType, summary, payload: JSON.stringify(payload) }).execute();
   }
 
   private serialized<T>(taskId: string, action: () => Promise<T>): Promise<T> {

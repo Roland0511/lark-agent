@@ -7,7 +7,8 @@ import {
   type ClaimedTask,
   type InboxDecision,
   type Signal,
-  type WorkerRegistration
+  type WorkerRegistration,
+  type WorkerModelCatalogEntry
 } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 
@@ -44,6 +45,14 @@ export class ControlPlaneClient {
     const response = await this.authorizedFetch("/v1/tasks/claim", { method: "POST" });
     if (response.status === 204) return null;
     return claimedTaskSchema.parse(await jsonResponse(response));
+  }
+
+  async reportModelCatalog(models: WorkerModelCatalogEntry[]): Promise<void> {
+    await this.authorizedFetch("/v1/workers/model-catalog", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ models })
+    }).then(jsonResponse);
   }
 
   async heartbeat(taskId: string, leaseToken: string): Promise<{ leaseExpiresAt: string; state: string }> {

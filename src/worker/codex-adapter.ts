@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
-import type { AttentionResult } from "../shared/contracts.js";
+import type { AttentionResult, WorkerModelCatalogEntry } from "../shared/contracts.js";
 import { attentionResultSchema } from "../shared/contracts.js";
 import { errorMessage } from "../shared/errors.js";
 import type { ResolvedWorkerConfig } from "./config.js";
@@ -28,6 +28,7 @@ interface TurnCollector {
 export type ApprovalHandler = (request: { id: string; method: string; params: Record<string, unknown>; summary: string }) => Promise<"accept" | "decline" | "cancel">;
 export type ItemHandler = (item: Record<string, unknown>) => Promise<void>;
 export type CommentaryHandler = (update: { itemId: string; text: string; ordinal: number }) => Promise<void>;
+export type ActivityHandler = (method: string, params: Record<string, unknown>) => void;
 
 export class CodexAdapter {
   private child: ChildProcessWithoutNullStreams | null = null;
@@ -39,7 +40,8 @@ export class CodexAdapter {
     private readonly config: ResolvedWorkerConfig,
     private readonly approvalHandler: ApprovalHandler,
     private readonly itemHandler?: ItemHandler,
-    private readonly commentaryHandler?: CommentaryHandler
+    private readonly commentaryHandler?: CommentaryHandler,
+    private readonly activityHandler?: ActivityHandler
   ) {}
 
   async start(): Promise<void> {
@@ -58,7 +60,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.1" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.2" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -75,10 +77,10 @@ export class CodexAdapter {
     this.child = null;
   }
 
-  async startOrResumeThread(cwd: string, threadId: string | null): Promise<string> {
+  async startOrResumeThread(cwd: string, threadId: string | null, model: string | null = null): Promise<string> {
     const result = (await this.request(threadId ? "thread/resume" : "thread/start", threadId
       ? { threadId, cwd, approvalPolicy: "on-request", approvalsReviewer: "user" }
-      : { cwd, approvalPolicy: "on-request", approvalsReviewer: "user", ephemeral: false, serviceName: "lark-agent" })) as {
+      : { cwd, approvalPolicy: "on-request", approvalsReviewer: "user", ephemeral: false, serviceName: "lark-agent", ...(model ? { model } : {}) })) as {
       thread?: { id?: string };
     };
     const id = result.thread?.id;
@@ -89,7 +91,7 @@ export class CodexAdapter {
   async runTurn(
     threadId: string,
     text: string,
-    options: { outputSchema?: Record<string, unknown>; publishCommentary?: boolean } = {}
+    options: { outputSchema?: Record<string, unknown>; publishCommentary?: boolean; model?: string | null; effort?: string | null } = {}
   ): Promise<{ turnId: string; text: string }> {
     if (this.collector) throw new Error("only one primary turn may run per executor instance");
     let collector!: TurnCollector;
@@ -101,6 +103,8 @@ export class CodexAdapter {
       const result = (await this.request("turn/start", {
         threadId,
         input: [{ type: "text", text }],
+        ...(options.model ? { model: options.model } : {}),
+        ...(options.effort ? { effort: options.effort } : {}),
         ...(options.outputSchema ? { outputSchema: options.outputSchema } : {})
       })) as { turn?: { id?: string } };
       const turnId = result.turn?.id;
@@ -114,8 +118,13 @@ export class CodexAdapter {
     }
   }
 
-  async attention(cwd: string, taskSummary: string, signalPreview: string): Promise<AttentionResult> {
-    const threadId = await this.startEphemeralThread(cwd);
+  async attention(
+    cwd: string,
+    taskSummary: string,
+    signalPreview: string,
+    policy: { model: string | null; effort: string | null } = { model: null, effort: null }
+  ): Promise<AttentionResult> {
+    const threadId = await this.startEphemeralThread(cwd, policy.model);
     const result = await this.runTurn(
       threadId,
       [
@@ -124,7 +133,7 @@ export class CodexAdapter {
         `新信号预览：${signalPreview}`,
         "选择 consume、defer、dismiss 或 merge，并给出 0-100 优先级和简短理由。"
       ].join("\n"),
-      { outputSchema: {
+      { model: policy.model, effort: policy.effort, outputSchema: {
         type: "object",
         additionalProperties: false,
         required: ["decision", "priority", "rationale"],
@@ -151,13 +160,41 @@ export class CodexAdapter {
     return { threadId: this.collector.threadId, turnId: this.collector.turnId };
   }
 
-  private async startEphemeralThread(cwd: string): Promise<string> {
+  async listModels(): Promise<WorkerModelCatalogEntry[]> {
+    const models: WorkerModelCatalogEntry[] = [];
+    let cursor: string | null = null;
+    do {
+      const result = await this.request("model/list", { cursor, limit: 100, includeHidden: false }) as {
+        data?: Array<Record<string, unknown>>;
+        nextCursor?: string | null;
+      };
+      for (const item of result.data ?? []) {
+        const id = String(item.id ?? item.model ?? "").trim();
+        if (!id) continue;
+        const efforts = Array.isArray(item.supportedReasoningEfforts)
+          ? item.supportedReasoningEfforts.map((entry) => typeof entry === "string" ? entry : String((entry as Record<string, unknown>).reasoningEffort ?? "")).filter(Boolean)
+          : [];
+        models.push({
+          id,
+          displayName: String(item.displayName ?? id),
+          isDefault: item.isDefault === true,
+          defaultReasoningEffort: typeof item.defaultReasoningEffort === "string" ? item.defaultReasoningEffort : null,
+          supportedReasoningEfforts: [...new Set(efforts)]
+        });
+      }
+      cursor = result.nextCursor ?? null;
+    } while (cursor);
+    return models;
+  }
+
+  private async startEphemeralThread(cwd: string, model: string | null): Promise<string> {
     const result = (await this.request("thread/start", {
       cwd,
       approvalPolicy: "never",
       approvalsReviewer: "user",
       ephemeral: true,
-      serviceName: "lark-agent-attention"
+      serviceName: "lark-agent-attention",
+      ...(model ? { model } : {})
     })) as { thread?: { id?: string } };
     if (!result.thread?.id) throw new Error("Codex did not return an attention thread id");
     return result.thread.id;
@@ -203,6 +240,7 @@ export class CodexAdapter {
   }
 
   private handleNotification(message: RpcMessage): void {
+    if (message.method) this.activityHandler?.(message.method, message.params ?? {});
     const collector = this.collector;
     if (!collector || !message.method) return;
     if (message.method === "item/started") {

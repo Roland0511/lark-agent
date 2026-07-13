@@ -60,6 +60,23 @@ export const workerRegistrationSchema = z.object({
 });
 export type WorkerRegistration = z.infer<typeof workerRegistrationSchema>;
 
+export const workerModelCatalogEntrySchema = z.object({
+  id: z.string().min(1).max(256),
+  displayName: z.string().min(1).max(256),
+  isDefault: z.boolean().default(false),
+  defaultReasoningEffort: z.string().max(32).nullable(),
+  supportedReasoningEfforts: z.array(z.string().min(1).max(32)).max(16)
+});
+export const workerModelCatalogSchema = z.object({
+  models: z.array(workerModelCatalogEntrySchema).max(500)
+});
+export type WorkerModelCatalogEntry = z.infer<typeof workerModelCatalogEntrySchema>;
+
+const canonicalUuidSchema = z.string().regex(
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/,
+  "Invalid canonical UUID"
+);
+
 export const workerSessionResponseSchema = z.object({
   sessionToken: z.string(),
   expiresAt: z.string().datetime()
@@ -98,11 +115,15 @@ export type Signal = z.infer<typeof signalSchema>;
 
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
-  botId: z.string().uuid(),
+  botId: canonicalUuidSchema,
   botAppId: z.string().regex(/^cli_[A-Za-z0-9]+$/),
   botDisplayName: z.string().min(1),
   roleInstructions: z.string().max(20_000),
   botConfigRevision: z.number().int().positive(),
+  attentionModel: z.string().max(256).nullable(),
+  attentionReasoningEffort: z.string().max(32).nullable(),
+  executionModel: z.string().max(256).nullable(),
+  executionReasoningEffort: z.string().max(32).nullable(),
   conversationId: z.string().uuid(),
   state: z.enum(taskStates),
   leaseToken: z.string(),

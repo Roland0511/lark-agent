@@ -10,9 +10,11 @@ import {
   approvalRequestSchema,
   actionReceiptSchema,
   commentaryStreamUpdateSchema,
+  claimedTaskSchema,
   draftSubmissionSchema,
   resultSubmissionSchema,
   taskEventSchema,
+  workerModelCatalogSchema,
   workerRegistrationSchema,
   type InboxDecision
 } from "../shared/contracts.js";
@@ -112,6 +114,18 @@ export function buildControlPlane(
     return reply.send({ sessionToken: session.token, expiresAt: session.expiresAt.toISOString() });
   });
 
+  app.post("/v1/workers/model-catalog", async (request) => {
+    const principal = await requireWorkerSession(db, config, request);
+    const body = workerModelCatalogSchema.parse(request.body);
+    await db.updateTable("workers").set({
+      model_catalog: JSON.stringify(body.models),
+      model_catalog_updated_at: new Date(),
+      updated_at: new Date()
+    }).where("executor_id", "=", principal.executorId).execute();
+    adminEvents.publish("worker", principal.executorId);
+    return { ok: true };
+  });
+
   app.post("/v1/tasks/claim", async (request, reply) => {
     const principal = await requireWorkerSession(db, config, request);
     await repository.touchWorker(principal.executorId);
@@ -121,7 +135,12 @@ export function buildControlPlane(
       const claimed = await repository.claimTask(principal);
       if (claimed) {
         const conversation = await db.selectFrom("conversations").innerJoin("bots", "bots.id", "conversations.bot_id")
-          .select(["conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot", "bots.app_id", "bots.display_name"])
+          .select([
+            "conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot",
+            "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot",
+            "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot",
+            "bots.app_id", "bots.display_name"
+          ])
           .where("conversations.id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
         const signals = await repository.taskSignals(claimed.task.id);
         const previous = claimed.task.turn_index > 1
@@ -140,13 +159,17 @@ export function buildControlPlane(
               `上一回合回复摘要：${String(previous.current_content ?? "").slice(0, 500)}`
             ].join("\n").slice(0, 2_000)
           : "这是会话的首次激活回合。";
-        return reply.send({
+        const payload = {
           id: claimed.task.id,
           botId: claimed.task.bot_id,
           botAppId: conversation.app_id,
           botDisplayName: conversation.display_name,
           roleInstructions: conversation.role_instructions_snapshot,
           botConfigRevision: conversation.bot_config_revision,
+          attentionModel: conversation.attention_model_snapshot,
+          attentionReasoningEffort: conversation.attention_reasoning_effort_snapshot,
+          executionModel: conversation.execution_model_snapshot,
+          executionReasoningEffort: conversation.execution_reasoning_effort_snapshot,
           conversationId: claimed.task.conversation_id,
           state: claimed.task.state,
           leaseToken: claimed.leaseToken,
@@ -176,7 +199,15 @@ export function buildControlPlane(
             decision: signal.decision,
             createdAt: iso(signal.created_at)
           }))
-        });
+        };
+        const validated = claimedTaskSchema.safeParse(payload);
+        if (!validated.success) {
+          const detail = validated.error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ");
+          await repository.rejectInvalidClaim(claimed.task.id, claimed.leaseToken, detail);
+          adminEvents.publish("task", claimed.task.id);
+          continue;
+        }
+        return reply.send(validated.data);
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     } while (Date.now() < deadline);

@@ -31,7 +31,7 @@ export class IncidentService {
     const findings = await this.findings();
     const active = new Set(findings.map((item) => item.fingerprint));
     for (const finding of findings) await this.upsert(finding);
-    const managedKinds = ["worker_offline", "task_waiting", "task_long_running", "worker_failures", "outbox_unknown", "output_unknown", "consumer_down", "config_changed"];
+    const managedKinds = ["worker_offline", "task_waiting", "task_claim_slow", "task_long_running", "attention_slow", "execution_slow", "lease_recovery_stopped", "worker_failures", "outbox_unknown", "output_unknown", "consumer_down", "config_changed"];
     const open = await this.db.selectFrom("incidents").selectAll().where("state", "!=", "resolved").where("kind", "in", managedKinds).execute();
     for (const incident of open) {
       if (active.has(incident.fingerprint)) continue;
@@ -46,20 +46,33 @@ export class IncidentService {
 
   private async findings(): Promise<Finding[]> {
     const now = Date.now();
-    const [workers, waiting, running, failures, unknown, outputUnknown, changed, bots] = await Promise.all([
+    const [workers, waiting, claimSlow, running, failures, unknown, outputUnknown, changed, bots, slowEvents, leaseStops, activeByWorker] = await Promise.all([
       this.db.selectFrom("workers").selectAll().where("operational_mode", "=", "enabled").where("deleted_at", "is", null).execute(),
       this.db.selectFrom("tasks").select(["id", "state", "created_at", "executor_id"]).where("state", "in", ["queued", "waiting_worker"]).where("created_at", "<", new Date(now - 5 * 60_000)).execute(),
+      this.db.selectFrom("tasks").select(["id", "state", "created_at", "preferred_executor_id"]).where("state", "in", ["queued", "waiting_worker"]).where("created_at", "<", new Date(now - 3_000)).execute(),
       this.db.selectFrom("tasks").select(["id", "created_at", "executor_id"]).where("state", "=", "running").where("created_at", "<", new Date(now - 60 * 60_000)).execute(),
       this.db.selectFrom("tasks").select(["executor_id", sql<number>`count(*)::int`.as("count")]).where("state", "=", "failed").where("updated_at", ">", new Date(now - 15 * 60_000)).where("executor_id", "is not", null).groupBy("executor_id").having(sql`count(*)`, ">=", 3).execute(),
       this.db.selectFrom("outbox_messages").select(["id", "task_id", "last_error"]).where("state", "=", "unknown").execute(),
       this.db.selectFrom("task_outputs").select(["task_id", "last_error"]).where("state", "=", "unknown").execute(),
       this.db.selectFrom("tasks").select(["id", "executor_id"]).where("state", "=", "waiting_input").where("summary", "like", "%配置指纹%").execute(),
-      this.db.selectFrom("bots").select(["id", "display_name", "is_system"]).where("enabled", "=", true).where("deleted_at", "is", null).execute()
+      this.db.selectFrom("bots").select(["id", "display_name", "is_system"]).where("enabled", "=", true).where("deleted_at", "is", null).execute(),
+      this.db.selectFrom("task_events").innerJoin("tasks", "tasks.id", "task_events.task_id").select(["task_events.task_id", "task_events.event_type", "task_events.created_at"]).where("tasks.state", "=", "running").where("task_events.event_type", "in", ["attention.slow", "execution.slow"]).execute(),
+      this.db.selectFrom("task_events").innerJoin("tasks", "tasks.id", "task_events.task_id").select(["task_events.task_id", "task_events.created_at"]).where("tasks.state", "=", "waiting_input").where("task_events.event_type", "=", "task.lease_recovery_stopped").execute(),
+      this.db.selectFrom("tasks").select(["executor_id", sql<number>`count(*)::int`.as("count")]).where("state", "=", "running").where("executor_id", "is not", null).groupBy("executor_id").execute()
     ]);
     const result: Finding[] = [];
     for (const worker of workers) if (now - new Date(worker.last_seen_at).getTime() > 90_000) result.push(finding("worker_offline", worker.executor_id, "critical", "执行器已离线", `${worker.display_name} 超过 90 秒没有心跳`, "worker", worker.executor_id));
     for (const task of waiting) result.push(finding("task_waiting", task.id, "warning", "任务等待执行器", `任务已等待超过 5 分钟（${task.state}）`, "task", task.id));
+    const activeCounts = new Map(activeByWorker.map((row) => [row.executor_id, row.count]));
+    for (const task of claimSlow) {
+      if (!task.preferred_executor_id) continue;
+      const worker = workers.find((candidate) => candidate.executor_id === task.preferred_executor_id);
+      if (!worker || now - new Date(worker.last_seen_at).getTime() > 45_000 || (activeCounts.get(worker.executor_id) ?? 0) >= worker.capacity) continue;
+      result.push(finding("task_claim_slow", task.id, "warning", "空闲执行器未及时领取", `任务超过 3 秒未被 ${worker.display_name} 领取，检查 Worker 长轮询和契约`, "task", task.id));
+    }
     for (const task of running) result.push(finding("task_long_running", task.id, "warning", "任务运行时间过长", "任务已运行超过 60 分钟", "task", task.id));
+    for (const event of slowEvents) result.push(finding(event.event_type === "attention.slow" ? "attention_slow" : "execution_slow", event.task_id, "warning", event.event_type === "attention.slow" ? "注意力判断响应缓慢" : "模型响应缓慢", event.event_type === "attention.slow" ? "注意力判断已超过 15 秒" : "正式执行已超过 60 秒没有 App Server 事件；任务仍继续运行", "task", event.task_id));
+    for (const event of leaseStops) result.push(finding("lease_recovery_stopped", event.task_id, "critical", "任务启动契约持续失败", "任务在建立 Codex thread 前连续三次租约过期，已停止自动重领", "task", event.task_id));
     for (const row of failures) if (row.executor_id) result.push(finding("worker_failures", row.executor_id, "critical", "执行器连续失败", `15 分钟内失败 ${row.count} 次`, "worker", row.executor_id));
     for (const row of unknown) result.push(finding("outbox_unknown", row.id, "critical", "飞书发送结果不确定", row.last_error?.slice(0, 180) ?? "需要人工核查", "outbox", row.id));
     for (const row of outputUnknown) result.push(finding("output_unknown", row.task_id, "critical", "流式回复状态不确定", row.last_error?.slice(0, 180) ?? "禁止自动创建第二条消息，需要人工核查", "task", row.task_id));
