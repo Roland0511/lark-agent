@@ -123,6 +123,9 @@ export class LarkProfileStore {
 export async function bootstrapLegacyBot(db: Kysely<Database>, config: ControlPlaneConfig): Promise<BotRow> {
   const existing = await db.selectFrom("bots").selectAll().where("app_id", "!=", "__legacy__").where("deleted_at", "is", null).executeTakeFirst();
   if (existing) return existing;
+  if (!config.botAppId || !config.ownerOpenId) {
+    throw new AppError("空数据库首次启动需要配置 BOT_APP_ID 和 OWNER_OPEN_ID", 500, "bot_bootstrap_config_missing");
+  }
   const legacy = await db.updateTable("bots").set({
     app_id: config.botAppId,
     bot_open_id: config.botAppId,

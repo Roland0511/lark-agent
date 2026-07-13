@@ -21,8 +21,9 @@ services:
       PORT: 3000
       DATABASE_URL: postgresql://lark_agent:${POSTGRES_PASSWORD}@postgres:5432/lark_agent
       SESSION_SIGNING_SECRET: ${SESSION_SIGNING_SECRET}
-      OWNER_OPEN_ID: ${OWNER_OPEN_ID}
-      BOT_APP_ID: ${BOT_APP_ID}
+      # 仅空数据库首次引导需要；已有机器人配置时可留空。
+      OWNER_OPEN_ID: ${OWNER_OPEN_ID:-}
+      BOT_APP_ID: ${BOT_APP_ID:-}
       AGENT_DISPLAY_NAME: ${AGENT_DISPLAY_NAME:-Lark Agent}
       ADMIN_ORIGIN: ${ADMIN_ORIGIN:-https://${AGENT_DOMAIN}}
       ADMIN_SESSION_HOURS: ${ADMIN_SESSION_HOURS:-12}

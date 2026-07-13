@@ -67,7 +67,9 @@ docker compose --profile proxy up -d
 pnpm init:lark-volume
 ```
 
-该脚本只在初始化阶段读取 `.env` 中的 `BOT_APP_SECRET`。长期运行的 `control` 容器不接收 App Secret。
+该脚本只在初始化阶段读取 `.env` 中的 `BOT_APP_SECRET`。导入成功后可从私有 `.env` 删除
+`OWNER_OPEN_ID`、`BOT_APP_ID`、`BOT_APP_SECRET` 和 `WHITELIST_CHAT_IDS`；机器人、主人及群绑定
+以后以 PostgreSQL 和 lark-cli profile 为准，长期运行的 `control` 容器不接收 App Secret。
 
 ## 飞书配置
 
@@ -80,7 +82,7 @@ pnpm init:lark-volume
 /连接控制台
 ```
 
-`/连接控制台` 会返回一条两分钟有效、只能使用一次的身份确认链接。后台只接受 `OWNER_OPEN_ID` 对应的飞书身份。
+`/连接控制台` 会返回一条两分钟有效、只能使用一次的身份确认链接。后台只接受已在机器人配置中绑定为主人的飞书身份；`OWNER_OPEN_ID` 只用于空数据库首次引导。
 
 ## 添加和绑定机器人
 
@@ -130,7 +132,7 @@ RUNNER_ARTIFACT_RSYNC_TARGET
 RUNNER_ARTIFACT_RSYNC_PASSWORD_FILE
 ```
 
-密码文件必须为 `600`，不得提交到 Git。先做本地构建：
+密码文件必须为 `600`，不得提交到 Git；建议放在仓库已忽略的 `.private/rsync.pass`。先做本地构建：
 
 ```bash
 pnpm publish:runner --dry-run

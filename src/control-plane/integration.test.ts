@@ -18,6 +18,7 @@ import { DraftService } from "./drafts.js";
 import { TaskOutputService } from "./task-output.js";
 import { AppError } from "../shared/errors.js";
 import { registerBotAdminRoutes } from "./bot-admin-routes.js";
+import { bootstrapLegacyBot } from "./bot-runtime.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -130,6 +131,13 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const admin = await app.inject({ method: "GET", url: "/admin" });
     expect(admin.statusCode).toBe(302);
     expect(admin.headers.location).toBe("/admin/");
+  });
+
+  it("does not require bootstrap identity after a bot has been imported", async () => {
+    const withoutBootstrap = { ...config, ownerOpenId: "", botAppId: "", whitelistChatIds: new Set<string>() };
+    await expect(bootstrapLegacyBot(db, withoutBootstrap)).resolves.toMatchObject({ app_id: "cli_bot", owner_open_id: "ou_owner" });
+    await db.updateTable("bots").set({ app_id: "__legacy__", owner_open_id: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await expect(bootstrapLegacyBot(db, withoutBootstrap)).rejects.toThrow("空数据库首次启动需要配置 BOT_APP_ID 和 OWNER_OPEN_ID");
   });
 
   it("reconnects one enabled bot without changing its configuration", async () => {
