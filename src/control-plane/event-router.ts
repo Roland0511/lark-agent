@@ -1,7 +1,6 @@
 import { sql, type Kysely } from "kysely";
 import type { Database } from "../db/types.js";
 import type { LarkCardActionEvent, LarkMessageEvent } from "../shared/contracts.js";
-import { authorizationFromMessage } from "./policy.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { LarkGateway } from "../lark/gateway.js";
 import { sha256 } from "../shared/crypto.js";
@@ -9,8 +8,8 @@ import { randomToken } from "../shared/crypto.js";
 import { AppError } from "../shared/errors.js";
 import type { ControlPlaneRepository } from "./repository.js";
 import { legacyBotId, type BotRow } from "./bot-types.js";
+import { MessageRouter } from "./message-router.js";
 
-const activeTaskStates = ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"] as const;
 const helpCommands = new Set(["/help", "/帮助"]);
 
 export class EventRouter {
@@ -26,25 +25,21 @@ export class EventRouter {
       default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true,
       config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null,
       created_at: new Date(), updated_at: new Date()
-    }
+    },
+    private readonly messageRouter = new MessageRouter(db)
   ) {}
 
   async handleMessage(event: LarkMessageEvent): Promise<void> {
-    const receivedAt = new Date();
     const duplicate = await this.db.selectFrom("processed_events").select("event_id").where("bot_id", "=", this.bot.id).where("event_id", "=", event.event_id).executeTakeFirst();
     if (duplicate) return;
-    if (event.chat_type === "group") {
-      const binding = await this.db.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", this.bot.id).where("chat_id", "=", event.chat_id).where("enabled", "=", true).executeTakeFirst();
-      if (!binding) return;
-    }
 
     const registeredBots = await this.db
       .selectFrom("bots")
-      .select(["id", "app_id", "bot_open_id", "display_name", "owner_open_id"])
+      .selectAll()
       .where("deleted_at", "is", null)
       .execute();
-    const knownBotSender = registeredBots.some((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id);
-    if (knownBotSender) {
+    const senderBot = registeredBots.find((item) => item.app_id === event.sender_id || item.bot_open_id === event.sender_id) ?? null;
+    if (senderBot?.id === this.bot.id) {
       await this.markDiscarded(event.event_id, event.type);
       return;
     }
@@ -52,7 +47,7 @@ export class EventRouter {
     const displayNameCounts = new Map<string, number>();
     for (const item of registeredBots) displayNameCounts.set(item.display_name, (displayNameCounts.get(item.display_name) ?? 0) + 1);
     const fastMentionedBotIds = new Set(
-      event.chat_type === "group" && event.sender_id === this.bot.owner_open_id
+      event.chat_type === "group" && (event.sender_id === this.bot.owner_open_id || Boolean(senderBot))
         ? registeredBots
             .filter((item) => displayNameCounts.get(item.display_name) === 1 && event.content.includes(`@${item.display_name}`))
             .map((item) => item.id)
@@ -60,7 +55,7 @@ export class EventRouter {
     );
     const canUseOwnerMentionFastPath = fastMentionedBotIds.size > 0;
     const details = canUseOwnerMentionFastPath ? null : await this.lark.getMessage(event.message_id);
-    if (details?.senderType === "app") {
+    if (details?.senderType === "app" && !senderBot) {
       await this.markDiscarded(event.event_id, event.type);
       return;
     }
@@ -88,159 +83,39 @@ export class EventRouter {
       : mentionIds.has(this.bot.app_id) || Boolean(this.bot.bot_open_id && mentionIds.has(this.bot.bot_open_id));
     if (event.chat_type === "group" && hasRegisteredBotMention && !mentionsThisBot) return;
     const explicitlyActivated = event.chat_type === "p2p" || mentionsThisBot;
-
-    let createdTaskId: string | null = null;
-    await this.db.transaction().execute(async (trx) => {
-      if (event.chat_type === "group") {
-        await sql`select pg_advisory_xact_lock(hashtext(${`${this.bot.id}:${event.chat_id}`}))`.execute(trx);
-      }
-      let conversation = event.chat_type === "group"
-        ? await trx
-            .selectFrom("conversations")
-            .selectAll()
-            .where("bot_id", "=", this.bot.id)
-            .where("chat_id", "=", event.chat_id)
-            .where("chat_type", "=", "group")
-            .where("active", "=", true)
-            .orderBy("created_at", "desc")
-            .forUpdate()
-            .executeTakeFirst()
-        : await trx
-            .selectFrom("conversations")
-            .selectAll()
-            .where("bot_id", "=", this.bot.id)
-            .where("chat_id", "=", event.chat_id)
-            .where("root_message_id", "=", rootMessageId)
-            .forUpdate()
-            .executeTakeFirst();
-      if (conversation?.followup_expires_at && new Date(conversation.followup_expires_at).getTime() <= Date.now()) {
-        const activeTask = await trx.selectFrom("tasks").select("id").where("conversation_id", "=", conversation.id).where("state", "in", [...activeTaskStates]).executeTakeFirst();
-        if (!activeTask) {
-          await trx.updateTable("conversations").set({ active: false, followup_expires_at: null, updated_at: new Date() }).where("id", "=", conversation.id).execute();
-          conversation = undefined;
-        }
-      }
-      if (!conversation && !explicitlyActivated) return;
-      const marker = await trx.insertInto("processed_events").values({ bot_id: this.bot.id, event_id: event.event_id, event_type: event.type, status: "processed", processed_at: new Date() }).onConflict((conflict) => conflict.columns(["bot_id", "event_id"]).doNothing()).returning("event_id").executeTakeFirst();
-      if (!marker) return;
-      if (!conversation) {
-        conversation = await trx
-          .insertInto("conversations")
-          .values({
-            bot_id: this.bot.id,
-            bot_config_revision: this.bot.config_revision,
-            role_instructions_snapshot: this.bot.role_instructions,
-            attention_model_snapshot: this.bot.attention_model,
-            attention_reasoning_effort_snapshot: this.bot.attention_reasoning_effort,
-            execution_model_snapshot: this.bot.execution_model,
-            execution_reasoning_effort_snapshot: this.bot.execution_reasoning_effort,
-            chat_id: event.chat_id,
-            chat_type: event.chat_type,
-            root_message_id: rootMessageId,
-            thread_id: null,
-            room_seq: 0,
-            active: true,
-            response_message_id: null,
-            followup_expires_at: null,
-            updated_at: new Date()
-          })
-          .returningAll()
-          .executeTakeFirstOrThrow();
-      }
-      let task = await trx
-        .selectFrom("tasks")
-        .selectAll()
-        .where("conversation_id", "=", conversation.id)
-        .where("state", "in", [...activeTaskStates])
-        .orderBy("created_at", "desc")
-        .executeTakeFirst();
-      if (!task) {
-        const policy = await trx.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", this.bot.id).where("chat_id", "=", event.chat_id).executeTakeFirst();
-        const owner = event.sender_id === this.bot.owner_open_id;
-        const previous = await trx.selectFrom("tasks").selectAll().where("conversation_id", "=", conversation.id).orderBy("turn_index", "desc").executeTakeFirst();
-        if (previous && !conversation.active) return;
-        const requestedWorkspaceAlias = previous?.requested_workspace_alias ?? policy?.workspace_alias ?? this.bot.default_workspace_alias;
-        let preferredExecutorId = previous?.executor_id ?? previous?.preferred_executor_id ?? policy?.preferred_executor_id ?? this.bot.default_executor_id;
-        let routeAmbiguous = false;
-        if (!preferredExecutorId) {
-          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases"]).where("deleted_at", "is", null).where("operational_mode", "=", "enabled").execute();
-          const eligible = workers.filter((worker) => {
-            const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
-            return requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1;
-          });
-          if (eligible.length === 1) preferredExecutorId = eligible[0]!.executor_id;
-          else if (eligible.length > 1) routeAmbiguous = true;
-        }
-        task = await trx
-          .insertInto("tasks")
-          .values({
-            bot_id: this.bot.id,
-            conversation_id: conversation.id,
-            state: routeAmbiguous ? "waiting_input" : previous ? "waiting_worker" : "queued",
-            turn_index: (previous?.turn_index ?? 0) + 1,
-            trigger_message_id: event.message_id,
-            conversation_disposition: null,
-            disposition_reason: null,
-            requester_id: event.sender_id,
-            requester_role: owner ? "owner" : "member",
-            authorization_grant: JSON.stringify(authorizationFromMessage(event.content, owner)),
-            requested_workspace_alias: requestedWorkspaceAlias,
-            resolved_workspace_alias: previous?.resolved_workspace_alias ?? null,
-            preferred_executor_id: preferredExecutorId,
-            executor_id: previous?.executor_id ?? null,
-            codex_thread_id: previous?.codex_thread_id ?? null,
-            executor_home_ref: previous?.executor_home_ref ?? null,
-            executor_profile: previous?.executor_profile ?? null,
-            executor_config_fingerprint: previous?.executor_config_fingerprint ?? null,
-            codex_version: previous?.codex_version ?? null,
-            lease_token_hash: null,
-            lease_expires_at: null,
-            summary: routeAmbiguous ? "存在多个可用执行器，请先为机器人或群绑定默认执行器" : null,
-            completed_at: null,
-            updated_at: new Date()
-          })
-          .returningAll()
-          .executeTakeFirstOrThrow();
-        createdTaskId = task.id;
-        await trx.insertInto("task_events").values({
-          task_id: task.id,
-          event_type: "task.created",
-          summary: routeAmbiguous ? "任务已创建，但执行器路由不明确" : "任务已创建",
-          payload: JSON.stringify({ preferredExecutorId, requestedWorkspaceAlias, routeAmbiguous })
-        }).execute();
-      }
-      const nextSeq = conversation.room_seq + 1;
-      await trx.updateTable("conversations").set({ room_seq: nextSeq, active: true, thread_id: null, updated_at: new Date() }).where("id", "=", conversation.id).execute();
-      await trx
-        .insertInto("signals")
-        .values({
-          bot_id: this.bot.id,
-          conversation_id: conversation.id,
-          task_id: task.id,
-          event_id: event.event_id,
-          seq: nextSeq,
-          message_id: event.message_id,
-          sender_id: event.sender_id,
-          sender_role: event.sender_id === this.bot.owner_open_id ? "owner" : "member",
-          message_type: event.message_type,
-          content: event.content,
-          preview: event.content.slice(0, 500),
-          priority: explicitlyActivated ? 90 : 50,
-          decision: "pending",
-          decision_rationale: null,
-          decided_at: null
-        })
-        .execute();
-      await trx.insertInto("task_events").values({
-        task_id: task.id,
-        event_type: "event.received",
-        summary: "飞书事件已进入任务收件箱",
-        payload: JSON.stringify({ eventId: event.event_id, messageId: event.message_id, seq: nextSeq }),
-        created_at: receivedAt
-      }).execute();
+    const sourceContext = senderBot ? await this.botMessageContext(senderBot.id, event.message_id) : null;
+    await this.messageRouter.route(this.bot, {
+      eventId: event.event_id,
+      eventType: event.type,
+      messageId: event.message_id,
+      chatId: event.chat_id,
+      chatType: event.chat_type,
+      rootMessageId,
+      senderId: event.sender_id,
+      senderRole: senderBot ? "member" : event.sender_id === this.bot.owner_open_id ? "owner" : "member",
+      senderType: senderBot ? "bot" : "user",
+      senderBotId: senderBot?.id ?? null,
+      senderDisplayName: senderBot?.display_name ?? null,
+      ingressSource: "lark",
+      originMessageId: sourceContext?.originMessageId ?? event.message_id,
+      botDialogueDepth: sourceContext?.botDialogueDepth ?? (senderBot ? 1 : 0),
+      messageType: event.message_type,
+      content: event.content,
+      explicitlyActivated,
+      receivedAt: new Date()
     });
+  }
 
-    void createdTaskId;
+  private async botMessageContext(senderBotId: string, messageId: string): Promise<{ originMessageId: string; botDialogueDepth: number } | null> {
+    const output = await this.db.selectFrom("task_outputs").innerJoin("tasks", "tasks.id", "task_outputs.task_id")
+      .select(["tasks.id"]).where("tasks.bot_id", "=", senderBotId).where("task_outputs.message_id", "=", messageId).executeTakeFirst();
+    if (!output) return null;
+    const signals = await this.db.selectFrom("signals").select(["origin_message_id", "bot_dialogue_depth", "sender_type", "created_at"])
+      .where("task_id", "=", output.id).orderBy("seq").execute();
+    const latestUser = signals.filter((signal) => signal.sender_type === "user").at(-1);
+    if (latestUser) return { originMessageId: latestUser.origin_message_id, botDialogueDepth: 1 };
+    const deepest = signals.toSorted((a, b) => b.bot_dialogue_depth - a.bot_dialogue_depth)[0];
+    return deepest ? { originMessageId: deepest.origin_message_id, botDialogueDepth: deepest.bot_dialogue_depth + 1 } : null;
   }
 
   async handleCardAction(event: LarkCardActionEvent): Promise<void> {

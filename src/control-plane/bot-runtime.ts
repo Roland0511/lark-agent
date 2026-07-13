@@ -14,6 +14,7 @@ import type { ControlPlaneRepository } from "./repository.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { AdminEventBus } from "./admin-events.js";
 import { legacyBotId, type BotRow } from "./bot-types.js";
+import { MessageRouter } from "./message-router.js";
 
 const messageEventSchema = z.object({
   type: z.literal("im.message.receive_v1"), event_id: z.string(), timestamp: z.string(), message_id: z.string(), chat_id: z.string(),
@@ -158,7 +159,8 @@ export class BotRuntimeManager {
     private readonly gateways: BotGatewayRegistry,
     private readonly runtime: RuntimeStatus,
     private readonly events: AdminEventBus,
-    private readonly log: { info(value: unknown, message: string): void; error(value: unknown, message: string): void }
+    private readonly log: { info(value: unknown, message: string): void; error(value: unknown, message: string): void },
+    private readonly messageRouter = new MessageRouter(db)
   ) {}
 
   async startAll(): Promise<void> {
@@ -190,7 +192,7 @@ export class BotRuntimeManager {
   private async start(bot: BotRow): Promise<void> {
     if (this.active.has(bot.id) || !this.config.larkEnabled) return;
     const gateway = await this.gateways.gateway(bot.id);
-    const router = new EventRouter(this.db, this.config, gateway, this.repository, bot);
+    const router = new EventRouter(this.db, this.config, gateway, this.repository, bot, this.messageRouter);
     const consumers: NdjsonConsumer[] = [];
     const messageKey = `${bot.id}:message`;
     this.runtime.configure(messageKey, true, false);

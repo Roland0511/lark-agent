@@ -106,16 +106,28 @@ function Shell({ user, queryClient }: { user: AdminUser; queryClient: QueryClien
 function Bots({ user }: { user: AdminUser }) {
   const bots = useQuery({ queryKey: ["bot"], queryFn: () => api<AnyRecord>("/v1/admin/bots"), refetchInterval: 30_000 });
   const workers = useQuery({ queryKey: ["worker"], queryFn: () => api<AnyRecord>("/v1/admin/workers") });
+  const dialogue = useQuery({ queryKey: ["settings", "bot-dialogue"], queryFn: () => api<AnyRecord>("/v1/admin/settings/bot-dialogue") });
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<AnyRecord | null>(null);
   const refresh = () => { void bots.refetch(); setAdding(false); setEditing(null); };
   const continueSetup = (bot: AnyRecord) => { void bots.refetch(); setAdding(false); setEditing(bot); };
   return <><PageTitle eyebrow="飞书身份" title="机器人与角色" description="每个机器人拥有独立的飞书凭据、群绑定、角色要求和执行路由。" action={<button className="primary-button" onClick={() => setAdding(true)}><Plus size={17} />添加机器人</button>} />
     <div className="bot-routing-note"><GitBranch size={18} /><div><strong>群聊路由规则</strong><span>明确 @ 时只交给被提及机器人；普通续聊会进入该群所有活跃机器人的收件箱，由各 Agent 独立判断。</span></div></div>
+    <BotDialogueSettings user={user} value={dialogue.data} loading={dialogue.isLoading} onSaved={() => void dialogue.refetch()} />
     <div className="card-grid">{bots.data?.items?.map((bot: AnyRecord) => <BotCard key={bot.id} bot={bot} user={user} onEdit={() => setEditing(bot)} onRefreshed={() => void bots.refetch()} />) ?? <PageLoading />}</div>
     {adding && <AddBotDialog user={user} workers={workers.data?.items ?? []} onClose={() => setAdding(false)} onCreated={continueSetup} />}
     {editing && <BotSettingsDialog user={user} bot={editing} workers={workers.data?.items ?? []} onClose={() => setEditing(null)} onSaved={refresh} />}
   </>;
+}
+
+function BotDialogueSettings({ user, value, loading, onSaved }: { user: AdminUser; value: AnyRecord | undefined; loading: boolean; onSaved(): void }) {
+  const [depth, setDepth] = useState(30);
+  useEffect(() => { if (value?.maxConsecutiveDepth) setDepth(value.maxConsecutiveDepth); }, [value?.maxConsecutiveDepth]);
+  const mutation = useMutation({
+    mutationFn: () => api("/v1/admin/settings/bot-dialogue", { method: "PATCH", body: JSON.stringify({ maxConsecutiveDepth: depth }) }, user),
+    onSuccess: onSaved
+  });
+  return <section className="bot-dialogue-settings"><div><ShieldCheck size={18} /><div><strong>机器人互聊保护</strong><span>只处理当前控制台注册的机器人，并且只传播最终回复；流式进度、审批、故障和保护提示不会进入其他机器人的收件箱。</span></div></div><div className="dialogue-depth-control"><label htmlFor="bot-dialogue-depth">连续因果轮次上限</label><input id="bot-dialogue-depth" type="number" min={1} max={200} value={depth} disabled={loading || mutation.isPending} onChange={(event) => setDepth(Math.max(1, Math.min(200, Number(event.target.value) || 1)))} /><button className="secondary-button" disabled={loading || mutation.isPending || depth === value?.maxConsecutiveDepth} onClick={() => mutation.mutate()}>{mutation.isPending ? "保存中…" : "保存"}</button><small>达到上限后，本轮回复仍会发送，但不再传播；群内只提示一次并等待下一条人类消息自动恢复。</small></div>{mutation.error && <ErrorBox error={mutation.error} />}</section>;
 }
 
 function BotCard({ bot, user, onEdit, onRefreshed }: { bot: AnyRecord; user: AdminUser; onEdit(): void; onRefreshed(): void }) {
@@ -227,7 +239,7 @@ function Flow() {
 
 function FlowRun({ item, onOpen }: { item: AnyRecord; onOpen(): void }) {
   const cells = [
-    { key: "message", title: "消息", state: item.signal ? "received" : "missing", body: item.signal?.content ?? "没有 Signal", meta: item.signal ? `${item.signal.sender_id} · ${item.signal.message_id}` : null },
+    { key: "message", title: "消息", state: item.signal ? "received" : "missing", body: item.signal?.content ?? "没有 Signal", meta: item.signal ? `${signalSenderLabel(item.signal)} · ${item.signal.ingress_source ?? "lark"} · depth ${item.signal.bot_dialogue_depth ?? 0} · origin ${shortId(item.signal.origin_message_id)}` : null },
     { key: "attention", title: "判断", state: item.signal?.decision ?? "pending", body: decisionLabel[item.signal?.decision] ?? "待判断", meta: item.signal?.decision_rationale },
     { key: "codex", title: "执行", state: item.state, body: stateLabel[item.state] ?? item.state, meta: [item.executor_id, workspaceLabel(item), item.executor_profile, item.codex_thread_id && `thread ${shortId(item.codex_thread_id)}`, item.executor_config_fingerprint && `cfg ${shortId(item.executor_config_fingerprint)}`, item.lease_expires_at && `lease ${new Date(item.lease_expires_at).toLocaleTimeString("zh-CN")}`].filter(Boolean).join(" · ") || "尚未绑定" },
     { key: "draft", title: "草稿", state: item.draft?.state ?? "skipped", body: item.draft?.content ?? (item.signal?.decision === "dismiss" ? "静默跳过" : "尚无草稿"), meta: item.draft ? `room ${item.draft.base_room_seq} → ${item.draft.observed_room_seq} · held ${item.draft.hold_count}` : null },
@@ -238,7 +250,7 @@ function FlowRun({ item, onOpen }: { item: AnyRecord; onOpen(): void }) {
 }
 
 function InboxFlow({ items, onTask }: { items: AnyRecord[]; onTask(id: string): void }) {
-  return <article className="panel table-panel"><div className="table-wrap"><table><thead><tr><th>信号</th><th>机器人</th><th>正文</th><th>判断</th><th>优先级</th><th>耗时</th><th>Codex</th><th /></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong className="mono">#{item.seq}</strong><small>{item.chat_type === "group" ? "群聊" : "私聊"} · 回合 {item.turn_index}</small><small className="mono">{shortId(item.message_id)}</small></td><td>{item.bot_display_name}</td><td><pre className="message-content">{item.content}</pre></td><td><StateBadge state={item.decision} /><small>{item.decision_rationale ?? "尚未判断"}</small></td><td>{item.priority}</td><td>{item.decisionSeconds == null ? "等待中" : formatDuration(item.decisionSeconds)}</td><td>{item.enteredCodex ? shortId(item.codex_thread_id) : "未进入"}</td><td><button className="icon-button" aria-label="查看任务" onClick={() => onTask(item.task_id)}><ChevronRight size={17} /></button></td></tr>)}</tbody></table></div></article>;
+  return <article className="panel table-panel"><div className="table-wrap"><table><thead><tr><th>信号</th><th>接收机器人</th><th>发送者</th><th>正文</th><th>判断</th><th>因果链</th><th>耗时</th><th>Codex</th><th /></tr></thead><tbody>{items.map((item) => <tr key={item.id}><td><strong className="mono">#{item.seq}</strong><small>{item.chat_type === "group" ? "群聊" : "私聊"} · 回合 {item.turn_index}</small><small className="mono">{shortId(item.message_id)}</small></td><td>{item.bot_display_name}</td><td>{signalSenderLabel(item)}<small>{item.ingress_source === "internal" ? "控制面投递" : item.ingress_source === "history" ? "历史补偿" : "飞书事件"}</small></td><td><pre className="message-content">{item.content}</pre></td><td><StateBadge state={item.decision} /><small>{item.decision_rationale ?? "尚未判断"}</small></td><td>深度 {item.bot_dialogue_depth ?? 0}<small className="mono">origin {shortId(item.origin_message_id)}</small></td><td>{item.decisionSeconds == null ? "等待中" : formatDuration(item.decisionSeconds)}</td><td>{item.enteredCodex ? shortId(item.codex_thread_id) : "未进入"}</td><td><button className="icon-button" aria-label="查看任务" onClick={() => onTask(item.task_id)}><ChevronRight size={17} /></button></td></tr>)}</tbody></table></div></article>;
 }
 
 function OutboxFlow({ items, onTask, onPending }: { items: AnyRecord[]; onTask(id: string): void; onPending(): void }) {
@@ -349,13 +361,14 @@ function SummaryStat({ label, value }: { label: string; value: string }) { retur
 function MiniBars({ values }: { values: number[] }) { const list = values.length ? values : Array(24).fill(0); const max = Math.max(...list, 1); return <div className="mini-bars" aria-label="过去24小时任务量">{list.map((v, i) => <span key={i} style={{ height: `${Math.max(5, v / max * 100)}%` }} title={`${v} 个任务`} />)}</div>; }
 function Fact({ label, value }: { label: string; value: string }) { return <div><span>{label}</span><strong>{value}</strong></div>; }
 function Detail({ label, value }: { label: string; value?: string | null }) { return <div><dt>{label}</dt><dd title={value ?? ""}>{value ?? "—"}</dd></div>; }
-function TimelineItem({ item }: { item: AnyRecord }) { const title = item.type === "signal" ? `收到${item.sender_role === "owner" ? "主人" : "成员"}信号` : item.type === "event" ? item.event_type : item.type === "draft" ? `草稿 · ${item.state}` : item.type === "approval" ? `审批 · ${item.method}` : item.type === "outbox" ? `发件箱 · ${item.state}` : item.type === "output" ? `单消息回复 · ${item.state}` : item.type === "output_update" ? `回复更新 · ${item.operation}` : `动作 · ${item.action_type}`; return <div className={`timeline-item type-${item.type}`}><div className="timeline-dot" /><div><div><strong>{title}</strong><time>{relativeTime(item.created_at)}</time></div><p>{item.summary ?? (item.decision ? `注意力判断：${item.decision}` : item.last_error ?? `状态：${item.state ?? "已记录"}`)}</p></div></div>; }
+function TimelineItem({ item }: { item: AnyRecord }) { const title = item.type === "signal" ? `收到${signalSenderLabel(item)}信号` : item.type === "event" ? item.event_type : item.type === "draft" ? `草稿 · ${item.state}` : item.type === "approval" ? `审批 · ${item.method}` : item.type === "outbox" ? `发件箱 · ${item.state}` : item.type === "output" ? `单消息回复 · ${item.state}` : item.type === "output_update" ? `回复更新 · ${item.operation}` : `动作 · ${item.action_type}`; return <div className={`timeline-item type-${item.type}`}><div className="timeline-dot" /><div><div><strong>{title}</strong><time>{relativeTime(item.created_at)}</time></div><p>{item.summary ?? (item.decision ? `注意力判断：${item.decision} · ${item.ingress_source ?? "lark"} · depth ${item.bot_dialogue_depth ?? 0}` : item.last_error ?? `状态：${item.state ?? "已记录"}`)}</p></div></div>; }
 function TimelineGroups({ items }: { items: AnyRecord[] }) { const groups = [["收件", items.filter((item) => item.type === "signal")], ["执行", items.filter((item) => item.type === "event" && !String(item.event_type).startsWith("conversation."))], ["草稿", items.filter((item) => ["draft", "approval"].includes(item.type))], ["发送", items.filter((item) => ["output", "output_update", "outbox", "action"].includes(item.type))], ["生命周期", items.filter((item) => item.type === "event" && String(item.event_type).startsWith("conversation."))]] as const; return <div className="timeline-groups">{groups.filter(([, entries]) => entries.length).map(([title, entries]) => <section key={title}><h3>{title}<span>{entries.length}</span></h3><div className="timeline">{entries.map((item) => <TimelineItem key={`${item.type}-${item.id}`} item={item} />)}</div></section>)}</div>; }
 function Empty({ icon, title, text }: { icon: ReactNode; title: string; text: string }) { return <div className="empty"><div>{icon}</div><strong>{title}</strong><p>{text}</p></div>; }
 function Modal({ title, onClose, children }: { title: string; onClose(): void; children: ReactNode }) { return <div className="modal-backdrop" onClick={onClose}><div className="modal" role="dialog" aria-modal="true" aria-label={title} onClick={(e) => e.stopPropagation()}><div className="modal-head"><h2>{title}</h2><button className="icon-button" onClick={onClose}><X /></button></div>{children}</div></div>; }
 function ErrorBox({ error }: { error: unknown }) { return <div className="inline-alert"><AlertTriangle size={17} />{error instanceof Error ? error.message : "操作失败"}</div>; }
 function formatDuration(seconds: number) { return seconds < 60 ? `${Math.round(seconds)} 秒` : seconds < 3600 ? `${Math.round(seconds / 60)} 分钟` : `${(seconds / 3600).toFixed(1)} 小时`; }
 function formatDurationPrecise(seconds: number) { return seconds < 1 ? `${Math.round(seconds * 1000)} 毫秒` : seconds < 60 ? `${seconds.toFixed(seconds < 10 ? 1 : 0)} 秒` : formatDuration(seconds); }
+function signalSenderLabel(signal: AnyRecord) { return signal.sender_type === "bot" ? `机器人 ${signal.sender_display_name ?? shortId(signal.sender_bot_id) ?? "未知"}` : signal.sender_role === "owner" ? "主人" : "成员"; }
 function workspaceLabel(task: AnyRecord) {
   const suffix = task.bot_app_id ? `/${task.bot_app_id}` : "";
   if (task.resolved_workspace_alias) return task.requested_workspace_alias ? `${task.resolved_workspace_alias}${suffix}` : `${task.resolved_workspace_alias}${suffix}（自动选择）`;

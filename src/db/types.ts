@@ -76,6 +76,12 @@ export interface SignalsTable {
   message_id: string;
   sender_id: string;
   sender_role: "owner" | "member";
+  sender_type: Generated<"user" | "bot">;
+  sender_bot_id: string | null;
+  sender_display_name: string | null;
+  ingress_source: Generated<"lark" | "internal" | "history">;
+  origin_message_id: string;
+  bot_dialogue_depth: Generated<number>;
   message_type: string;
   content: string;
   preview: string;
@@ -84,6 +90,21 @@ export interface SignalsTable {
   decision_rationale: string | null;
   created_at: Timestamp;
   decided_at: NullableTimestamp;
+}
+
+export interface BotDialogueSettingsTable {
+  id: Generated<number>;
+  max_consecutive_depth: Generated<number>;
+  updated_at: Timestamp;
+}
+
+export interface BotDialogueGuardsTable {
+  chat_id: string;
+  origin_message_id: string;
+  source_task_id: string;
+  reached_depth: number;
+  notification_outbox_id: string | null;
+  created_at: Timestamp;
 }
 
 export interface WorkersTable {
@@ -333,6 +354,8 @@ export interface Database {
   conversations: ConversationsTable;
   tasks: TasksTable;
   signals: SignalsTable;
+  bot_dialogue_settings: BotDialogueSettingsTable;
+  bot_dialogue_guards: BotDialogueGuardsTable;
   workers: WorkersTable;
   worker_enrollment_tokens: WorkerEnrollmentTokensTable;
   worker_device_credentials: WorkerDeviceCredentialsTable;

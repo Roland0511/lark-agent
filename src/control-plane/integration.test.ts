@@ -18,7 +18,9 @@ import { DraftService } from "./drafts.js";
 import { TaskOutputService } from "./task-output.js";
 import { AppError } from "../shared/errors.js";
 import { registerBotAdminRoutes } from "./bot-admin-routes.js";
-import { bootstrapLegacyBot } from "./bot-runtime.js";
+import { bootstrapLegacyBot, BotGatewayRegistry } from "./bot-runtime.js";
+import { MessageRouter } from "./message-router.js";
+import { BotMessageFanoutService } from "./bot-message-fanout.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -78,6 +80,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const workerSoftDeleteSql = await readFile(fileURLToPath(new URL("../db/migrations/010_worker_soft_delete.sql", import.meta.url)), "utf8");
     const multiBotSql = await readFile(fileURLToPath(new URL("../db/migrations/011_multi_bot.sql", import.meta.url)), "utf8");
     const latencyAndModelPolicySql = await readFile(fileURLToPath(new URL("../db/migrations/012_latency_and_model_policy.sql", import.meta.url)), "utf8");
+    const botDialogueSql = await readFile(fileURLToPath(new URL("../db/migrations/013_bot_dialogue.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -94,6 +97,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (multiBotApplied.rowCount === 0) await client.query(multiBotSql);
     const latencyPolicyApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'conversations' AND column_name = 'attention_model_snapshot'");
     if (latencyPolicyApplied.rowCount === 0) await client.query(latencyAndModelPolicySql);
+    const botDialogueApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'signals' AND column_name = 'sender_type'");
+    if (botDialogueApplied.rowCount === 0) await client.query(botDialogueSql);
     await client.end();
   });
 
@@ -102,6 +107,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("admin_sessions").execute();
     await db.deleteFrom("admin_login_tokens").execute();
     await db.deleteFrom("incidents").execute();
+    await db.deleteFrom("bot_dialogue_guards").execute();
     await db.deleteFrom("task_output_updates").execute();
     await db.deleteFrom("task_outputs").execute();
     await db.deleteFrom("outbox_messages").execute();
@@ -118,6 +124,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("worker_enrollment_tokens").execute();
     await db.deleteFrom("workers").execute();
     await db.deleteFrom("bots").where("id", "!=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 30, updated_at: new Date() }).where("id", "=", 1).execute();
     await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, credential_state: "verified", deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     await db.insertInto("bot_chat_bindings").values({ bot_id: "00000000-0000-0000-0000-000000000001", chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
   });
@@ -344,6 +351,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       event_id: "ev_1",
       seq: 2,
       message_id: "om_root",
+      origin_message_id: "om_root",
       sender_id: "ou_owner",
       sender_role: "owner",
       message_type: "text",
@@ -742,7 +750,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     }).returningAll().executeTakeFirstOrThrow();
     await db.insertInto("processed_events").values({ event_id: "ev_late", event_type: "message", status: "processed", processed_at: new Date() }).execute();
     await db.insertInto("signals").values({
-      conversation_id: conversation.id, task_id: task.id, event_id: "ev_late", seq: 2, message_id: "om_late",
+      conversation_id: conversation.id, task_id: task.id, event_id: "ev_late", seq: 2, message_id: "om_late", origin_message_id: "om_late",
       sender_id: "ou_member", sender_role: "member", message_type: "text", content: "late", preview: "late",
       priority: 50, decision: "pending", decision_rationale: null, decided_at: null
     }).execute();
@@ -830,7 +838,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     }).returningAll().executeTakeFirstOrThrow();
     await db.insertInto("processed_events").values({ event_id: "ev_root", event_type: "message", status: "processed", processed_at: new Date() }).execute();
     await db.insertInto("signals").values({
-      conversation_id: conversation.id, task_id: task.id, event_id: "ev_root", seq: 1, message_id: "om_root",
+      conversation_id: conversation.id, task_id: task.id, event_id: "ev_root", seq: 1, message_id: "om_root", origin_message_id: "om_root",
       sender_id: "ou_owner", sender_role: "owner", message_type: "text", content: "start", preview: "start",
       priority: 90, decision: "consume", decision_rationale: null, decided_at: new Date()
     }).execute();
@@ -921,7 +929,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     }).returningAll().executeTakeFirstOrThrow();
     await db.insertInto("processed_events").values({ event_id: "ev_flow", event_type: "im.message.receive_v1", status: "processed", received_at: now, processed_at: now }).execute();
     await db.insertInto("signals").values({
-      conversation_id: conversation.id, task_id: task.id, event_id: "ev_flow", seq: 1, message_id: "om_flow", sender_id: "ou_owner", sender_role: "owner",
+      conversation_id: conversation.id, task_id: task.id, event_id: "ev_flow", seq: 1, message_id: "om_flow", origin_message_id: "om_flow", sender_id: "ou_owner", sender_role: "owner",
       message_type: "text", content: "请检查完整链路", preview: "请检查完整链路", priority: 90, decision: "consume", decision_rationale: "主人明确请求", decided_at: now
     }).execute();
     const draft = await db.insertInto("drafts").values({
@@ -1060,6 +1068,55 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("processed_events").selectAll().where("bot_id", "=", second.id).where("event_id", "=", "ev_first_only").execute()).toHaveLength(0);
   });
 
+  it("treats registered bot final replies as member signals, deduplicates them, and enforces the causal depth guard", async () => {
+    const second = await db.insertInto("bots").values({
+      app_id: "cli_bot_two", profile_name: "bot-two", bot_open_id: "cli_bot_two", display_name: "第二机器人",
+      role_instructions: "以第二角色回答", owner_open_id: "ou_owner", default_executor_id: null, default_workspace_alias: null,
+      enabled: true, is_system: false, config_revision: 1, credential_state: "verified", credential_error: null, deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    await db.insertInto("bot_chat_bindings").values({ bot_id: second.id, chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
+    const first = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const details: LarkMessageDetails = {
+      messageId: "om_human_origin", rootId: null, parentId: null, threadId: null, chatId: "oc_test", senderId: "ou_owner", senderType: "user",
+      messageType: "text", content: "@Lark Agent @第二机器人 开始", createTime: "1",
+      mentions: [{ id: first.app_id, idType: "app_id", name: first.display_name }, { id: second.app_id, idType: "app_id", name: second.display_name }]
+    };
+    const fakeLark = { getMessage: async () => details } as unknown as LarkGateway;
+    const humanEvent: LarkMessageEvent = {
+      type: "im.message.receive_v1", event_id: "ev_human_origin", timestamp: "1", message_id: details.messageId, chat_id: details.chatId,
+      chat_type: "group", sender_id: details.senderId, message_type: "text", content: details.content, create_time: "1"
+    };
+    await Promise.all([
+      new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60), first).handleMessage(humanEvent),
+      new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60), second).handleMessage(humanEvent)
+    ]);
+    const sourceTask = await db.selectFrom("tasks").selectAll().where("bot_id", "=", first.id).executeTakeFirstOrThrow();
+    const guardMessages: string[] = [];
+    const outbound = { sendMarkdownToChat: async (_chatId: string, content: string) => { guardMessages.push(content); return "om_guard_notice"; } } as unknown as LarkGateway;
+    const fanout = new BotMessageFanoutService(db, new BotGatewayRegistry(db, "lark-cli", outbound), new MessageRouter(db));
+
+    await fanout.publishFinal(sourceTask.id, "om_bot_reply_1", "第一机器人的最终回复", 1, "interactive");
+    await fanout.publishFinal(sourceTask.id, "om_bot_reply_1", "第一机器人的最终回复", 1, "interactive");
+    const botSignal = await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").executeTakeFirstOrThrow();
+    expect(botSignal).toMatchObject({ sender_type: "bot", sender_bot_id: first.id, sender_display_name: first.display_name, sender_role: "member", ingress_source: "internal", origin_message_id: "om_human_origin", bot_dialogue_depth: 1 });
+    expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", first.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(0);
+    expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(1);
+
+    const secondConversation = await db.selectFrom("conversations").select("id").where("bot_id", "=", second.id).executeTakeFirstOrThrow();
+    await db.updateTable("tasks").set({ state: "completed", completed_at: new Date(), updated_at: new Date() }).where("conversation_id", "=", secondConversation.id).execute();
+    await db.updateTable("conversations").set({ active: false, followup_expires_at: null, updated_at: new Date() }).where("id", "=", secondConversation.id).execute();
+    await fanout.publishFinal(sourceTask.id, "om_bot_reply_2", "@第二机器人 请继续", 1, "interactive");
+    expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_2").execute()).toHaveLength(1);
+    expect(await db.selectFrom("conversations").selectAll().where("bot_id", "=", second.id).where("active", "=", true).execute()).toHaveLength(1);
+
+    await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 1, updated_at: new Date() }).where("id", "=", 1).execute();
+    await fanout.publishFinal(sourceTask.id, "om_guarded_1", "达到上限", 1, "interactive");
+    await fanout.publishFinal(sourceTask.id, "om_guarded_2", "不会重复提示", 1, "interactive");
+    expect(guardMessages).toHaveLength(1);
+    expect(await db.selectFrom("bot_dialogue_guards").selectAll().where("chat_id", "=", "oc_test").where("origin_message_id", "=", "om_human_origin").execute()).toHaveLength(1);
+    expect(await db.selectFrom("outbox_messages").selectAll().where("operation_kind", "=", "bot_dialogue_guard").execute()).toHaveLength(1);
+  });
+
   it("protects Prometheus metrics with a dedicated bearer token", async () => {
     expect((await app.inject({ method: "GET", url: "/metrics" })).statusCode).toBe(401);
     const response = await app.inject({ method: "GET", url: "/metrics", headers: { authorization: "Bearer metrics-test-token" } });
@@ -1070,6 +1127,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(response.body).toContain("lark_agent_conversations_awaiting_followup");
     expect(response.body).toContain("lark_agent_followup_expired_total");
     expect(response.body).toContain("lark_agent_conversation_turns_total");
+    expect(response.body).toContain("lark_agent_bot_message_fanout_total");
+    expect(response.body).toContain("lark_agent_bot_dialogue_guard_total");
     expect(response.body).not.toContain("ou_owner");
   });
 

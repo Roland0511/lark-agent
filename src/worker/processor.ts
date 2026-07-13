@@ -99,7 +99,9 @@ export class TaskProcessor {
               attention = await this.codex.attention(
                 workspace.path,
                 [`飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
-                signal.preview,
+                signal.senderType === "bot"
+                  ? `[bot:${signal.senderDisplayName ?? signal.senderId}|member|depth=${signal.botDialogueDepth}] ${signal.preview}`
+                  : `[user:${signal.senderRole}] ${signal.preview}`,
                 { model: task.attentionModel, effort: task.attentionReasoningEffort }
               );
             } finally {
@@ -343,7 +345,9 @@ function buildTaskPrompt(task: ClaimedTask, signals: Signal[], revision: boolean
     revision ? "先前草稿因线程变化被搁置。结合下面新增消息更新结论，必要时保持沉默。" : "在允许范围内完成任务，遇到审批或缺少信息时明确暂停。",
     "commentary 只可描述正在进行的操作、进度或等待原因；不要在 commentary 中提前披露查询结果、结论、秘密、本机路径或尚未通过新鲜度检查的草稿。",
     "飞书信号：",
-    ...signals.map((signal) => `- [${signal.senderRole}] ${signal.content}`),
+    ...signals.map((signal) => signal.senderType === "bot"
+      ? `- [bot:${signal.senderDisplayName ?? signal.senderId}|${signal.senderRole}|depth=${signal.botDialogueDepth}] ${signal.content}`
+      : `- [user:${signal.senderRole}] ${signal.content}`),
     "最终必须按结构化 schema 返回 reply、disposition 和 rationale。reply 是适合直接回复飞书的简洁正文；不要重复 commentary，完整执行日志不要复制到回复中。",
     "若请求已完整完成且不期待对方继续，disposition=complete；若当前回复明确期待下一条输入、接龙、确认或后续步骤，disposition=awaiting_followup。数数到目标值前必须等待，达到目标值时完成。"
   ].join("\n");

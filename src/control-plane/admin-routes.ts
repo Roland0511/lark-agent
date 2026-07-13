@@ -10,6 +10,7 @@ import type { ControlPlaneRepository } from "./repository.js";
 import { AdminEventBus } from "./admin-events.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { BotGatewayRegistry } from "./bot-runtime.js";
+import type { BotMessageFanoutService } from "./bot-message-fanout.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -22,6 +23,7 @@ const workerCommandSchema = z.object({
 
 const decisionSchema = z.object({ approved: z.boolean() });
 const outboxCommandSchema = z.object({ command: z.enum(["retry", "mark_sent", "discard"]) });
+const botDialogueSettingsSchema = z.object({ maxConsecutiveDepth: z.number().int().min(1).max(200) });
 
 function iso(value: Date | string | null): string | null {
   return value ? new Date(value).toISOString() : null;
@@ -53,9 +55,9 @@ export function registerAdminRoutes(
   app: FastifyInstance,
   db: Kysely<Database>,
   config: ControlPlaneConfig,
-  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; gateways: BotGatewayRegistry; events: AdminEventBus; runtime: RuntimeStatus }
+  dependencies: { repository: ControlPlaneRepository; lark: LarkGateway; gateways: BotGatewayRegistry; events: AdminEventBus; runtime: RuntimeStatus; fanout: BotMessageFanoutService }
 ): void {
-  const { repository, gateways, events, runtime } = dependencies;
+  const { repository, gateways, events, runtime, fanout } = dependencies;
   app.addHook("onSend", async (request, reply, payload) => {
     if (request.url.startsWith("/v1/admin")) setNoStore(reply);
     return payload;
@@ -65,6 +67,28 @@ export function registerAdminRoutes(
     const principal = await requireAdmin(db, config, request);
     setNoStore(reply);
     return { openId: masked(principal.openId), displayName: principal.displayName, role: principal.role, csrfToken: principal.csrfToken, agentDisplayName: config.agentDisplayName };
+  });
+
+  app.get("/v1/admin/settings/bot-dialogue", async (request) => {
+    await requireAdmin(db, config, request);
+    const row = await db.selectFrom("bot_dialogue_settings").selectAll().where("id", "=", 1).executeTakeFirstOrThrow();
+    return {
+      maxConsecutiveDepth: row.max_consecutive_depth,
+      registeredBotsOnly: true,
+      finalRepliesOnly: true,
+      guardAction: "notify_and_wait_human",
+      updatedAt: iso(row.updated_at)
+    };
+  });
+
+  app.patch("/v1/admin/settings/bot-dialogue", async (request) => {
+    const principal = await requireAdmin(db, config, request, true);
+    requireCsrf(request, principal);
+    const body = botDialogueSettingsSchema.parse(request.body);
+    const row = await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: body.maxConsecutiveDepth, updated_at: new Date() })
+      .where("id", "=", 1).returningAll().executeTakeFirstOrThrow();
+    events.publish("settings", "bot-dialogue");
+    return { maxConsecutiveDepth: row.max_consecutive_depth, updatedAt: iso(row.updated_at) };
   });
 
   app.get<{ Querystring: { window?: string } }>("/v1/admin/overview", async (request) => {
@@ -159,7 +183,7 @@ export function registerAdminRoutes(
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id/timeline", async (request) => {
     await requireAdmin(db, config, request);
     const [signals, taskEvents, drafts, approvals, outbox, actions, output, outputUpdates] = await Promise.all([
-      db.selectFrom("signals").select(["id", "seq", "sender_role", "message_type", "decision", "priority", "created_at", "decided_at"]).where("task_id", "=", request.params.id).execute(),
+      db.selectFrom("signals").select(["id", "seq", "sender_role", "sender_type", "sender_bot_id", "sender_display_name", "ingress_source", "origin_message_id", "bot_dialogue_depth", "message_type", "decision", "priority", "created_at", "decided_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("task_events").select(["id", "event_type", "summary", "created_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("drafts").select(["id", "state", "base_room_seq", "observed_room_seq", "hold_count", "created_at", "sent_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("approvals").select(["id", "method", "state", "created_at", "decided_at", "expires_at"]).where("task_id", "=", request.params.id).execute(),
@@ -294,15 +318,17 @@ export function registerAdminRoutes(
       .selectFrom("outbox_messages")
       .innerJoin("tasks", "tasks.id", "outbox_messages.task_id")
       .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+      .leftJoin("task_outputs", "task_outputs.task_id", "tasks.id")
+      .leftJoin("drafts", "drafts.id", "outbox_messages.draft_id")
       .selectAll("outbox_messages")
-      .select(["conversations.chat_id", "tasks.bot_id"])
+      .select(["conversations.chat_id", "conversations.chat_type", "tasks.bot_id", "task_outputs.message_id as output_message_id", "task_outputs.transport", "drafts.base_room_seq"])
       .where("outbox_messages.id", "=", request.params.id)
       .executeTakeFirst();
     if (!row || row.state !== "unknown") throw new AppError("只有发送结果不确定的消息可以处置", 409, "invalid_outbox_state");
     let state = row.state;
     let platformMessageId = row.platform_message_id;
     if (body.command === "retry") {
-      if (row.operation_kind !== "message_send") throw new AppError("流式回复结果不确定，禁止降级为新消息；请先核查任务输出记录", 409, "stream_output_unknown");
+      if (!["message_send", "bot_dialogue_guard"].includes(row.operation_kind)) throw new AppError("流式回复结果不确定，禁止降级为新消息；请先核查任务输出记录", 409, "stream_output_unknown");
       try {
         platformMessageId = await (await gateways.gateway(row.bot_id)).sendMarkdownToChat(row.chat_id, row.content, row.idempotency_key);
         state = "sent";
@@ -312,6 +338,13 @@ export function registerAdminRoutes(
       }
     } else state = body.command === "mark_sent" ? "sent" : "discarded";
     await db.updateTable("outbox_messages").set({ state, platform_message_id: platformMessageId, updated_at: new Date(), sent_at: state === "sent" ? new Date() : row.sent_at, attempt: body.command === "retry" ? row.attempt + 1 : row.attempt }).where("id", "=", row.id).execute();
+    const confirmedMessageId = platformMessageId ?? row.output_message_id;
+    if (state === "sent" && confirmedMessageId && row.operation_kind !== "bot_dialogue_guard" && row.chat_type === "group") {
+      const maxSignal = await db.selectFrom("signals").select(sql<number>`coalesce(max(seq), 0)::int`.as("seq")).where("task_id", "=", row.task_id).executeTakeFirstOrThrow();
+      await fanout.publishFinal(row.task_id, confirmedMessageId, row.content, row.base_room_seq ?? maxSignal.seq, row.transport === "cardkit" ? "interactive" : "text").catch(async (error) => {
+        await db.insertInto("task_events").values({ task_id: row.task_id, event_type: "bot.fanout.failed", summary: "人工确认发件后投递机器人收件箱失败", payload: JSON.stringify({ error: errorMessage(error).slice(0, 500), confirmedMessageId }) }).execute();
+      });
+    }
     events.publish("outbox", row.id);
     return { ok: true, state };
   });

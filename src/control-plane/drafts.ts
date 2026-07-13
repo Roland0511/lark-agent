@@ -7,13 +7,15 @@ import { sha256 } from "../shared/crypto.js";
 import type { LarkMessageDetails } from "../shared/contracts.js";
 import { TaskOutputService } from "./task-output.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
+import { BotMessageFanoutService } from "./bot-message-fanout.js";
 
 export class DraftService {
   constructor(
     private readonly db: Kysely<Database>,
     private readonly config: ControlPlaneConfig,
     private readonly lark: LarkGateway | BotGatewayRegistry,
-    private readonly outputs: TaskOutputService
+    private readonly outputs: TaskOutputService,
+    private readonly fanout?: BotMessageFanoutService
   ) {}
 
   async submit(taskId: string, content: string, baseRoomSeq: number, force: boolean) {
@@ -82,6 +84,20 @@ export class DraftService {
         await trx.updateTable("outbox_messages").set({ state: "sent", platform_message_id: platformMessageId, sent_at: now, updated_at: now, attempt: outbox.attempt + 1 }).where("id", "=", outbox.id).execute();
         await trx.updateTable("drafts").set({ state: "sent", sent_at: now, updated_at: now }).where("id", "=", draft.id).execute();
       });
+      await this.fanout?.publishFinal(
+        task.id,
+        platformMessageId,
+        content,
+        baseRoomSeq,
+        delivery.transport === "cardkit" ? "interactive" : "text"
+      ).catch(async (error) => {
+        await this.db.insertInto("task_events").values({
+          task_id: task.id,
+          event_type: "bot.fanout.failed",
+          summary: "机器人最终回复投递到其他收件箱失败",
+          payload: JSON.stringify({ error: errorMessage(error).slice(0, 500), platformMessageId })
+        }).execute();
+      });
       return { draft, sent: true, held: false, platformMessageId };
     } catch (error) {
       await this.db.updateTable("outbox_messages").set({ state: "unknown", last_error: errorMessage(error), updated_at: new Date(), attempt: outbox.attempt + 1 }).where("id", "=", outbox.id).execute();
@@ -110,15 +126,29 @@ export class DraftService {
     } while (pageToken && messages.length < 500);
     messages.splice(500);
     messages.reverse();
+    const registeredBots = await this.db.selectFrom("bots").select(["id", "app_id", "display_name", "owner_open_id"])
+      .where("deleted_at", "is", null).execute();
+    const currentBot = registeredBots.find((bot) => bot.id === task.bot_id);
     for (const message of messages) {
-      if (message.senderType === "app") continue;
-      const known = await this.db.selectFrom("signals").select("id").where("conversation_id", "=", conversationId).where("message_id", "=", message.messageId).executeTakeFirst();
+      const senderBot = message.senderType === "app" ? registeredBots.find((bot) => bot.app_id === message.senderId) ?? null : null;
+      if (message.senderType === "app" && (!senderBot || senderBot.id === currentBot?.id)) continue;
+      if (message.senderType === "app") {
+        const systemMessage = await this.db.selectFrom("outbox_messages").select("id")
+          .where("platform_message_id", "=", message.messageId)
+          .where("operation_kind", "=", "bot_dialogue_guard")
+          .executeTakeFirst();
+        if (systemMessage) continue;
+      }
+      const known = await this.db.selectFrom("signals").select("id").where("bot_id", "=", task.bot_id).where("message_id", "=", message.messageId).executeTakeFirst();
       if (known) continue;
       const syntheticEventId = `refresh:${sha256(message.messageId).slice(0, 32)}`;
+      const context = senderBot ? await this.fanout?.contextForPlatformMessage(senderBot.id, message.messageId) : null;
       await this.db.transaction().execute(async (trx) => {
         const inserted = await trx.insertInto("processed_events").values({ bot_id: task.bot_id, event_id: syntheticEventId, event_type: "chat.refresh", status: "processed", processed_at: new Date() }).onConflict((conflict) => conflict.columns(["bot_id", "event_id"]).doNothing()).returning("event_id").executeTakeFirst();
         if (!inserted) return;
         const current = await trx.selectFrom("conversations").select("room_seq").where("id", "=", conversationId).forUpdate().executeTakeFirstOrThrow();
+        const duplicate = await trx.selectFrom("signals").select("id").where("bot_id", "=", task.bot_id).where("message_id", "=", message.messageId).executeTakeFirst();
+        if (duplicate) return;
         const nextSeq = current.room_seq + 1;
         await trx.updateTable("conversations").set({ room_seq: nextSeq, updated_at: new Date() }).where("id", "=", conversationId).execute();
         await trx.insertInto("signals").values({
@@ -129,7 +159,13 @@ export class DraftService {
           seq: nextSeq,
           message_id: message.messageId,
           sender_id: message.senderId,
-          sender_role: message.senderId === (await trx.selectFrom("bots").select("owner_open_id").where("id", "=", task.bot_id).executeTakeFirst())?.owner_open_id ? "owner" : "member",
+          sender_role: senderBot ? "member" : message.senderId === currentBot?.owner_open_id ? "owner" : "member",
+          sender_type: senderBot ? "bot" : "user",
+          sender_bot_id: senderBot?.id ?? null,
+          sender_display_name: senderBot?.display_name ?? null,
+          ingress_source: "history",
+          origin_message_id: context?.originMessageId ?? message.messageId,
+          bot_dialogue_depth: context?.botDialogueDepth ?? (senderBot ? 1 : 0),
           message_type: message.messageType,
           content: message.content,
           preview: message.content.slice(0, 500),

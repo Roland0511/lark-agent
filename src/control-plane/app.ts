@@ -35,6 +35,8 @@ import { TaskOutputService } from "./task-output.js";
 import { registerAdminFlowRoutes } from "./admin-flow.js";
 import { registerRunnerRoutes, RunnerReleaseService } from "./runner-routes.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
+import { MessageRouter } from "./message-router.js";
+import { BotMessageFanoutService } from "./bot-message-fanout.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -55,6 +57,8 @@ export interface ControlPlaneServices {
   gateways: BotGatewayRegistry;
   adminEvents: AdminEventBus;
   runtime: RuntimeStatus;
+  messageRouter: MessageRouter;
+  fanout: BotMessageFanoutService;
 }
 
 export function buildControlPlane(
@@ -71,15 +75,17 @@ export function buildControlPlane(
   const lark = services?.lark ?? new LarkGateway(config.larkCliPath);
   const gateways = services?.gateways ?? new BotGatewayRegistry(db, config.larkCliPath, services?.lark);
   const repository = services?.repository ?? new ControlPlaneRepository(db, config.leaseSeconds);
-  const router = services?.router ?? new EventRouter(db, config, lark, repository);
-  const outputs = services?.outputs ?? new TaskOutputService(db, config, gateways);
-  const drafts = services?.drafts ?? new DraftService(db, config, gateways, outputs);
   const adminEvents = services?.adminEvents ?? new AdminEventBus();
+  const messageRouter = services?.messageRouter ?? new MessageRouter(db);
+  const fanout = services?.fanout ?? new BotMessageFanoutService(db, gateways, messageRouter, adminEvents);
+  const router = services?.router ?? new EventRouter(db, config, lark, repository, undefined, messageRouter);
+  const outputs = services?.outputs ?? new TaskOutputService(db, config, gateways);
+  const drafts = services?.drafts ?? new DraftService(db, config, gateways, outputs, fanout);
   const runnerReleases = new RunnerReleaseService(config);
   const runnerManifestTimer = setInterval(() => void runnerReleases.current(true), config.runnerManifestRefreshSeconds * 1_000);
   runnerManifestTimer.unref();
   app.addHook("onClose", async () => clearInterval(runnerManifestTimer));
-  const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime };
+  const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime, messageRouter, fanout };
 
   void app.register(cookie);
 
@@ -191,6 +197,12 @@ export function buildControlPlane(
             seq: signal.seq,
             senderId: signal.sender_id,
             senderRole: signal.sender_role,
+            senderType: signal.sender_type,
+            senderBotId: signal.sender_bot_id,
+            senderDisplayName: signal.sender_display_name,
+            ingressSource: signal.ingress_source,
+            originMessageId: signal.origin_message_id,
+            botDialogueDepth: signal.bot_dialogue_depth,
             messageId: signal.message_id,
             messageType: signal.message_type,
             content: signal.content,
@@ -232,6 +244,12 @@ export function buildControlPlane(
         seq: signal.seq,
         senderId: signal.sender_id,
         senderRole: signal.sender_role,
+        senderType: signal.sender_type,
+        senderBotId: signal.sender_bot_id,
+        senderDisplayName: signal.sender_display_name,
+        ingressSource: signal.ingress_source,
+        originMessageId: signal.origin_message_id,
+        botDialogueDepth: signal.bot_dialogue_depth,
         messageId: signal.message_id,
         messageType: signal.message_type,
         content: signal.content,
@@ -333,7 +351,7 @@ export function buildControlPlane(
 
   registerAdminAuth(app, db, config);
   registerRunnerRoutes(app, db, config, runnerReleases, adminEvents);
-  registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
+  registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime, fanout });
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);
 
