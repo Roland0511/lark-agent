@@ -50,6 +50,9 @@ describe("worker config", () => {
     expect(config.homeRef).not.toContain(data.codexHome);
     expect(config.configFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(config.capabilities).not.toContain("app_handoff");
+    expect(config.attachmentMaxBytes).toBe(104_857_600);
+    expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
+    expect(config.attachmentRetentionDays).toBe(7);
   });
 
   it("reports the effective profile model and reasoning effort", async () => {

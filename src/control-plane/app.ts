@@ -37,6 +37,7 @@ import { registerRunnerRoutes, RunnerReleaseService } from "./runner-routes.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
 import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
+import { publicAttachments, storedAttachments } from "../lark/attachments.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -46,6 +47,30 @@ function leaseToken(request: FastifyRequest): string {
 
 function iso(value: Date | string): string {
   return new Date(value).toISOString();
+}
+
+function publicSignal(signal: Awaited<ReturnType<ControlPlaneRepository["taskSignals"]>>[number]) {
+  return {
+    id: signal.id,
+    taskId: signal.task_id,
+    seq: signal.seq,
+    senderId: signal.sender_id,
+    senderRole: signal.sender_role,
+    senderType: signal.sender_type,
+    senderBotId: signal.sender_bot_id,
+    senderDisplayName: signal.sender_display_name,
+    ingressSource: signal.ingress_source,
+    originMessageId: signal.origin_message_id,
+    botDialogueDepth: signal.bot_dialogue_depth,
+    messageId: signal.message_id,
+    messageType: signal.message_type,
+    content: signal.content,
+    preview: signal.preview,
+    attachments: publicAttachments(signal.attachments),
+    priority: signal.priority,
+    decision: signal.decision,
+    createdAt: iso(signal.created_at)
+  };
 }
 
 export interface ControlPlaneServices {
@@ -190,27 +215,13 @@ export function buildControlPlane(
           turnIndex: claimed.task.turn_index,
           triggerMessageId: claimed.task.trigger_message_id,
           attentionContext,
+          attachmentPolicy: {
+            maxBytes: config.attachmentMaxBytes,
+            taskMaxBytes: config.attachmentTaskMaxBytes,
+            retentionDays: config.attachmentRetentionDays
+          },
           roomSeq: conversation.room_seq,
-          signals: signals.map((signal) => ({
-            id: signal.id,
-            taskId: signal.task_id,
-            seq: signal.seq,
-            senderId: signal.sender_id,
-            senderRole: signal.sender_role,
-            senderType: signal.sender_type,
-            senderBotId: signal.sender_bot_id,
-            senderDisplayName: signal.sender_display_name,
-            ingressSource: signal.ingress_source,
-            originMessageId: signal.origin_message_id,
-            botDialogueDepth: signal.bot_dialogue_depth,
-            messageId: signal.message_id,
-            messageType: signal.message_type,
-            content: signal.content,
-            preview: signal.preview,
-            priority: signal.priority,
-            decision: signal.decision,
-            createdAt: iso(signal.created_at)
-          }))
+          signals: signals.map(publicSignal)
         };
         const validated = claimedTaskSchema.safeParse(payload);
         if (!validated.success) {
@@ -238,28 +249,36 @@ export function buildControlPlane(
     const afterSeq = Number.parseInt(request.query.after_seq ?? "0", 10);
     const signals = await repository.taskSignals(request.params.id, Number.isFinite(afterSeq) ? afterSeq : 0);
     return {
-      signals: signals.map((signal) => ({
-        id: signal.id,
-        taskId: signal.task_id,
-        seq: signal.seq,
-        senderId: signal.sender_id,
-        senderRole: signal.sender_role,
-        senderType: signal.sender_type,
-        senderBotId: signal.sender_bot_id,
-        senderDisplayName: signal.sender_display_name,
-        ingressSource: signal.ingress_source,
-        originMessageId: signal.origin_message_id,
-        botDialogueDepth: signal.bot_dialogue_depth,
-        messageId: signal.message_id,
-        messageType: signal.message_type,
-        content: signal.content,
-        preview: signal.preview,
-        priority: signal.priority,
-        decision: signal.decision,
-        createdAt: iso(signal.created_at)
-      }))
+      signals: signals.map(publicSignal)
     };
   });
+
+  app.get<{ Params: { taskId: string; signalId: string; attachmentId: string } }>(
+    "/v1/tasks/:taskId/signals/:signalId/attachments/:attachmentId",
+    async (request, reply) => {
+      const principal = await requireWorkerSession(db, config, request);
+      const task = await repository.assertLease(request.params.taskId, principal.executorId, leaseToken(request));
+      const signal = await db.selectFrom("signals")
+        .select(["id", "task_id", "bot_id", "message_id", "attachments"])
+        .where("id", "=", request.params.signalId)
+        .where("task_id", "=", task.id)
+        .where("bot_id", "=", task.bot_id)
+        .executeTakeFirst();
+      if (!signal) throw new AppError("attachment signal not found", 404, "not_found");
+      const attachment = storedAttachments(signal.attachments).find((item) => item.id === request.params.attachmentId);
+      if (!attachment) throw new AppError("attachment not found", 404, "not_found");
+      const resource = await (await gateways.gateway(task.bot_id)).downloadMessageResource(signal.message_id, attachment, config.attachmentMaxBytes);
+      const dispose = () => { void resource.cleanup(); };
+      reply.raw.once("finish", dispose);
+      reply.raw.once("close", dispose);
+      reply.header("content-type", "application/octet-stream");
+      reply.header("cache-control", "private, no-store");
+      reply.header("content-length", String(resource.size));
+      reply.header("content-disposition", `attachment; filename="attachment"; filename*=UTF-8''${encodeURIComponent(resource.fileName)}`);
+      reply.header("x-attachment-type", attachment.type);
+      return reply.send(resource.stream);
+    }
+  );
 
   app.post<{ Params: { id: string; signalId: string } }>("/v1/tasks/:id/signals/:signalId/decision", async (request) => {
     const principal = await requireWorkerSession(db, config, request);

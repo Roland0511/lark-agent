@@ -5,6 +5,7 @@ import type { ControlPlaneConfig } from "./config.js";
 import { requireAdmin } from "./admin-auth.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import { AppError } from "../shared/errors.js";
+import { publicAttachments } from "../lark/attachments.js";
 
 const flowStages = ["message", "inbox", "attention", "routing", "codex", "draft", "outbox", "reply"] as const;
 type FlowStage = (typeof flowStages)[number];
@@ -178,7 +179,7 @@ export function registerAdminFlowRoutes(
     const start = since(request.query.range);
     if (view === "inbox") {
       let query = db.selectFrom("signals").innerJoin("tasks", "tasks.id", "signals.task_id").innerJoin("conversations", "conversations.id", "signals.conversation_id").innerJoin("bots", "bots.id", "signals.bot_id")
-        .select(["signals.id", "signals.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.sender_type", "signals.sender_bot_id", "signals.sender_display_name", "signals.ingress_source", "signals.origin_message_id", "signals.bot_dialogue_depth", "signals.message_type", "signals.content", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
+        .select(["signals.id", "signals.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.sender_type", "signals.sender_bot_id", "signals.sender_display_name", "signals.ingress_source", "signals.origin_message_id", "signals.bot_dialogue_depth", "signals.message_type", "signals.content", "signals.attachments", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type"])
         .orderBy(sql`CASE WHEN signals.decision IN ('pending','defer') THEN 0 ELSE 1 END`).orderBy("signals.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("signals.created_at", ">=", start);
       if (request.query.state) query = query.where("signals.decision", "=", request.query.state);
@@ -189,7 +190,7 @@ export function registerAdminFlowRoutes(
       if (request.query.q) query = query.where("signals.content", "ilike", `%${request.query.q.replace(/[%_]/g, "")}%`);
       if (request.query.before) query = query.where("signals.created_at", "<", new Date(request.query.before));
       const rows = await query.execute();
-      return { items: rows.slice(0, limit).map((row) => ({ ...row, created_at: iso(row.created_at), decided_at: iso(row.decided_at), decisionSeconds: elapsed(row.created_at, row.decided_at), enteredCodex: Boolean(row.codex_thread_id) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
+      return { items: rows.slice(0, limit).map((row) => ({ ...row, attachments: publicAttachments(row.attachments), created_at: iso(row.created_at), decided_at: iso(row.decided_at), decisionSeconds: elapsed(row.created_at, row.decided_at), enteredCodex: Boolean(row.codex_thread_id) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
     if (view === "outbox") {
       let query = db.selectFrom("outbox_messages").innerJoin("tasks", "tasks.id", "outbox_messages.task_id").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
@@ -253,7 +254,7 @@ export function registerAdminFlowRoutes(
         ...publicTask(task),
         created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), followup_expires_at: iso(task.followup_expires_at),
         currentStage: stage, health: flowHealth(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state),
-        signal: taskSignals.at(-1) ? { ...taskSignals.at(-1), created_at: iso(taskSignals.at(-1)?.created_at), decided_at: iso(taskSignals.at(-1)?.decided_at) } : null,
+        signal: taskSignals.at(-1) ? { ...taskSignals.at(-1), attachments: publicAttachments(taskSignals.at(-1)?.attachments), created_at: iso(taskSignals.at(-1)?.created_at), decided_at: iso(taskSignals.at(-1)?.decided_at) } : null,
         signalCount: taskSignals.length,
         codexEvent: codexEvent ? { ...codexEvent, created_at: iso(codexEvent.created_at) } : null,
         stageTimings: latency.timings,
@@ -314,7 +315,7 @@ export function registerAdminFlowRoutes(
       task: { ...publicTask(task), bot_app_id: bot.app_id, bot_display_name: bot.display_name, bot_default_executor_id: bot.default_executor_id, route_mismatch: Boolean(bot.default_executor_id && task.executor_id && bot.default_executor_id !== task.executor_id), created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at) },
       conversation: { ...conversation, created_at: iso(conversation.created_at), updated_at: iso(conversation.updated_at), followup_expires_at: iso(conversation.followup_expires_at) },
       processed_events: processedEvents.map((x) => ({ ...x, received_at: iso(x.received_at), processed_at: iso(x.processed_at) })),
-      signals: signals.map((x) => ({ ...x, created_at: iso(x.created_at), decided_at: iso(x.decided_at) })),
+      signals: signals.map((x) => ({ ...x, attachments: publicAttachments(x.attachments), created_at: iso(x.created_at), decided_at: iso(x.decided_at) })),
       events: events.map((x) => ({ ...x, created_at: iso(x.created_at) })),
       drafts: drafts.map((x) => ({ ...x, created_at: iso(x.created_at), updated_at: iso(x.updated_at), sent_at: iso(x.sent_at) })),
       approvals: approvals.map((x) => ({ ...x, created_at: iso(x.created_at), decided_at: iso(x.decided_at), expires_at: iso(x.expires_at) })),

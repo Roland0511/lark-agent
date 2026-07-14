@@ -883,6 +883,29 @@ textarea:focus {
   word-break: break-word;
   font-family: inherit;
 }
+
+.attachment-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 7px;
+}
+
+.attachment-badges span {
+  align-items: center;
+  background: #f6f8fa;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: var(--muted);
+  display: inline-flex;
+  font-size: 12px;
+  gap: 4px;
+  max-width: 240px;
+  overflow: hidden;
+  padding: 3px 8px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .flow-action-link {
   border: 0;
   background: transparent;

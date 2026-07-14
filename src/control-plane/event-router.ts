@@ -11,6 +11,7 @@ import { legacyBotId, type BotRow } from "./bot-types.js";
 import { MessageRouter } from "./message-router.js";
 import { botMessageContextForPlatformMessage } from "./bot-message-context.js";
 import type { BotDialogueGuardService } from "./bot-dialogue-guard.js";
+import { extractLarkAttachments, safeMessageContent } from "../lark/attachments.js";
 
 const helpCommands = new Set(["/help", "/帮助"]);
 
@@ -57,7 +58,9 @@ export class EventRouter {
         : []
     );
     const canUseOwnerMentionFastPath = fastMentionedBotIds.size > 0;
-    const details = canUseOwnerMentionFastPath ? null : await this.lark.getMessage(event.message_id);
+    const attachmentCapable = ["image", "file", "post"].includes(event.message_type)
+      || /(?:img_|file_)[A-Za-z0-9_-]+/.test(event.content);
+    const details = canUseOwnerMentionFastPath && !attachmentCapable ? null : await this.lark.getMessage(event.message_id);
     if (!senderBot && details?.senderType === "app") {
       senderBot = registeredBots.find((item) => item.app_id === details.senderId) ?? null;
     }
@@ -100,6 +103,10 @@ export class EventRouter {
       : mentionedBotIds.has(this.bot.id);
     if (event.chat_type === "group" && hasRegisteredBotMention && !mentionsThisBot) return;
     const explicitlyActivated = event.chat_type === "p2p" || mentionsThisBot;
+    const rawContent = details?.rawContent ?? event.content;
+    const messageType = details?.messageType ?? event.message_type;
+    const attachments = extractLarkAttachments(messageType, rawContent);
+    const content = safeMessageContent(messageType, rawContent, attachments);
     const sourceContext = senderBot ? await botMessageContextForPlatformMessage(this.db, senderBot.id, event.message_id) : null;
     if (senderBot && await this.dialogueGuard?.isSystemNotice(event.message_id)) {
       await this.markDiscarded(event.event_id, event.type);
@@ -124,8 +131,9 @@ export class EventRouter {
       ingressSource: "lark",
       originMessageId: sourceContext?.originMessageId ?? event.message_id,
       botDialogueDepth: sourceContext?.botDialogueDepth ?? (senderBot ? 1 : 0),
-      messageType: event.message_type,
-      content: event.content,
+      messageType,
+      content,
+      attachments,
       explicitlyActivated,
       receivedAt: new Date()
     });

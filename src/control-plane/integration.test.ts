@@ -1,5 +1,6 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import pg from "pg";
 import { sql } from "kysely";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -22,6 +23,7 @@ import { bootstrapLegacyBot, BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
 import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 import { BotPermissionService } from "./bot-permissions.js";
+import { RetentionService } from "./retention.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -40,6 +42,9 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     larkCardActionsEnabled: false,
     larkCliPath: "lark-cli",
     messageRetentionDays: 30,
+    attachmentMaxBytes: 104_857_600,
+    attachmentTaskMaxBytes: 209_715_200,
+    attachmentRetentionDays: 7,
     traceRetentionDays: 180,
     leaseSeconds: 60,
     sessionMinutes: 60,
@@ -89,6 +94,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const latencyAndModelPolicySql = await readFile(fileURLToPath(new URL("../db/migrations/012_latency_and_model_policy.sql", import.meta.url)), "utf8");
     const botDialogueSql = await readFile(fileURLToPath(new URL("../db/migrations/013_bot_dialogue.sql", import.meta.url)), "utf8");
     const botPermissionsSql = await readFile(fileURLToPath(new URL("../db/migrations/014_bot_permissions.sql", import.meta.url)), "utf8");
+    const signalAttachmentsSql = await readFile(fileURLToPath(new URL("../db/migrations/015_signal_attachments.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -109,6 +115,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (botDialogueApplied.rowCount === 0) await client.query(botDialogueSql);
     const botPermissionsApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'bots' AND column_name = 'permission_state'");
     if (botPermissionsApplied.rowCount === 0) await client.query(botPermissionsSql);
+    const signalAttachmentsApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'signals' AND column_name = 'attachments'");
+    if (signalAttachmentsApplied.rowCount === 0) await client.query(signalAttachmentsSql);
     await client.end();
   });
 
@@ -163,6 +171,30 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await expect(bootstrapLegacyBot(db, withoutBootstrap)).resolves.toMatchObject({ app_id: "cli_bot", owner_open_id: "ou_owner" });
     await db.updateTable("bots").set({ app_id: "__legacy__", owner_open_id: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     await expect(bootstrapLegacyBot(db, withoutBootstrap)).rejects.toThrow("空数据库首次启动需要配置 BOT_APP_ID 和 OWNER_OPEN_ID");
+  });
+
+  it("clears attachment metadata together with expired signal content", async () => {
+    const old = new Date(Date.now() - 31 * 86_400_000);
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_retention", chat_type: "p2p", root_message_id: "om_retention", thread_id: null,
+      room_seq: 1, active: false, response_message_id: null, created_at: old, updated_at: old
+    }).returning("id").executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, state: "completed", trigger_message_id: "om_retention", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: null, preferred_executor_id: null, executor_id: null, codex_thread_id: null, lease_token_hash: null, lease_expires_at: null,
+      summary: null, created_at: old, updated_at: old, completed_at: old
+    }).returning("id").executeTakeFirstOrThrow();
+    await db.insertInto("processed_events").values({ event_id: "ev_retention", event_type: "message", status: "processed", received_at: old, processed_at: old }).execute();
+    await db.insertInto("signals").values({
+      conversation_id: conversation.id, task_id: task.id, event_id: "ev_retention", seq: 1, message_id: "om_retention", origin_message_id: "om_retention",
+      sender_id: "ou_owner", sender_role: "owner", message_type: "file", content: "old", preview: "old",
+      attachments: JSON.stringify([{ id: "99999999-9999-4999-8999-999999999999", type: "file", fileName: "old.txt", resourceKey: "file_old" }]),
+      priority: 90, decision: "consume", decision_rationale: null, created_at: old, decided_at: old
+    }).execute();
+    await new RetentionService(db, 30, 180).runOnce();
+    const retained = await db.selectFrom("signals").select(["content", "preview", "attachments"]).where("task_id", "=", task.id).executeTakeFirstOrThrow();
+    expect(retained).toEqual({ content: "[expired]", preview: "[expired]", attachments: [] });
   });
 
   it("reconnects one enabled bot without changing its configuration", async () => {
@@ -397,6 +429,12 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       message_type: "text",
       content: "implement",
       preview: "implement",
+      attachments: JSON.stringify([{
+        id: "11111111-1111-4111-8111-111111111111",
+        type: "file",
+        fileName: "proof.txt",
+        resourceKey: "file_internal_secret"
+      }]),
       priority: 90,
       decision: "pending",
       decision_rationale: null,
@@ -405,15 +443,42 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
     const claimResponse = await app.inject({ method: "POST", url: "/v1/tasks/claim", headers: { authorization: `Bearer ${sessionToken}` } });
     expect(claimResponse.statusCode).toBe(200);
-    const claim = claimResponse.json<{ id: string; botAppId: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string }>();
+    const claim = claimResponse.json<{ id: string; botAppId: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string; signals: Array<{ id: string; attachments: Array<{ id: string; type: string; fileName: string }> }> }>();
     expect(claim.id).toBe(task.id);
     expect(claim).toMatchObject({ botAppId: "cli_bot", chatType: "group", turnIndex: 1, triggerMessageId: "om_root", requestedWorkspaceAlias: "repo", resolvedWorkspaceAlias: "repo" });
     expect(claim.attentionContext).toContain("首次激活回合");
+    expect(claim.signals[0]?.attachments).toEqual([{ id: "11111111-1111-4111-8111-111111111111", type: "file", fileName: "proof.txt" }]);
+    expect(claimResponse.body).not.toContain("file_internal_secret");
     const claimedRow = await db.selectFrom("tasks").selectAll().where("id", "=", task.id).executeTakeFirstOrThrow();
     expect(claimedRow.executor_home_ref).toBe("worker-a:home");
     expect(claimedRow.executor_profile).toBe("lark-agent");
     expect(claimedRow.executor_config_fingerprint).toBe("a".repeat(64));
     expect(claimedRow.resolved_workspace_alias).toBe("repo");
+
+    let attachmentTemp = "";
+    const attachmentGateway = new (await import("../lark/gateway.js")).LarkGateway("lark-cli", async () => ({}), null, async (_command, args, _env, options) => {
+      attachmentTemp = options?.cwd ?? "";
+      const output = args[args.indexOf("--output") + 1] ?? "";
+      await writeFile(join(attachmentTemp, output), "attachment proof");
+      return { stdout: "{}", stderr: "", exitCode: 0 };
+    });
+    const attachmentControl = buildControlPlane(db, config, { lark: attachmentGateway }).app;
+    const attachmentHeaders = { authorization: `Bearer ${sessionToken}`, "x-lease-token": claim.leaseToken };
+    const downloaded = await attachmentControl.inject({
+      method: "GET",
+      url: `/v1/tasks/${task.id}/signals/${claim.signals[0]?.id}/attachments/11111111-1111-4111-8111-111111111111`,
+      headers: attachmentHeaders
+    });
+    expect(downloaded.statusCode).toBe(200);
+    expect(downloaded.body).toBe("attachment proof");
+    expect(downloaded.headers["content-disposition"]).toContain("proof.txt");
+    const wrongSignal = await attachmentControl.inject({ method: "GET", url: `/v1/tasks/${task.id}/signals/22222222-2222-4222-8222-222222222222/attachments/11111111-1111-4111-8111-111111111111`, headers: attachmentHeaders });
+    expect(wrongSignal.statusCode).toBe(404);
+    const crossTask = await attachmentControl.inject({ method: "GET", url: `/v1/tasks/33333333-3333-4333-8333-333333333333/signals/${claim.signals[0]?.id}/attachments/11111111-1111-4111-8111-111111111111`, headers: attachmentHeaders });
+    expect(crossTask.statusCode).toBe(409);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(stat(attachmentTemp)).rejects.toThrow();
+    await attachmentControl.close();
 
     const draftResponse = await app.inject({
       method: "POST",
@@ -647,7 +712,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     let getMessageCalls = 0;
     const fakeLark = { getMessage: async () => { getMessageCalls += 1; return details; } } as unknown as LarkGateway;
     const router = new EventRouter(db, config, fakeLark, new ControlPlaneRepository(db, 60));
-    const event = (eventId: string, messageId: string, content: string, senderId = "ou_member"): LarkMessageEvent => ({
+    const event = (eventId: string, messageId: string, content: string, senderId = "ou_member", messageType = "text"): LarkMessageEvent => ({
       type: "im.message.receive_v1",
       event_id: eventId,
       timestamp: "1",
@@ -655,7 +720,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       chat_id: "oc_test",
       chat_type: "group",
       sender_id: senderId,
-      message_type: "text",
+      message_type: messageType,
       content,
       create_time: "1"
     });
@@ -665,9 +730,15 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(0);
     expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(0);
 
-    details = { ...details, messageId: "om_activated", content: "@Lark Agent handle this", mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
+    const inactiveFile = JSON.stringify({ file_key: "file_inactive", file_name: "inactive.txt" });
+    details = { ...details, messageId: "om_inactive_file", messageType: "file", content: inactiveFile, rawContent: inactiveFile, mentions: [] };
+    await router.handleMessage(event("ev_inactive_file", "om_inactive_file", inactiveFile, "ou_member", "file"));
+    expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(0);
+    expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(0);
+
+    details = { ...details, messageId: "om_activated", messageType: "text", content: "@Lark Agent handle this", rawContent: undefined, mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
     await router.handleMessage(event("ev_activated", "om_activated", "@Lark Agent handle this", "ou_owner"));
-    expect(getMessageCalls).toBe(1);
+    expect(getMessageCalls).toBe(2);
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(1);
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
     const activatedConversation = await db.selectFrom("conversations").selectAll().executeTakeFirstOrThrow();
@@ -682,18 +753,46 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     signals = await db.selectFrom("signals").selectAll().orderBy("seq").execute();
     expect(signals.map((signal) => signal.content)).toEqual(["@Lark Agent handle this", "follow up without mention"]);
 
+    const activeFile = JSON.stringify({ file_key: "file_active", file_name: "active.txt" });
+    details = { ...details, messageId: "om_active_file", messageType: "file", content: activeFile, rawContent: activeFile, mentions: [] };
+    await router.handleMessage(event("ev_active_file", "om_active_file", activeFile, "ou_member", "file"));
+    signals = await db.selectFrom("signals").selectAll().orderBy("seq").execute();
+    expect(signals).toHaveLength(3);
+    expect(signals[2]?.content).toBe("附件（1 个）：文件「active.txt」");
+    expect(signals[2]?.content).not.toContain("file_active");
+    expect(signals[2]?.attachments).toMatchObject([{ type: "file", fileName: "active.txt", resourceKey: "file_active" }]);
+
     const activeTask = await db.selectFrom("tasks").select("id").executeTakeFirstOrThrow();
     await new ControlPlaneRepository(db, 60).finishTask(activeTask.id, "completed", "done");
     expect((await db.selectFrom("conversations").select("active").where("id", "=", activatedConversation.id).executeTakeFirstOrThrow()).active).toBe(false);
-    details = { ...details, messageId: "om_after", content: "ordinary after completion", mentions: [] };
+    details = { ...details, messageId: "om_after", messageType: "text", content: "ordinary after completion", rawContent: undefined, mentions: [] };
     await router.handleMessage(event("ev_after", "om_after", "ordinary after completion"));
-    expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(2);
+    expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(3);
     expect(await db.selectFrom("processed_events").select("event_id").where("event_id", "=", "ev_after").executeTakeFirst()).toBeUndefined();
 
-    details = { ...details, messageId: "om_reactivate", content: "@Lark Agent next task", mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
+    details = { ...details, messageId: "om_reactivate", messageType: "text", content: "@Lark Agent next task", rawContent: undefined, mentions: [{ id: "cli_bot", idType: "app_id", name: "Lark Agent" }] };
     await router.handleMessage(event("ev_reactivate", "om_reactivate", "@Lark Agent next task"));
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(2);
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(2);
+  });
+
+  it("routes a direct private image as an attachment task without requiring text", async () => {
+    const rawContent = JSON.stringify({ image_key: "img_private" });
+    const details: LarkMessageDetails = {
+      messageId: "om_private_image", rootId: null, parentId: null, threadId: null, chatId: "oc_private_image",
+      senderId: "ou_owner", senderType: "user", messageType: "image", content: rawContent, rawContent,
+      createTime: "1", mentions: []
+    };
+    const router = new EventRouter(db, config, { getMessage: async () => details } as unknown as LarkGateway, new ControlPlaneRepository(db, 60));
+    await router.handleMessage({
+      type: "im.message.receive_v1", event_id: "ev_private_image", timestamp: "1", message_id: details.messageId,
+      chat_id: details.chatId, chat_type: "p2p", sender_id: details.senderId, message_type: "image", content: rawContent, create_time: "1"
+    });
+    const stored = await db.selectFrom("signals").select(["content", "preview", "attachments"]).executeTakeFirstOrThrow();
+    expect(stored.content).toBe("附件（1 个）：图片「image」");
+    expect(stored.preview).toBe(stored.content);
+    expect(stored.attachments).toMatchObject([{ type: "image", fileName: "image", resourceKey: "img_private" }]);
+    expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
   });
 
   it("pauses a newly activated group task when multiple executors are eligible but none is bound", async () => {

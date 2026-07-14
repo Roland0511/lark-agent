@@ -13,6 +13,9 @@ describe("control plane config", () => {
     expect(config.ownerOpenId).toBe("");
     expect(config.botAppId).toBe("");
     expect(config.whitelistChatIds.size).toBe(0);
+    expect(config.attachmentMaxBytes).toBe(104_857_600);
+    expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
+    expect(config.attachmentRetentionDays).toBe(7);
   });
 
   it("still accepts bootstrap settings for a fresh installation", () => {

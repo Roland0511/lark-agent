@@ -11,7 +11,7 @@ export class RetentionService {
   async runOnce(): Promise<void> {
     const messageCutoff = new Date(Date.now() - this.messageDays * 86_400_000);
     const traceCutoff = new Date(Date.now() - this.traceDays * 86_400_000);
-    await this.db.updateTable("signals").set({ content: "[expired]", preview: "[expired]" }).where("created_at", "<", messageCutoff).where("content", "!=", "[expired]").execute();
+    await this.db.updateTable("signals").set({ content: "[expired]", preview: "[expired]", attachments: JSON.stringify([]) }).where("created_at", "<", messageCutoff).where("content", "!=", "[expired]").execute();
     await this.db.updateTable("drafts").set({ content: "[expired]", updated_at: new Date() }).where("created_at", "<", messageCutoff).where("content", "!=", "[expired]").execute();
     await this.db.updateTable("outbox_messages").set({ content: "[expired]", updated_at: new Date() }).where("created_at", "<", messageCutoff).where("content", "!=", "[expired]").execute();
     await this.db.updateTable("task_outputs").set({ current_content: "[expired]", updated_at: new Date() }).where("created_at", "<", messageCutoff).where("current_content", "is not", null).where("current_content", "!=", "[expired]").execute();

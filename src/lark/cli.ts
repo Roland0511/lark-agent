@@ -1,20 +1,29 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
+import { lstat, readdir } from "node:fs/promises";
 import { AppError, errorMessage } from "../shared/errors.js";
 
 export interface CommandResult {
   stdout: string;
   stderr: string;
   exitCode: number;
+  limitExceeded?: boolean;
 }
 
-export async function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv = process.env): Promise<CommandResult> {
-  return runCommandWithInput(command, args, undefined, env);
+export interface CommandOptions {
+  cwd?: string;
+  maxOutputDirectory?: string;
+  maxOutputBytes?: number;
 }
 
-export async function runCommandWithInput(command: string, args: string[], input?: string, env: NodeJS.ProcessEnv = process.env): Promise<CommandResult> {
+export async function runCommand(command: string, args: string[], env: NodeJS.ProcessEnv = process.env, options: CommandOptions = {}): Promise<CommandResult> {
+  return runCommandWithInput(command, args, undefined, env, options);
+}
+
+export async function runCommandWithInput(command: string, args: string[], input?: string, env: NodeJS.ProcessEnv = process.env, options: CommandOptions = {}): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
+      cwd: options.cwd,
       env: {
         ...env,
         LARKSUITE_CLI_NO_UPDATE_NOTIFIER: "1",
@@ -24,14 +33,50 @@ export async function runCommandWithInput(command: string, args: string[], input
     });
     let stdout = "";
     let stderr = "";
+    let limitExceeded = false;
+    let checkingSize = false;
+    let forceKillTimer: NodeJS.Timeout | null = null;
+    const sizeMonitor = options.maxOutputDirectory && options.maxOutputBytes
+      ? setInterval(() => {
+          if (checkingSize || limitExceeded) return;
+          checkingSize = true;
+          void directorySize(options.maxOutputDirectory!).then((size) => {
+            if (size > options.maxOutputBytes!) {
+              limitExceeded = true;
+              child.kill("SIGTERM");
+              forceKillTimer = setTimeout(() => child.kill("SIGKILL"), 2_000);
+              forceKillTimer.unref();
+            }
+          }).finally(() => { checkingSize = false; });
+        }, 50)
+      : null;
+    sizeMonitor?.unref();
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => (stdout += chunk));
     child.stderr.on("data", (chunk: string) => (stderr += chunk));
-    child.once("error", reject);
-    child.once("close", (code) => resolve({ stdout, stderr, exitCode: code ?? -1 }));
+    child.once("error", (error) => {
+      if (sizeMonitor) clearInterval(sizeMonitor);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      if (sizeMonitor) clearInterval(sizeMonitor);
+      if (forceKillTimer) clearTimeout(forceKillTimer);
+      resolve({ stdout, stderr, exitCode: code ?? -1, limitExceeded });
+    });
     child.stdin.end(input);
   });
+}
+
+async function directorySize(directory: string): Promise<number> {
+  const entries = await readdir(directory, { recursive: true }).catch(() => []);
+  let total = 0;
+  for (const entry of entries) {
+    const info = await lstat(`${directory}/${entry}`).catch(() => null);
+    if (info?.isFile()) total += info.size;
+  }
+  return total;
 }
 
 export async function runJsonCommand(command: string, args: string[], env?: NodeJS.ProcessEnv): Promise<unknown> {

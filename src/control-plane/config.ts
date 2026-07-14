@@ -13,6 +13,9 @@ const envSchema = z.object({
   LARK_CARD_ACTIONS_ENABLED: z.enum(["true", "false"]).default("false"),
   LARK_CLI_PATH: z.string().default("lark-cli"),
   MESSAGE_RETENTION_DAYS: z.coerce.number().int().positive().default(30),
+  ATTACHMENT_MAX_BYTES: z.coerce.number().int().positive().default(104_857_600),
+  ATTACHMENT_TASK_MAX_BYTES: z.coerce.number().int().positive().default(209_715_200),
+  ATTACHMENT_RETENTION_DAYS: z.coerce.number().int().positive().default(7),
   TRACE_RETENTION_DAYS: z.coerce.number().int().positive().default(180),
   LEASE_SECONDS: z.coerce.number().int().min(30).default(60),
   SESSION_MINUTES: z.coerce.number().int().min(5).default(60),
@@ -38,6 +41,9 @@ export interface ControlPlaneConfig {
   larkCardActionsEnabled: boolean;
   larkCliPath: string;
   messageRetentionDays: number;
+  attachmentMaxBytes: number;
+  attachmentTaskMaxBytes: number;
+  attachmentRetentionDays: number;
   traceRetentionDays: number;
   leaseSeconds: number;
   sessionMinutes: number;
@@ -65,6 +71,9 @@ export function loadControlPlaneConfig(env: NodeJS.ProcessEnv = process.env): Co
     larkCardActionsEnabled: parsed.LARK_CARD_ACTIONS_ENABLED === "true",
     larkCliPath: parsed.LARK_CLI_PATH,
     messageRetentionDays: parsed.MESSAGE_RETENTION_DAYS,
+    attachmentMaxBytes: parsed.ATTACHMENT_MAX_BYTES,
+    attachmentTaskMaxBytes: parsed.ATTACHMENT_TASK_MAX_BYTES,
+    attachmentRetentionDays: parsed.ATTACHMENT_RETENTION_DAYS,
     traceRetentionDays: parsed.TRACE_RETENTION_DAYS,
     leaseSeconds: parsed.LEASE_SECONDS,
     sessionMinutes: parsed.SESSION_MINUTES,

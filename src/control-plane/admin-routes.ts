@@ -10,6 +10,7 @@ import type { ControlPlaneRepository } from "./repository.js";
 import { AdminEventBus } from "./admin-events.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { BotGatewayRegistry } from "./bot-runtime.js";
+import { publicAttachments } from "../lark/attachments.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -182,7 +183,7 @@ export function registerAdminRoutes(
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id/timeline", async (request) => {
     await requireAdmin(db, config, request);
     const [signals, taskEvents, drafts, approvals, outbox, actions, output, outputUpdates] = await Promise.all([
-      db.selectFrom("signals").select(["id", "seq", "sender_role", "sender_type", "sender_bot_id", "sender_display_name", "ingress_source", "origin_message_id", "bot_dialogue_depth", "message_type", "decision", "priority", "created_at", "decided_at"]).where("task_id", "=", request.params.id).execute(),
+      db.selectFrom("signals").select(["id", "seq", "sender_role", "sender_type", "sender_bot_id", "sender_display_name", "ingress_source", "origin_message_id", "bot_dialogue_depth", "message_type", "attachments", "decision", "priority", "created_at", "decided_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("task_events").select(["id", "event_type", "summary", "created_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("drafts").select(["id", "state", "base_room_seq", "observed_room_seq", "hold_count", "created_at", "sent_at"]).where("task_id", "=", request.params.id).execute(),
       db.selectFrom("approvals").select(["id", "method", "state", "created_at", "decided_at", "expires_at"]).where("task_id", "=", request.params.id).execute(),
@@ -192,7 +193,7 @@ export function registerAdminRoutes(
       db.selectFrom("task_output_updates").select(["id", "operation", "sequence", "state", "attempt", "last_error", "created_at", "sent_at"]).where("task_id", "=", request.params.id).execute()
     ]);
     const items = [
-      ...signals.map((x) => ({ type: "signal", ...x })), ...taskEvents.map((x) => ({ type: "event", ...x })),
+      ...signals.map((x) => ({ type: "signal", ...x, attachments: publicAttachments(x.attachments) })), ...taskEvents.map((x) => ({ type: "event", ...x })),
       ...drafts.map((x) => ({ type: "draft", ...x })), ...approvals.map((x) => ({ type: "approval", ...x })),
       ...outbox.map((x) => ({ type: "outbox", ...x })), ...actions.map((x) => ({ type: "action", ...x })),
       ...output.map((x) => ({ type: "output", ...x })), ...outputUpdates.map((x) => ({ type: "output_update", ...x }))

@@ -26,6 +26,7 @@ rl.on('line', (line) => {
     const turnId = 'turn_' + nextTurn++;
     send({ id: msg.id, result: { turn: { id: turnId } } });
     const prompt = msg.params.input?.[0]?.text;
+    const localImageAccepted = msg.params.input?.[1]?.type === 'localImage' && msg.params.input?.[1]?.path === '/tmp/screen.png';
     const isStructuredTask = Boolean(msg.params.outputSchema) && prompt === 'structured';
     const isAttention = Boolean(msg.params.outputSchema) && !isStructuredTask;
     if (isStructuredTask && (msg.params.model !== 'exec-model' || msg.params.effort !== 'high')) return send({ id: msg.id, error: { code: -1, message: 'execution policy missing' } });
@@ -44,12 +45,13 @@ rl.on('line', (line) => {
       send({ method: 'item/agentMessage/delta', params: { itemId: 'attention_' + turnId, delta: text } });
       send({ method: 'item/completed', params: { item: { id: 'attention_' + turnId, type: 'agentMessage', text, phase: 'final_answer' } } });
     } else {
+      const finalText = prompt === 'with-image' && localImageAccepted ? 'image accepted' : 'done';
       send({ method: 'item/started', params: { item: { id: 'comment_' + turnId, type: 'agentMessage', text: '', phase: 'commentary' } } });
       send({ method: 'item/agentMessage/delta', params: { itemId: 'comment_' + turnId, delta: 'checking' } });
       send({ method: 'item/completed', params: { item: { id: 'comment_' + turnId, type: 'agentMessage', text: 'checking', phase: 'commentary' } } });
       send({ method: 'item/started', params: { item: { id: 'final_' + turnId, type: 'agentMessage', text: '', phase: 'final_answer' } } });
-      send({ method: 'item/agentMessage/delta', params: { itemId: 'final_' + turnId, delta: 'done' } });
-      send({ method: 'item/completed', params: { item: { id: 'final_' + turnId, type: 'agentMessage', text: 'done', phase: 'final_answer' } } });
+      send({ method: 'item/agentMessage/delta', params: { itemId: 'final_' + turnId, delta: finalText } });
+      send({ method: 'item/completed', params: { item: { id: 'final_' + turnId, type: 'agentMessage', text: finalText, phase: 'final_answer' } } });
     }
     send({ method: 'thread/tokenUsage/updated', params: { threadId: 'thr_1', turnId, tokenUsage: { last: { inputTokens: 12, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 1, totalTokens: 15 }, total: { inputTokens: 12, cachedInputTokens: 2, outputTokens: 3, reasoningOutputTokens: 1, totalTokens: 15 } } } });
     send({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
@@ -102,14 +104,15 @@ describe("CodexAdapter", () => {
     const threadId = await adapter.startOrResumeThread(config.codexHome, null);
     expect(threadId).toBe("thr_1");
     await expect(adapter.runTurn(threadId, "work")).resolves.toEqual({ turnId: "turn_1", text: "done" });
+    await expect(adapter.runTurn(threadId, "with-image", { localImages: ["/tmp/screen.png"] })).resolves.toEqual({ turnId: "turn_2", text: "image accepted" });
     await expect(adapter.runTurn(threadId, "structured", {
       outputSchema: { type: "object" }, publishCommentary: true, model: "exec-model", effort: "high"
     })).resolves.toEqual({
-      turnId: "turn_2",
+      turnId: "turn_3",
       text: JSON.stringify({ reply: "2", disposition: "awaiting_followup", rationale: "counting continues" })
     });
     await expect(adapter.attention(config.codexHome, "task", "signal", { model: "attention-model", effort: "low" })).resolves.toEqual({ decision: "consume", priority: 80, rationale: "relevant" });
-    expect(commentary).toEqual(["checking", "structured checking"]);
+    expect(commentary).toEqual(["checking", "checking", "structured checking"]);
     expect(activity).toContain("thread/tokenUsage/updated");
     await adapter.stop();
   });

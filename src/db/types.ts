@@ -4,6 +4,7 @@ import type { ApprovalState, AuthorizationGrant, DraftState, TaskState } from ".
 type Timestamp = ColumnType<Date, Date | string | undefined, Date | string>;
 type NullableTimestamp = ColumnType<Date | null, Date | string | null | undefined, Date | string | null>;
 type Json = ColumnType<unknown, string, string>;
+type GeneratedJson = ColumnType<unknown, string | undefined, string>;
 
 export interface ProcessedEventsTable {
   bot_id: string;
@@ -85,6 +86,7 @@ export interface SignalsTable {
   message_type: string;
   content: string;
   preview: string;
+  attachments: GeneratedJson;
   priority: Generated<number>;
   decision: Generated<string>;
   decision_rationale: string | null;

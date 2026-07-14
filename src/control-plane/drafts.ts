@@ -5,6 +5,7 @@ import { LarkGateway } from "../lark/gateway.js";
 import { AppError, errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { LarkMessageDetails } from "../shared/contracts.js";
+import { extractLarkAttachments, safeMessageContent } from "../lark/attachments.js";
 import { TaskOutputService } from "./task-output.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
 import { botMessageContextForPlatformMessage } from "./bot-message-context.js";
@@ -117,6 +118,9 @@ export class DraftService {
       .where("deleted_at", "is", null).execute();
     const currentBot = registeredBots.find((bot) => bot.id === task.bot_id);
     for (const message of messages) {
+      const rawContent = message.rawContent ?? message.content;
+      const attachments = extractLarkAttachments(message.messageType, rawContent);
+      const safeContent = safeMessageContent(message.messageType, rawContent, attachments);
       const senderBot = message.senderType === "app" ? registeredBots.find((bot) => bot.app_id === message.senderId) ?? null : null;
       if (message.senderType === "app" && (!senderBot || senderBot.id === currentBot?.id)) continue;
       if (message.senderType === "app") {
@@ -155,8 +159,9 @@ export class DraftService {
           origin_message_id: context?.originMessageId ?? message.messageId,
           bot_dialogue_depth: context?.botDialogueDepth ?? (senderBot ? 1 : 0),
           message_type: message.messageType,
-          content: message.content,
-          preview: message.content.slice(0, 500),
+          content: safeContent,
+          preview: safeContent.slice(0, 500),
+          attachments: JSON.stringify(attachments),
           priority: 80,
           decision: "pending",
           decision_rationale: "reconciled before draft send",

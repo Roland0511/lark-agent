@@ -1,7 +1,63 @@
 import { describe, expect, it } from "vitest";
 import { LarkGateway } from "./gateway.js";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 
 describe("LarkGateway main-chat messaging", () => {
+  it("downloads a message resource with a relative output path and removes the temporary directory", async () => {
+    let temporaryDirectory = "";
+    const gateway = new LarkGateway("lark-cli", async () => ({}), "bot-profile", async (_command, args, _env, options) => {
+      temporaryDirectory = options?.cwd ?? "";
+      const output = args[args.indexOf("--output") + 1] ?? "";
+      expect(output.startsWith("/")).toBe(false);
+      await writeFile(join(temporaryDirectory, output), "attachment-body");
+      return { stdout: "{}", stderr: "", exitCode: 0 };
+    });
+    const resource = await gateway.downloadMessageResource("om_resource", {
+      id: "11111111-1111-4111-8111-111111111111",
+      type: "file",
+      fileName: "proof.txt",
+      resourceKey: "file_resource"
+    }, 100);
+    expect(await readFile(resource.path, "utf8")).toBe("attachment-body");
+    expect(resource.size).toBe(15);
+    resource.stream.destroy();
+    await resource.cleanup();
+    await expect(stat(temporaryDirectory)).rejects.toThrow();
+  });
+
+  it("rejects downloads stopped by the per-file size monitor and cleans temporary data", async () => {
+    let temporaryDirectory = "";
+    const gateway = new LarkGateway("lark-cli", async () => ({}), null, async (_command, _args, _env, options) => {
+      temporaryDirectory = options?.cwd ?? "";
+      return { stdout: "", stderr: "", exitCode: -1, limitExceeded: true };
+    });
+    await expect(gateway.downloadMessageResource("om_resource", {
+      id: "22222222-2222-4222-8222-222222222222",
+      type: "image",
+      fileName: "screen.png",
+      resourceKey: "img_resource"
+    }, 5)).rejects.toMatchObject({ statusCode: 413, code: "attachment_too_large" });
+    await expect(stat(temporaryDirectory)).rejects.toThrow();
+  });
+
+  it("accepts the extension that lark-cli infers for an image output basename", async () => {
+    const gateway = new LarkGateway("lark-cli", async () => ({}), null, async (_command, args, _env, options) => {
+      const output = args[args.indexOf("--output") + 1] ?? "";
+      await writeFile(join(options?.cwd ?? "", `${output}.jpg`), "jpeg-bytes");
+      return { stdout: "{}", stderr: "", exitCode: 0 };
+    });
+    const resource = await gateway.downloadMessageResource("om_image", {
+      id: "33333333-3333-4333-8333-333333333333",
+      type: "image",
+      fileName: "image",
+      resourceKey: "img_resource"
+    }, 100);
+    expect(resource.fileName).toBe("image.jpg");
+    resource.stream.destroy();
+    await resource.cleanup();
+  });
+
   it("lists only granted application scopes with the selected bot profile", async () => {
     const calls: string[][] = [];
     const gateway = new LarkGateway("lark-cli", async (_command, args) => {

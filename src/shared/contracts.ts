@@ -97,6 +97,13 @@ export const runnerEnrollmentResponseSchema = z.object({
   enrolledAt: z.string().datetime()
 });
 
+export const signalAttachmentSchema = z.object({
+  id: z.string().uuid(),
+  type: z.enum(["image", "file"]),
+  fileName: z.string().min(1).max(255)
+});
+export type SignalAttachment = z.infer<typeof signalAttachmentSchema>;
+
 export const signalSchema = z.object({
   id: z.string().uuid(),
   taskId: z.string().uuid(),
@@ -113,11 +120,18 @@ export const signalSchema = z.object({
   messageType: z.string(),
   content: z.string(),
   preview: z.string(),
+  attachments: z.array(signalAttachmentSchema).default([]),
   priority: z.number().int(),
   decision: z.enum(["pending", ...inboxDecisions]),
   createdAt: z.string()
 });
 export type Signal = z.infer<typeof signalSchema>;
+
+export const attachmentPolicySchema = z.object({
+  maxBytes: z.number().int().positive(),
+  taskMaxBytes: z.number().int().positive(),
+  retentionDays: z.number().int().positive()
+}).default({ maxBytes: 104_857_600, taskMaxBytes: 209_715_200, retentionDays: 7 });
 
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
@@ -144,6 +158,7 @@ export const claimedTaskSchema = z.object({
   turnIndex: z.number().int().positive(),
   triggerMessageId: z.string().min(1),
   attentionContext: z.string().max(2_000),
+  attachmentPolicy: attachmentPolicySchema,
   roomSeq: z.number().int().nonnegative(),
   signals: z.array(signalSchema)
 });
@@ -240,6 +255,7 @@ export interface LarkMessageDetails {
   senderType: string;
   messageType: string;
   content: string;
+  rawContent?: string;
   createTime: string;
   mentions: Array<{ id: string; idType: string; name: string }>;
 }

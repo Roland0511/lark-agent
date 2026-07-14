@@ -2,8 +2,15 @@ import { sql, type Kysely } from "kysely";
 import type { Database } from "../db/types.js";
 import { authorizationFromMessage } from "./policy.js";
 import type { BotRow } from "./bot-types.js";
+import type { StoredAttachment } from "../lark/attachments.js";
+import { attachmentSummary } from "../lark/attachments.js";
 
 const activeTaskStates = ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"] as const;
+
+function messagePreview(content: string, attachments: StoredAttachment[]): string {
+  const summary = attachmentSummary(attachments);
+  return (summary && !content.includes(summary) ? `${content}\n${summary}` : content).trim().slice(0, 500);
+}
 
 export interface RoutableMessage {
   eventId: string;
@@ -22,6 +29,7 @@ export interface RoutableMessage {
   botDialogueDepth: number;
   messageType: string;
   content: string;
+  attachments?: StoredAttachment[];
   explicitlyActivated: boolean;
   receivedAt?: Date;
   decisionRationale?: string | null;
@@ -171,7 +179,8 @@ export class MessageRouter {
         bot_dialogue_depth: message.botDialogueDepth,
         message_type: message.messageType,
         content: message.content,
-        preview: message.content.slice(0, 500),
+        preview: messagePreview(message.content, message.attachments ?? []),
+        attachments: JSON.stringify(message.attachments ?? []),
         priority: message.explicitlyActivated ? 90 : 50,
         decision: "pending",
         decision_rationale: message.decisionRationale ?? null,

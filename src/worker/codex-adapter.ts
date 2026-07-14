@@ -60,7 +60,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.3" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.5" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -91,7 +91,7 @@ export class CodexAdapter {
   async runTurn(
     threadId: string,
     text: string,
-    options: { outputSchema?: Record<string, unknown>; publishCommentary?: boolean; model?: string | null; effort?: string | null } = {}
+    options: { outputSchema?: Record<string, unknown>; publishCommentary?: boolean; model?: string | null; effort?: string | null; localImages?: string[] } = {}
   ): Promise<{ turnId: string; text: string }> {
     if (this.collector) throw new Error("only one primary turn may run per executor instance");
     let collector!: TurnCollector;
@@ -102,7 +102,7 @@ export class CodexAdapter {
     try {
       const result = (await this.request("turn/start", {
         threadId,
-        input: [{ type: "text", text }],
+        input: [{ type: "text", text }, ...(options.localImages ?? []).map((path) => ({ type: "localImage", path }))],
         ...(options.model ? { model: options.model } : {}),
         ...(options.effort ? { effort: options.effort } : {}),
         ...(options.outputSchema ? { outputSchema: options.outputSchema } : {})

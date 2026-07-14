@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { claimedTaskSchema } from "./contracts.js";
+import { claimedTaskSchema, signalSchema } from "./contracts.js";
 
 function claim(botId: string) {
   return {
@@ -40,5 +40,31 @@ describe("claimedTaskSchema", () => {
 
   it("拒绝非规范 UUID，避免无效任务进入 Worker", () => {
     expect(claimedTaskSchema.safeParse(claim("legacy-bot")).success).toBe(false);
+  });
+});
+
+describe("signalSchema attachment compatibility", () => {
+  it("treats old control-plane signals without attachments as an empty array", () => {
+    const signal = signalSchema.parse({
+      id: "33333333-3333-4333-8333-333333333333",
+      taskId: "11111111-1111-4111-8111-111111111111",
+      seq: 1,
+      senderId: "ou_owner",
+      senderRole: "owner",
+      senderType: "user",
+      senderBotId: null,
+      senderDisplayName: null,
+      ingressSource: "lark",
+      originMessageId: "om_old",
+      botDialogueDepth: 0,
+      messageId: "om_old",
+      messageType: "text",
+      content: "legacy signal",
+      preview: "legacy signal",
+      priority: 90,
+      decision: "pending",
+      createdAt: new Date().toISOString()
+    });
+    expect(signal.attachments).toEqual([]);
   });
 });

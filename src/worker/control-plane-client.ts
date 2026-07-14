@@ -11,6 +11,12 @@ import {
   type WorkerModelCatalogEntry
 } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
+import { createWriteStream } from "node:fs";
+import { chmod, mkdir, rename, rm } from "node:fs/promises";
+import { dirname, extname } from "node:path";
+import { randomUUID } from "node:crypto";
+import { Readable, Transform } from "node:stream";
+import { pipeline } from "node:stream/promises";
 
 export class ControlPlaneClient {
   private sessionToken: string | null = null;
@@ -44,7 +50,16 @@ export class ControlPlaneClient {
   async claim(): Promise<ClaimedTask | null> {
     const response = await this.authorizedFetch("/v1/tasks/claim", { method: "POST" });
     if (response.status === 204) return null;
-    return claimedTaskSchema.parse(await jsonResponse(response));
+    const payload = await jsonResponse(response);
+    const record = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
+    return claimedTaskSchema.parse({
+      ...record,
+      attachmentPolicy: record.attachmentPolicy ?? {
+        maxBytes: this.config.attachmentMaxBytes,
+        taskMaxBytes: this.config.attachmentTaskMaxBytes,
+        retentionDays: this.config.attachmentRetentionDays
+      }
+    });
   }
 
   async reportModelCatalog(models: WorkerModelCatalogEntry[]): Promise<void> {
@@ -64,6 +79,44 @@ export class ControlPlaneClient {
     const response = await this.authorizedFetch(`/v1/tasks/${taskId}/signals?after_seq=${afterSeq}`, { headers: leaseHeaders(leaseToken) });
     const body = (await jsonResponse(response)) as { signals: unknown[] };
     return body.signals.map((signal) => signalSchema.parse(signal));
+  }
+
+  async downloadAttachment(task: ClaimedTask, signal: Signal, attachmentId: string, target: string, maxBytes: number): Promise<{ path: string; size: number }> {
+    const response = await this.authorizedFetch(
+      `/v1/tasks/${task.id}/signals/${signal.id}/attachments/${attachmentId}`,
+      { headers: leaseHeaders(task.leaseToken) }
+    );
+    if (!response.ok) {
+      const text = await response.text();
+      throw new AttachmentDownloadError(response.status === 413 ? "file_limit" : "download_failed", `control plane ${response.status}: ${text.slice(0, 500)}`);
+    }
+    const declared = Number(response.headers.get("content-length") ?? "0");
+    if (declared > maxBytes) {
+      await response.body?.cancel();
+      throw new AttachmentDownloadError("task_limit", "attachment would exceed the remaining task limit");
+    }
+    if (!response.body) throw new AttachmentDownloadError("download_failed", "control plane returned an empty attachment body");
+    const finalTarget = targetWithResponseExtension(target, response.headers.get("content-disposition"));
+    await mkdir(dirname(finalTarget), { recursive: true, mode: 0o700 });
+    const temporary = `${finalTarget}.${randomUUID()}.tmp`;
+    let bytes = 0;
+    try {
+      const source = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream<Uint8Array>);
+      const destination = createWriteStream(temporary, { flags: "wx", mode: 0o600 });
+      const counter = new Transform({
+        transform(chunk: Buffer, _encoding, callback) {
+          bytes += chunk.length;
+          callback(bytes > maxBytes ? new AttachmentDownloadError("task_limit", "attachment exceeded the remaining task limit") : null, chunk);
+        }
+      });
+      await pipeline(source, counter, destination);
+      await chmod(temporary, 0o600);
+      await rename(temporary, finalTarget);
+      return { path: finalTarget, size: bytes };
+    } catch (error) {
+      await rm(temporary, { force: true });
+      throw error;
+    }
   }
 
   async decideSignal(taskId: string, signalId: string, leaseToken: string, result: AttentionResult): Promise<void> {
@@ -146,6 +199,26 @@ export class ControlPlaneClient {
       response = await fetch(`${this.config.controlPlaneUrl}${path}`, { ...init, headers });
     }
     return response;
+  }
+}
+
+function targetWithResponseExtension(target: string, contentDisposition: string | null): string {
+  if (extname(target) || !contentDisposition) return target;
+  const encoded = contentDisposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  if (!encoded) return target;
+  let fileName = "";
+  try {
+    fileName = decodeURIComponent(encoded);
+  } catch {
+    return target;
+  }
+  const extension = extname(fileName);
+  return /^\.[A-Za-z0-9]{1,10}$/.test(extension) ? `${target}${extension.toLowerCase()}` : target;
+}
+
+export class AttachmentDownloadError extends Error {
+  constructor(readonly reason: "file_limit" | "task_limit" | "download_failed", message: string) {
+    super(message);
   }
 }
 

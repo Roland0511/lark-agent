@@ -53,6 +53,16 @@ export interface ResolvedWorkerConfig {
   capabilities: string[];
   runnerVersion: string;
   architecture: "arm64" | "x64";
+  attachmentMaxBytes: number;
+  attachmentTaskMaxBytes: number;
+  attachmentRetentionDays: number;
+}
+
+function positiveInteger(value: string | undefined, fallback: number, name: string): number {
+  if (value === undefined || value === "") return fallback;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${name} must be a positive integer`);
+  return parsed;
 }
 
 function tomlPathPart(value: string): string {
@@ -207,6 +217,9 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     workspaceRoots,
     capabilities,
     runnerVersion: raw.executor.runner_version,
-    architecture: process.arch === "arm64" ? "arm64" : "x64"
+    architecture: process.arch === "arm64" ? "arm64" : "x64",
+    attachmentMaxBytes: positiveInteger(env.ATTACHMENT_MAX_BYTES, 104_857_600, "ATTACHMENT_MAX_BYTES"),
+    attachmentTaskMaxBytes: positiveInteger(env.ATTACHMENT_TASK_MAX_BYTES, 209_715_200, "ATTACHMENT_TASK_MAX_BYTES"),
+    attachmentRetentionDays: positiveInteger(env.ATTACHMENT_RETENTION_DAYS, 7, "ATTACHMENT_RETENTION_DAYS")
   };
 }

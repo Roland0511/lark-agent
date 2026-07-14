@@ -1,5 +1,12 @@
 import type { LarkMessageDetails } from "../shared/contracts.js";
-import { runJsonCommand } from "./cli.js";
+import { lstat, mkdtemp, readdir, realpath, rm } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, sep } from "node:path";
+import { AppError } from "../shared/errors.js";
+import type { StoredAttachment } from "./attachments.js";
+import { sanitizeAttachmentFileName } from "./attachments.js";
+import { runCommand, runJsonCommand, type CommandResult } from "./cli.js";
 
 interface LarkEnvelope {
   data?: { items?: unknown[]; messages?: unknown[]; scopes?: unknown[]; message_id?: string; card_id?: string; has_more?: boolean; page_token?: string; name?: string };
@@ -39,6 +46,8 @@ function normalizeMessage(item: unknown): LarkMessageDetails | null {
         return { id: String(data.id ?? ""), idType: String(data.id_type ?? ""), name: String(data.name ?? "") };
       })
     : [];
+  const rawValue = body.content ?? value.content;
+  const rawContent = typeof rawValue === "string" ? rawValue : rawValue == null ? "" : JSON.stringify(rawValue);
   return {
     messageId,
     rootId: value.root_id ? String(value.root_id) : null,
@@ -48,7 +57,8 @@ function normalizeMessage(item: unknown): LarkMessageDetails | null {
     senderId: String(sender.id ?? value.sender_id ?? ""),
     senderType: String(sender.sender_type ?? value.sender_type ?? "unknown"),
     messageType: String(value.msg_type ?? value.message_type ?? "text"),
-    content: parseContent(body.content ?? value.content),
+    content: parseContent(rawValue),
+    rawContent,
     createTime: String(value.create_time ?? "0"),
     mentions
   };
@@ -64,7 +74,8 @@ export class LarkGateway {
   constructor(
     private readonly cliPath = "lark-cli",
     private readonly run: (command: string, args: string[]) => Promise<unknown> = runJsonCommand,
-    private readonly profileName?: string | null
+    private readonly profileName?: string | null,
+    private readonly runFile: (command: string, args: string[], env?: NodeJS.ProcessEnv, options?: { cwd?: string; maxOutputDirectory?: string; maxOutputBytes?: number }) => Promise<CommandResult> = runCommand
   ) {}
 
   private args(args: string[]): string[] {
@@ -100,6 +111,48 @@ export class LarkGateway {
     const message = messagesFromEnvelope(envelope)[0];
     if (!message) throw new Error(`message ${messageId} was not returned by Lark`);
     return message;
+  }
+
+  async downloadMessageResource(
+    messageId: string,
+    attachment: StoredAttachment,
+    maxBytes: number
+  ): Promise<{ path: string; size: number; fileName: string; stream: ReturnType<typeof createReadStream>; cleanup(): Promise<void> }> {
+    const directory = await mkdtemp(join(tmpdir(), "lark-agent-resource-"));
+    let cleaned = false;
+    const cleanup = async () => {
+      if (cleaned) return;
+      cleaned = true;
+      await rm(directory, { recursive: true, force: true });
+    };
+    try {
+      const requestedFileName = sanitizeAttachmentFileName(attachment.fileName, attachment.type === "image" ? "image" : "attachment");
+      const result = await this.runFile(this.cliPath, this.args([
+        "im", "+messages-resources-download",
+        "--message-id", messageId,
+        "--file-key", attachment.resourceKey,
+        "--type", attachment.type,
+        "--as", "bot",
+        "--output", requestedFileName
+      ]), process.env, { cwd: directory, maxOutputDirectory: directory, maxOutputBytes: maxBytes });
+      if (result.limitExceeded) throw new AppError("attachment exceeds the per-file limit", 413, "attachment_too_large");
+      if (result.exitCode !== 0) throw new AppError("Lark attachment download failed", 502, "attachment_download_failed");
+      const entries = (await readdir(directory, { withFileTypes: true })).filter((entry) => entry.isFile() && !entry.isSymbolicLink());
+      const selected = entries.find((entry) => entry.name === requestedFileName) ?? (entries.length === 1 ? entries[0] : null);
+      const fileName = selected ? sanitizeAttachmentFileName(selected.name, requestedFileName) : "";
+      const path = fileName ? await realpath(join(directory, fileName)).catch(() => "") : "";
+      const child = path ? relative(await realpath(directory), path) : "";
+      if (!path || !child || child === ".." || child.startsWith(`..${sep}`) || isAbsolute(child)) {
+        throw new AppError("Lark attachment output path is invalid", 502, "attachment_output_invalid");
+      }
+      const info = await lstat(path);
+      if (!info.isFile() || info.isSymbolicLink()) throw new AppError("Lark attachment output is not a regular file", 502, "attachment_output_invalid");
+      if (info.size > maxBytes) throw new AppError("attachment exceeds the per-file limit", 413, "attachment_too_large");
+      return { path, size: info.size, fileName, stream: createReadStream(path), cleanup };
+    } catch (error) {
+      await cleanup();
+      throw error;
+    }
   }
 
   async getChatName(chatId: string): Promise<string | null> {
