@@ -1,6 +1,6 @@
-import { access, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, realpath, rm, stat } from "node:fs/promises";
 import { constants } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { parse as parseYaml } from "yaml";
@@ -27,6 +27,7 @@ const configSchema = z.object({
     codex_binary: z.string().default("codex"),
     capacity: z.literal(1).default(1),
     app_launcher: z.string().optional(),
+    runtime_state_dir: z.string().optional(),
     workspace_roots: z.array(workspaceRootSchema).min(1),
     capabilities: z.array(z.string()).default(["codex", "app_handoff", "chat_context_v1"]),
     runner_version: z.string().min(1).max(128).default("development")
@@ -36,6 +37,7 @@ const configSchema = z.object({
 export interface ResolvedWorkerConfig {
   controlPlaneUrl: string;
   deviceToken: string;
+  deviceTokenEnvironmentName: string | null;
   executorId: string;
   displayName: string;
   codexHome: string;
@@ -47,8 +49,10 @@ export interface ResolvedWorkerConfig {
   codexBinary: string;
   codexVersion: string;
   configFingerprint: string;
+  workspaceMappingFingerprint: string;
   capacity: number;
   appLauncher: string | null;
+  runtimeStateDir: string;
   workspaceRoots: Array<{ alias: string; path: string }>;
   capabilities: string[];
   runnerVersion: string;
@@ -119,6 +123,13 @@ function continuationConfigFingerprint(input: {
   }));
 }
 
+export function workspaceMappingFingerprint(workspaceRoots: Array<{ alias: string; path: string }>): string {
+  const roots = workspaceRoots
+    .map(({ alias, path }) => [alias, path] as const)
+    .sort((left, right) => left[0] < right[0] ? -1 : left[0] > right[0] ? 1 : left[1] < right[1] ? -1 : left[1] > right[1] ? 1 : 0);
+  return sha256(JSON.stringify({ version: 1, roots }));
+}
+
 async function commandVersion(command: string, codexHome: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome };
@@ -154,7 +165,7 @@ async function protocolFingerprint(command: string, codexHome: string): Promise<
     });
     const clientSchema = await readFile(join(outputDir, "ClientRequest.json"), "utf8");
     const serverSchema = await readFile(join(outputDir, "ServerRequest.json"), "utf8");
-    for (const method of ["thread/start", "thread/resume", "thread/read", "turn/start", "turn/steer", "turn/interrupt"]) {
+    for (const method of ["thread/start", "thread/resume", "thread/read", "turn/start", "turn/steer", "turn/interrupt", "skills/list"]) {
       if (!clientSchema.includes(`\"${method}\"`)) throw new Error(`Codex App Server protocol is missing ${method}`);
     }
     for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"]) {
@@ -208,8 +219,32 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     appLauncher = await realpath(raw.executor.app_launcher);
     await access(appLauncher, constants.X_OK);
   }
-  const capabilities = [...new Set([...raw.executor.capabilities, "chat_context_v1"])]
+  const capabilities = [...new Set([
+    ...raw.executor.capabilities,
+    "chat_context_v1",
+    "skillhub_skills_v1",
+    "skill_runtime_config_v1",
+    "user_skills_inventory_v1",
+    "workspace_mapping_v1"
+  ])]
     .filter((value) => value !== "app_handoff" || appLauncher !== null);
+  const configuredRuntimeStateDir = raw.executor.runtime_state_dir ?? join(dirname(resolve(configFile)), "state");
+  if (!isAbsolute(configuredRuntimeStateDir)) throw new Error("executor.runtime_state_dir must be an absolute path");
+  for (const workspace of workspaceRoots) {
+    if (pathsOverlap(resolve(configuredRuntimeStateDir), workspace.path)) {
+      throw new Error(`executor.runtime_state_dir must not overlap workspace root ${workspace.alias}`);
+    }
+  }
+  await mkdir(configuredRuntimeStateDir, { recursive: true, mode: 0o700 });
+  const runtimeStateDir = await realpath(configuredRuntimeStateDir);
+  if (!(await stat(runtimeStateDir)).isDirectory()) throw new Error("executor.runtime_state_dir must be a directory");
+  for (const workspace of workspaceRoots) {
+    if (pathsOverlap(runtimeStateDir, workspace.path)) {
+      throw new Error(`executor.runtime_state_dir must not overlap workspace root ${workspace.alias}`);
+    }
+  }
+  await chmod(runtimeStateDir, 0o700);
+  await access(runtimeStateDir, constants.R_OK | constants.W_OK);
   const codexVersion = await commandVersion(raw.executor.codex_binary, codexHome);
   const protocolHash = await protocolFingerprint(raw.executor.codex_binary, codexHome);
   const overrides = profileOverrides(profileConfig);
@@ -229,9 +264,11 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     effectiveModelProvider,
     effectiveReasoningEffort
   });
+  const mappingFingerprint = workspaceMappingFingerprint(workspaceRoots);
   return {
     controlPlaneUrl: raw.control_plane.url.replace(/\/$/, ""),
     deviceToken,
+    deviceTokenEnvironmentName: raw.control_plane.device_token_file ? null : raw.control_plane.device_token_env,
     executorId: raw.executor.id,
     displayName: raw.executor.display_name,
     codexHome,
@@ -243,8 +280,10 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     codexBinary: raw.executor.codex_binary,
     codexVersion,
     configFingerprint,
+    workspaceMappingFingerprint: mappingFingerprint,
     capacity: raw.executor.capacity,
     appLauncher,
+    runtimeStateDir,
     workspaceRoots,
     capabilities,
     runnerVersion: raw.executor.runner_version,
@@ -253,4 +292,12 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     attachmentTaskMaxBytes: positiveInteger(env.ATTACHMENT_TASK_MAX_BYTES, 209_715_200, "ATTACHMENT_TASK_MAX_BYTES"),
     attachmentRetentionDays: positiveInteger(env.ATTACHMENT_RETENTION_DAYS, 7, "ATTACHMENT_RETENTION_DAYS")
   };
+}
+
+function pathsOverlap(first: string, second: string): boolean {
+  const isInside = (root: string, target: string) => {
+    const child = relative(resolve(root), resolve(target));
+    return child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child));
+  };
+  return isInside(first, second) || isInside(second, first);
 }

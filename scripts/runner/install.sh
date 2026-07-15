@@ -47,12 +47,17 @@ need curl; need tar; need shasum; need plutil; need launchctl; need openssl
 ARTIFACT_BASE="${ARTIFACT_BASE%/}"
 
 INSTALL_ROOT="$HOME/Library/Application Support/Lark Agent Runner"
-MANIFEST="$(mktemp -t lark-agent-runner-manifest).json"
-PAYLOAD="$(mktemp -t lark-agent-runner-payload).json"
-RESPONSE="$(mktemp -t lark-agent-runner-response).json"
+MANIFEST="$(mktemp -t lark-agent-runner-manifest)"
+PAYLOAD="$(mktemp -t lark-agent-runner-payload)"
+RESPONSE="$(mktemp -t lark-agent-runner-response)"
 STAGING=""
 ENROLLED=false
+UPGRADE_DRAIN_ACTIVE=false
+UPGRADE_DRAIN_TOKEN=""
 cleanup() {
+  if [[ "$UPGRADE_DRAIN_ACTIVE" == true ]]; then
+    end_upgrade_drain >/dev/null 2>&1 || true
+  fi
   rm -f "$MANIFEST" "$PAYLOAD" "$RESPONSE"
   [[ -z "$STAGING" ]] || rm -rf "$STAGING"
   if [[ "$ENROLLED" != true && -n "${INSTALL_DIR:-}" && -f "${CREDENTIAL_FILE:-}" ]]; then
@@ -61,15 +66,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-info "读取 Runner 发布清单"
-curl -fsSL --retry 2 --connect-timeout 8 "$ARTIFACT_BASE/runner/manifest.json" -o "$MANIFEST"
-VERSION="$(json_value "$MANIFEST" version)"
-WORKER_PATH="$(json_value "$MANIFEST" worker.path)"
-WORKER_SHA="$(json_value "$MANIFEST" worker.sha256)"
-MANAGER_PATH="$(json_value "$MANIFEST" manager.path)"
-MANAGER_SHA="$(json_value "$MANIFEST" manager.sha256)"
-NODE_PATH="$(json_value "$MANIFEST" node.$ARCH.path)"
-NODE_SHA="$(json_value "$MANIFEST" node.$ARCH.sha256)"
+load_manifest() {
+  info "读取 Runner 发布清单"
+  curl -fsSL --retry 2 --connect-timeout 8 "$ARTIFACT_BASE/runner/manifest.json" -o "$MANIFEST" || return 1
+  VERSION="$(optional_json_value "$MANIFEST" version '')"
+  WORKER_PATH="$(optional_json_value "$MANIFEST" worker.path '')"
+  WORKER_SHA="$(optional_json_value "$MANIFEST" worker.sha256 '')"
+  MANAGER_PATH="$(optional_json_value "$MANIFEST" manager.path '')"
+  MANAGER_SHA="$(optional_json_value "$MANIFEST" manager.sha256 '')"
+  NODE_PATH="$(optional_json_value "$MANIFEST" node.$ARCH.path '')"
+  NODE_SHA="$(optional_json_value "$MANIFEST" node.$ARCH.sha256 '')"
+  [[ -n "$VERSION" && -n "$WORKER_PATH" && -n "$WORKER_SHA" && -n "$MANAGER_PATH" && -n "$MANAGER_SHA" && -n "$NODE_PATH" && -n "$NODE_SHA" ]]
+}
 
 install_release() {
   local target="$1"
@@ -140,6 +148,63 @@ wait_online() {
   return 1
 }
 
+optional_json_value() {
+  local file="$1" key="$2" fallback="$3"
+  /usr/bin/plutil -extract "$key" raw -o - "$file" 2>/dev/null || print -r -- "$fallback"
+}
+
+assert_safe_to_upgrade() {
+  local server="$1" executor="$2" credential="$3" expected_drain_token="${4:-}"
+  typeset -a status_headers
+  status_headers=(-H "Authorization: Bearer $credential")
+  if [[ -n "$expected_drain_token" ]]; then
+    status_headers+=(-H "X-Upgrade-Drain-Token: $expected_drain_token")
+  fi
+  if ! curl -fsS --connect-timeout 3 --max-time 15 "${status_headers[@]}" \
+    "$server/v1/runner/status/$executor" -o "$RESPONSE"; then
+    fail "无法连接控制面确认执行器是否空闲，未执行升级"
+  fi
+  local active_tasks active_runtime_sync_jobs
+  active_tasks="$(optional_json_value "$RESPONSE" activeTasks invalid)"
+  # 0.4.0 之前的控制面没有该字段；缺失时按 0 处理以允许先升级控制面、再滚动升级 Runner。
+  active_runtime_sync_jobs="$(optional_json_value "$RESPONSE" activeRuntimeSyncJobs 0)"
+  [[ "$active_tasks" == <-> ]] || fail "控制面返回的活跃任务状态无效，未执行升级"
+  [[ "$active_runtime_sync_jobs" == <-> ]] || fail "控制面返回的技能同步状态无效，未执行升级"
+  (( active_tasks == 0 )) || fail "执行器仍有 $active_tasks 个活跃任务，完成后再升级"
+  (( active_runtime_sync_jobs == 0 )) || fail "执行器仍有 $active_runtime_sync_jobs 个活跃技能同步任务，完成后再升级"
+  if [[ -n "$expected_drain_token" ]]; then
+    local upgrade_draining upgrade_drain_owned
+    upgrade_draining="$(optional_json_value "$RESPONSE" upgradeDraining false)"
+    upgrade_drain_owned="$(optional_json_value "$RESPONSE" upgradeDrainOwned false)"
+    [[ "$upgrade_draining" == true && "$upgrade_drain_owned" == true ]] || fail "控制面升级排空状态已失效，未切换或重启 Runner"
+  fi
+}
+
+begin_upgrade_drain() {
+  local server="$1" executor="$2" credential="$3" token
+  if ! curl -fsS --connect-timeout 3 --max-time 15 -X POST \
+    -H "Authorization: Bearer $credential" \
+    "$server/v1/runner/upgrade-drain/$executor" -o "$RESPONSE"; then
+    fail "控制面无法锁定升级排空状态，未执行升级"
+  fi
+  token="$(optional_json_value "$RESPONSE" drainToken '')"
+  [[ -n "$token" ]] || fail "控制面没有返回升级排空凭据，未执行升级"
+  UPGRADE_DRAIN_TOKEN="$token"
+  UPGRADE_DRAIN_ACTIVE=true
+}
+
+end_upgrade_drain() {
+  [[ "$UPGRADE_DRAIN_ACTIVE" == true ]] || return 0
+  if ! curl -fsS --connect-timeout 3 --max-time 15 -X DELETE \
+    -H "Authorization: Bearer $CREDENTIAL" \
+    -H "X-Upgrade-Drain-Token: $UPGRADE_DRAIN_TOKEN" \
+    "$CONTROL_PLANE_URL/v1/runner/upgrade-drain/$EXECUTOR_ID" -o "$RESPONSE"; then
+    return 1
+  fi
+  UPGRADE_DRAIN_ACTIVE=false
+  UPGRADE_DRAIN_TOKEN=""
+}
+
 if [[ "$UPGRADE" == true ]]; then
   typeset -a installs
   installs=("$INSTALL_ROOT"/*(N/))
@@ -165,7 +230,16 @@ if [[ "$UPGRADE" == true ]]; then
   CREDENTIAL="$(<"$CREDENTIAL_FILE")"
   ENROLLED=true
   PREVIOUS_RUNNER_VERSION="$(sed -n "s/^  runner_version: '\(.*\)'$/\1/p" "$INSTALL_DIR/config.yaml" | head -1)"
+  assert_safe_to_upgrade "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL"
+  # 事务内切入 maintenance 并复核空闲；此后控制面不会再向该执行器分配新任务或同步作业。
+  begin_upgrade_drain "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL"
+  if ! load_manifest; then
+    end_upgrade_drain || true
+    fail "Runner 发布清单无法读取或字段不完整，未执行升级"
+  fi
   install_release "$INSTALL_DIR"
+  # 下载期间可能接到新任务；切换版本和重启前再次确认，避免中断刚开始的工作。
+  assert_safe_to_upgrade "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL" "$UPGRADE_DRAIN_TOKEN"
   install_manager
   update_config_runner_version "$INSTALL_DIR/config.yaml" "$VERSION"
   PREVIOUS="$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)"
@@ -176,6 +250,7 @@ if [[ "$UPGRADE" == true ]]; then
     restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || true
     fail "新版本启动失败，已回滚到上一版本；请查看 $INSTALL_DIR/logs/worker.err.log"
   fi
+  end_upgrade_drain || fail "Runner 已升级并上线，但控制面升级排空状态解除失败；执行器会保持维护模式，请在后台核查后重新启用"
   info "执行器 $EXECUTOR_ID 已升级到 $VERSION"
   info "运行 lark-agent-runner help 可查看本机管理命令"
   exit 0
@@ -242,6 +317,7 @@ LAUNCHD_LABEL="io.github.lark-agent.runner.$EXECUTOR_ID"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 mkdir -p "$INSTALL_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 chmod 700 "$INSTALL_DIR"
+load_manifest || fail "Runner 发布清单无法读取或字段不完整"
 install_release "$INSTALL_DIR"
 install_manager
 ln -sfn "versions/$VERSION" "$INSTALL_DIR/current"
@@ -256,11 +332,15 @@ ln -sfn "versions/$VERSION" "$INSTALL_DIR/current"
   print "  codex_home: $(yaml_quote "$CODEX_HOME_VALUE")"
   print "  codex_profile: $(yaml_quote "$PROFILE")"
   print "  codex_binary: $(yaml_quote "$CODEX_BIN")"
+  print "  runtime_state_dir: $(yaml_quote "$INSTALL_DIR/state")"
   print "  runner_version: $(yaml_quote "$VERSION")"
   print "  capacity: 1"
   print "  capabilities:"
   print "    - codex"
   print "    - chat_context_v1"
+  print "    - skillhub_skills_v1"
+  print "    - skill_runtime_config_v1"
+  print "    - user_skills_inventory_v1"
   print "  workspace_roots:"
   typeset -A used_aliases
   for workspace in "${CANONICAL_WORKSPACES[@]}"; do

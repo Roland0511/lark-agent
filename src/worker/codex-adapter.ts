@@ -30,6 +30,32 @@ export type ItemHandler = (item: Record<string, unknown>) => Promise<void>;
 export type CommentaryHandler = (update: { itemId: string; text: string; ordinal: number }) => Promise<void>;
 export type ActivityHandler = (method: string, params: Record<string, unknown>) => void;
 
+export interface CodexSkillMetadata {
+  name: string;
+  description: string;
+  path: string;
+  scope: "user" | "repo" | "system" | "admin";
+  enabled: boolean;
+  shortDescription: string | null;
+  interface: {
+    displayName: string | null;
+    shortDescription: string | null;
+  } | null;
+  dependencies: Array<{ type: string; value: string; description: string | null }>;
+}
+
+export interface CodexSkillsListEntry {
+  cwd: string;
+  skills: CodexSkillMetadata[];
+  errors: Array<{ path: string; message: string }>;
+}
+
+interface CodexAdapterOptions {
+  environment?: NodeJS.ProcessEnv;
+  shellEnvironmentAllowlist?: string[];
+  redactStderr?: (chunk: string) => string;
+}
+
 export class CodexAdapter {
   private child: ChildProcessWithoutNullStreams | null = null;
   private nextId = 1;
@@ -41,26 +67,42 @@ export class CodexAdapter {
     private readonly approvalHandler: ApprovalHandler,
     private readonly itemHandler?: ItemHandler,
     private readonly commentaryHandler?: CommentaryHandler,
-    private readonly activityHandler?: ActivityHandler
+    private readonly activityHandler?: ActivityHandler,
+    private readonly options: CodexAdapterOptions = {}
   ) {}
 
   async start(): Promise<void> {
     if (this.child) return;
-    const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: this.config.codexHome };
+    const env: NodeJS.ProcessEnv = { ...(this.options.environment ?? process.env), CODEX_HOME: this.config.codexHome };
     delete env.CODEX_SQLITE_HOME;
-    const child = spawn(this.config.codexBinary, ["app-server", ...this.config.profileOverrides.flatMap((value) => ["-c", value]), "--stdio"], {
+    const environmentPolicyOverrides = this.options.shellEnvironmentAllowlist
+      ? [
+          'shell_environment_policy.inherit="all"',
+          "shell_environment_policy.ignore_default_excludes=true",
+          `shell_environment_policy.include_only=${JSON.stringify([...new Set(this.options.shellEnvironmentAllowlist)].sort())}`
+        ]
+      : [];
+    const child = spawn(this.config.codexBinary, [
+      "app-server",
+      ...this.config.profileOverrides.flatMap((value) => ["-c", value]),
+      ...environmentPolicyOverrides.flatMap((value) => ["-c", value]),
+      "--stdio"
+    ], {
       env,
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.child = child;
     child.stderr.setEncoding("utf8");
-    child.stderr.on("data", (chunk: string) => process.stderr.write(`[codex:${this.config.executorId}] ${chunk}`));
+    child.stderr.on("data", (chunk: string) => {
+      const safeChunk = this.options.redactStderr ? this.options.redactStderr(chunk) : chunk;
+      process.stderr.write(`[codex:${this.config.executorId}] ${safeChunk}`);
+    });
     child.once("error", (error) => this.failAll(error));
     child.once("close", (code) => this.failAll(new Error(`Codex App Server exited ${code ?? -1}`)));
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.3.0" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.0" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -183,6 +225,58 @@ export class CodexAdapter {
       cursor = result.nextCursor ?? null;
     } while (cursor);
     return models;
+  }
+
+  async listSkills(cwds: string[], forceReload = true): Promise<CodexSkillsListEntry[]> {
+    const result = await this.request("skills/list", { cwds, forceReload }) as { data?: unknown[] };
+    return (result.data ?? []).map((rawEntry) => {
+      const entry = rawEntry && typeof rawEntry === "object" ? rawEntry as Record<string, unknown> : {};
+      const skills = Array.isArray(entry.skills) ? entry.skills : [];
+      const errors = Array.isArray(entry.errors) ? entry.errors : [];
+      return {
+        cwd: String(entry.cwd ?? ""),
+        skills: skills.flatMap((rawSkill): CodexSkillMetadata[] => {
+          if (!rawSkill || typeof rawSkill !== "object") return [];
+          const skill = rawSkill as Record<string, unknown>;
+          const scope = skill.scope;
+          if (scope !== "user" && scope !== "repo" && scope !== "system" && scope !== "admin") return [];
+          const skillInterface = skill.interface && typeof skill.interface === "object"
+            ? skill.interface as Record<string, unknown>
+            : null;
+          const dependencies = skill.dependencies && typeof skill.dependencies === "object"
+            ? (skill.dependencies as Record<string, unknown>).tools
+            : null;
+          return [{
+            name: String(skill.name ?? ""),
+            description: String(skill.description ?? ""),
+            path: String(skill.path ?? ""),
+            scope,
+            enabled: skill.enabled === true,
+            shortDescription: typeof skill.shortDescription === "string" ? skill.shortDescription : null,
+            interface: skillInterface ? {
+              displayName: typeof skillInterface.displayName === "string" ? skillInterface.displayName : null,
+              shortDescription: typeof skillInterface.shortDescription === "string" ? skillInterface.shortDescription : null
+            } : null,
+            dependencies: Array.isArray(dependencies) ? dependencies.flatMap((rawDependency): CodexSkillMetadata["dependencies"] => {
+              if (!rawDependency || typeof rawDependency !== "object") return [];
+              const dependency = rawDependency as Record<string, unknown>;
+              const type = String(dependency.type ?? "").trim();
+              const value = String(dependency.value ?? "").trim();
+              return type && value ? [{
+                type,
+                value,
+                description: typeof dependency.description === "string" ? dependency.description : null
+              }] : [];
+            }) : []
+          }];
+        }),
+        errors: errors.flatMap((rawError) => {
+          if (!rawError || typeof rawError !== "object") return [];
+          const error = rawError as Record<string, unknown>;
+          return [{ path: String(error.path ?? ""), message: String(error.message ?? "skill discovery failed") }];
+        })
+      };
+    });
   }
 
   private async startEphemeralThread(cwd: string, model: string | null): Promise<string> {

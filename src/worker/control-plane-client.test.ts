@@ -14,6 +14,7 @@ const config = {
   homeRef: "worker-a:home",
   codexProfile: "lark-agent",
   configFingerprint: "a".repeat(64),
+  workspaceMappingFingerprint: "c".repeat(64),
   codexVersion: "test",
   capacity: 1,
   workspaceRoots: [{ alias: "repo", path: "/tmp" }],
@@ -30,6 +31,22 @@ function sessionResponse(): Response {
 }
 
 afterEach(() => vi.unstubAllGlobals());
+
+describe("ControlPlaneClient registration", () => {
+  it("reports the independent workspace mapping fingerprint when creating a session", async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(sessionResponse());
+    vi.stubGlobal("fetch", fetchMock);
+
+    await new ControlPlaneClient(config).createSession();
+
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toMatchObject({
+      configFingerprint: config.configFingerprint,
+      workspaceMappingFingerprint: config.workspaceMappingFingerprint,
+      capabilities: config.capabilities
+    });
+  });
+});
 
 describe("ControlPlaneClient attachment download", () => {
   it("atomically writes a bounded response with file mode 0600", async () => {
@@ -74,5 +91,82 @@ describe("ControlPlaneClient attachment download", () => {
     await expect(new ControlPlaneClient(config).downloadAttachment(task, signal, "55555555-5555-4555-8555-555555555555", join(directory, "too-large.txt"), 100))
       .rejects.toMatchObject<Partial<AttachmentDownloadError>>({ reason: "file_limit" });
     expect(await readdir(directory)).toEqual([]);
+  });
+});
+
+describe("ControlPlaneClient workspace runtime sync protocol", () => {
+  it.each([404, 405])("keeps claiming ordinary tasks when an older control plane returns %s for runtime sync", async (status) => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sessionResponse())
+      .mockResolvedValueOnce(new Response(null, { status }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ControlPlaneClient(config);
+
+    await expect(client.claimWorkspaceRuntimeSync()).resolves.toBeNull();
+    await expect(client.claim()).resolves.toBeNull();
+    expect(fetchMock.mock.calls[2]?.[0]).toBe("https://agent.example.test/v1/tasks/claim");
+  });
+
+  it("uses the dedicated sync lease and returns the desired fingerprint on completion", async () => {
+    const job = {
+      id: "77777777-7777-4777-8777-777777777777",
+      botAppId: "cli_test",
+      chatContextId: "88888888-8888-4888-8888-888888888888",
+      workspaceKey: "88888888-8888-4888-8888-888888888888",
+      resolvedWorkspaceAlias: "repo",
+      leaseToken: "sync-lease",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      desiredFingerprint: "d".repeat(64),
+      skills: [],
+      skillSetFingerprint: "0".repeat(64),
+      runtimeConfig: { fingerprint: "0".repeat(64), files: [] }
+    };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sessionResponse())
+      .mockResolvedValueOnce(Response.json(job))
+      .mockResolvedValueOnce(Response.json({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() }))
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ControlPlaneClient(config);
+    const claimed = await client.claimWorkspaceRuntimeSync();
+    expect(claimed).toMatchObject({ id: job.id, desiredFingerprint: job.desiredFingerprint });
+    await expect(client.heartbeatWorkspaceRuntimeSync(claimed!)).resolves.toHaveProperty("leaseExpiresAt");
+    await client.completeWorkspaceRuntimeSync(claimed!, {
+      status: "applied",
+      summary: "synced",
+      desiredFingerprint: job.desiredFingerprint,
+      skillSetFingerprint: job.skillSetFingerprint,
+      runtimeConfigFingerprint: job.runtimeConfig.fingerprint,
+      files: []
+    });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("https://agent.example.test/v1/workers/runtime-sync-jobs/claim");
+    const heartbeatRequest = fetchMock.mock.calls[2]?.[1] as RequestInit;
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(`https://agent.example.test/v1/workers/runtime-sync-jobs/${job.id}/heartbeat`);
+    expect(new Headers(heartbeatRequest.headers).get("x-sync-lease-token")).toBe("sync-lease");
+    const resultRequest = fetchMock.mock.calls[3]?.[1] as RequestInit;
+    expect(fetchMock.mock.calls[3]?.[0]).toBe(`https://agent.example.test/v1/workers/runtime-sync-jobs/${job.id}/result`);
+    expect(new Headers(resultRequest.headers).get("x-sync-lease-token")).toBe("sync-lease");
+    expect(JSON.parse(String(resultRequest.body))).toMatchObject({ desiredFingerprint: job.desiredFingerprint });
+  });
+});
+
+describe("ControlPlaneClient task runtime reporting", () => {
+  it("reports a fail-closed runtime error under the task lease", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sessionResponse())
+      .mockResolvedValueOnce(Response.json({ ok: true }));
+    vi.stubGlobal("fetch", fetchMock);
+    await new ControlPlaneClient(config).reportRuntimeFailure(task, {
+      skillSetFingerprint: "a".repeat(64),
+      runtimeConfigFingerprint: "b".repeat(64),
+      code: "runtime_file_drift",
+      summary: "配置文件与工作区现状冲突",
+      targetPath: ".env"
+    });
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(`https://agent.example.test/v1/tasks/${task.id}/runtime-snapshot/failure`);
+    const request = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    expect(new Headers(request.headers).get("x-lease-token")).toBe("lease-token");
+    expect(JSON.parse(String(request.body))).toMatchObject({ code: "runtime_file_drift", targetPath: ".env" });
   });
 });

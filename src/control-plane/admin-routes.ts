@@ -12,6 +12,7 @@ import type { RuntimeStatus } from "./runtime-status.js";
 import type { BotGatewayRegistry } from "./bot-runtime.js";
 import { publicAttachments } from "../lark/attachments.js";
 import { effectiveWorkerDisplayName, publicWorkerDisplayName } from "./worker-display-name.js";
+import { lockExecutorClaim } from "./executor-claim-lock.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -332,18 +333,25 @@ export function registerAdminRoutes(
     requireCsrf(request, principal);
     const body = workerCommandSchema.parse(request.body);
     if (body.command === "revoke_credentials") {
-      const worker = await db.selectFrom("workers").select("executor_id").where("executor_id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
-      if (!worker) throw new AppError("执行器不存在", 404, "not_found");
-      const result = await db.updateTable("worker_device_credentials").set({ revoked_at: new Date() })
-        .where("executor_id", "=", request.params.id).where("revoked_at", "is", null).executeTakeFirst();
-      if (!result.numUpdatedRows) throw new AppError("执行器没有可撤销的设备凭据", 409, "credential_not_active");
-      await db.updateTable("workers").set({ operational_mode: "disabled", status: "offline", updated_at: new Date() })
-        .where("executor_id", "=", request.params.id).execute();
+      await db.transaction().execute(async (trx) => {
+        await lockExecutorClaim(trx, request.params.id);
+        const worker = await trx.selectFrom("workers").select("executor_id")
+          .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).forUpdate().executeTakeFirst();
+        if (!worker) throw new AppError("执行器不存在", 404, "not_found");
+        const result = await trx.updateTable("worker_device_credentials").set({ revoked_at: new Date() })
+          .where("executor_id", "=", request.params.id).where("revoked_at", "is", null).executeTakeFirst();
+        if (!result.numUpdatedRows) throw new AppError("执行器没有可撤销的设备凭据", 409, "credential_not_active");
+        await trx.updateTable("workers").set({
+          operational_mode: "disabled", status: "offline", upgrade_drain_token_hash: null, upgrade_drain_previous_mode: null, updated_at: new Date()
+        }).where("executor_id", "=", request.params.id).execute();
+      });
       events.publish("worker", request.params.id);
       return { ok: true, operationalMode: "disabled", credentialsRevoked: true };
     }
     const mode = body.command === "enable" ? "enabled" : body.command === "disable" ? "disabled" : "maintenance";
-    const updated = await db.updateTable("workers").set({ operational_mode: mode, updated_at: new Date() })
+    const updated = await db.updateTable("workers").set({
+      operational_mode: mode, upgrade_drain_token_hash: null, upgrade_drain_previous_mode: null, updated_at: new Date()
+    })
       .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).returning("executor_id").executeTakeFirst();
     if (!updated) throw new AppError("执行器不存在", 404, "not_found");
     events.publish("worker", request.params.id);
@@ -355,6 +363,7 @@ export function registerAdminRoutes(
     requireCsrf(request, principal);
     const now = new Date();
     await db.transaction().execute(async (trx) => {
+      await lockExecutorClaim(trx, request.params.id);
       const worker = await trx.selectFrom("workers").select(["executor_id", "operational_mode"])
         .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).forUpdate().executeTakeFirst();
       if (!worker) throw new AppError("执行器不存在", 404, "not_found");
@@ -363,6 +372,9 @@ export function registerAdminRoutes(
         .where("executor_id", "=", request.params.id).where("state", "not in", ["completed", "failed", "cancelled"])
         .executeTakeFirstOrThrow();
       if (unfinished.count > 0) throw new AppError("执行器仍有关联的未结束任务，不能删除", 409, "worker_has_active_tasks");
+      const unfinishedRuntimeSync = await trx.selectFrom("skill_file_sync_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "in", ["queued", "running"]).executeTakeFirstOrThrow();
+      if (unfinishedRuntimeSync.count > 0) throw new AppError("执行器仍有关联的未结束技能同步任务，不能删除", 409, "worker_has_active_runtime_sync");
       await trx.updateTable("worker_device_credentials").set({ revoked_at: now })
         .where("executor_id", "=", request.params.id).where("revoked_at", "is", null).execute();
       await trx.updateTable("workers").set({ deleted_at: now, status: "offline", updated_at: now })

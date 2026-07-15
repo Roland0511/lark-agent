@@ -32,29 +32,33 @@ describe("聊天记忆管理接口脱敏", () => {
   it("恢复检查全部通过时只返回人类可读结论，不回显身份值", () => {
     const sensitiveHome = "/private/runner/.codex";
     const sensitiveFingerprint = "f".repeat(64);
+    const sensitiveMappingFingerprint = "e".repeat(64);
     const checks = buildChatContextRecoveryChecks({
       codex_thread_id: "thread-1",
       executor_id: "worker-a",
       executor_home_ref: sensitiveHome,
       executor_profile: "private-profile",
       executor_config_fingerprint: sensitiveFingerprint,
+      executor_workspace_mapping_fingerprint: sensitiveMappingFingerprint,
       workspace_root_alias: "private-workspace"
     }, {
       executor_id: "worker-a",
       home_ref: sensitiveHome,
       codex_profile: "private-profile",
       config_fingerprint: sensitiveFingerprint,
+      workspace_mapping_fingerprint: sensitiveMappingFingerprint,
       workspace_aliases: ["private-workspace"],
-      capabilities: ["codex", "chat_context_v1"],
+      capabilities: ["codex", "chat_context_v1", "workspace_mapping_v1"],
       operational_mode: "enabled",
       deleted_at: null
     });
 
-    expect(checks).toHaveLength(8);
+    expect(checks).toHaveLength(9);
     expect(checks.every((item) => item.state === "pass")).toBe(true);
     const publicResult = JSON.stringify(checks);
     expect(publicResult).not.toContain(sensitiveHome);
     expect(publicResult).not.toContain(sensitiveFingerprint);
+    expect(publicResult).not.toContain(sensitiveMappingFingerprint);
     expect(publicResult).not.toContain("private-profile");
     expect(publicResult).not.toContain("private-workspace");
   });
@@ -66,12 +70,14 @@ describe("聊天记忆管理接口脱敏", () => {
       executor_home_ref: "old-home",
       executor_profile: "old-profile",
       executor_config_fingerprint: "old-fingerprint",
+      executor_workspace_mapping_fingerprint: "old-mapping",
       workspace_root_alias: "old-workspace"
     }, {
       executor_id: "worker-a",
       home_ref: "new-home",
       codex_profile: "new-profile",
       config_fingerprint: "new-fingerprint",
+      workspace_mapping_fingerprint: "new-mapping",
       workspace_aliases: ["new-workspace"],
       capabilities: ["codex"],
       operational_mode: "maintenance",
@@ -79,7 +85,7 @@ describe("聊天记忆管理接口脱敏", () => {
     });
 
     expect(checks.filter((item) => item.state === "fail").map((item) => item.key)).toEqual([
-      "claimable", "capability", "homeIdentity", "profile", "workspaceAlias", "configFingerprint"
+      "claimable", "capability", "homeIdentity", "profile", "workspaceAlias", "workspaceMapping", "configFingerprint"
     ]);
   });
 
@@ -91,6 +97,7 @@ describe("聊天记忆管理接口脱敏", () => {
       executor_home_ref: null,
       executor_profile: null,
       executor_config_fingerprint: null,
+      executor_workspace_mapping_fingerprint: null,
       workspace_root_alias: null
     }, null);
 

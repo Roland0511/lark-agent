@@ -24,7 +24,7 @@ COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/admin-dist ./admin-dist
-RUN mkdir -p /home/agent/.lark-cli \
+RUN mkdir -p /home/agent/.lark-cli /home/agent/.lark-agent/skillhub-cache \
   && chown -R agent:agent /app /home/agent
 USER agent
 ENV HOME=/home/agent

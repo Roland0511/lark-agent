@@ -110,10 +110,15 @@ json_value() {
 assert_safe_to_interrupt() {
   [[ "${FORCE:-false}" == true ]] && return
   fetch_status || fail "无法连接控制面确认活跃任务；如需强制操作请增加 --force"
-  local active
+  local active active_runtime_sync_jobs
   active="$(json_value "$STATUS_FILE" activeTasks 0)"
+  # 旧控制面没有 activeRuntimeSyncJobs；缺失时按 0 兼容滚动升级。
+  active_runtime_sync_jobs="$(json_value "$STATUS_FILE" activeRuntimeSyncJobs 0)"
   rm -f "$STATUS_FILE"; STATUS_FILE=""
+  [[ "$active" == <-> ]] || fail "控制面返回的活跃任务状态无效"
+  [[ "$active_runtime_sync_jobs" == <-> ]] || fail "控制面返回的技能同步状态无效"
   (( active == 0 )) || fail "执行器仍有 $active 个活跃任务，请等待完成；如需中断请增加 --force"
+  (( active_runtime_sync_jobs == 0 )) || fail "执行器仍有 $active_runtime_sync_jobs 个活跃技能同步任务，请等待完成；如需中断请增加 --force"
 }
 
 wait_online() {
@@ -202,6 +207,7 @@ case "$COMMAND" in
       print -- "控制面：$(json_value "$STATUS_FILE" online false | sed 's/true/在线/;s/false/离线/')"
       print -- "运行模式：$(json_value "$STATUS_FILE" operationalMode unknown)"
       print -- "活跃任务：$(json_value "$STATUS_FILE" activeTasks 0)"
+      print -- "活跃技能同步：$(json_value "$STATUS_FILE" activeRuntimeSyncJobs 0)"
       print -- "总工作区：$(json_value "$STATUS_FILE" workspaceAliasesText '')"
       print -- "专属目录：每个机器人使用 <总工作区>/<App ID>/"
       rm -f "$STATUS_FILE"; STATUS_FILE=""
@@ -235,10 +241,7 @@ case "$COMMAND" in
     tail "${tail_args[@]}" "${log_files[@]}"
     ;;
   uninstall)
-    fetch_status || fail "无法连接控制面，未执行卸载，以免留下有效设备凭据"
-    active="$(json_value "$STATUS_FILE" activeTasks 0)"
-    rm -f "$STATUS_FILE"; STATUS_FILE=""
-    (( active == 0 )) || fail "执行器仍有 $active 个活跃任务，完成后再卸载"
+    assert_safe_to_interrupt
     response="$(mktemp -t lark-agent-runner-uninstall).json"
     if ! api_request DELETE "/v1/runner/credentials/current" "$response"; then
       rm -f "$response"

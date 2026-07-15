@@ -16,6 +16,9 @@ describe("control plane config", () => {
     expect(config.attachmentMaxBytes).toBe(104_857_600);
     expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
     expect(config.attachmentRetentionDays).toBe(7);
+    expect(config.skillhubRegistryUrl).toBe("");
+    expect(config.skillhubApiToken).toBe("");
+    expect(config.skillRuntimeEncryptionKeys).toBe("");
   });
 
   it("still accepts bootstrap settings for a fresh installation", () => {

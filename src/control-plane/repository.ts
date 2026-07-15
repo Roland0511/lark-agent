@@ -1,8 +1,9 @@
-import { sql, type Kysely } from "kysely";
+import { sql, type Kysely, type Transaction } from "kysely";
 import type { Database, Task } from "../db/types.js";
 import type { AuthorizationGrant, InboxDecision, WorkerRegistration } from "../shared/contracts.js";
 import { randomToken, sha256 } from "../shared/crypto.js";
 import { AppError } from "../shared/errors.js";
+import { executorHasClaimCapacity, lockExecutorClaim } from "./executor-claim-lock.js";
 import { authorizationFromMessage } from "./policy.js";
 
 export interface TaskLeaseGuard {
@@ -10,72 +11,128 @@ export interface TaskLeaseGuard {
   leaseToken: string;
 }
 
+interface WorkerRegistrationOptions {
+  statusOnInsert: string;
+  statusOnUpdate?: string;
+  restoreDeleted?: boolean;
+}
+
+export async function upsertWorkerRegistration(
+  db: Transaction<Database>,
+  registration: WorkerRegistration,
+  options: WorkerRegistrationOptions
+): Promise<void> {
+  const now = new Date();
+  const mappingFingerprint = registration.workspaceMappingFingerprint ?? null;
+  await sql`select pg_advisory_xact_lock(hashtext(${`worker-registration:${registration.executorId}`}))`.execute(db);
+  const previous = await db.selectFrom("workers")
+    .select(["config_fingerprint", "workspace_mapping_fingerprint"])
+    .where("executor_id", "=", registration.executorId)
+    .executeTakeFirst();
+
+  await db.insertInto("workers").values({
+    executor_id: registration.executorId,
+    display_name: registration.displayName,
+    home_ref: registration.homeRef,
+    codex_profile: registration.codexProfile,
+    config_fingerprint: registration.configFingerprint,
+    workspace_mapping_fingerprint: mappingFingerprint,
+    codex_version: registration.codexVersion,
+    capacity: registration.capacity,
+    workspace_aliases: JSON.stringify(registration.workspaceAliases),
+    capabilities: JSON.stringify(registration.capabilities),
+    runner_version: registration.runnerVersion ?? null,
+    architecture: registration.architecture ?? null,
+    registration_source: registration.registrationSource ?? "quick_install",
+    status: options.statusOnInsert,
+    deleted_at: null,
+    last_seen_at: now,
+    updated_at: now
+  }).onConflict((conflict) => conflict.column("executor_id").doUpdateSet({
+    display_name: registration.displayName,
+    home_ref: registration.homeRef,
+    codex_profile: registration.codexProfile,
+    config_fingerprint: registration.configFingerprint,
+    workspace_mapping_fingerprint: mappingFingerprint ?? sql`workers.workspace_mapping_fingerprint`,
+    codex_version: registration.codexVersion,
+    capacity: registration.capacity,
+    workspace_aliases: JSON.stringify(registration.workspaceAliases),
+    capabilities: JSON.stringify(registration.capabilities),
+    runner_version: registration.runnerVersion ?? null,
+    architecture: registration.architecture ?? null,
+    registration_source: registration.registrationSource ?? "quick_install",
+    ...(options.statusOnUpdate ? { status: options.statusOnUpdate } : {}),
+    ...(options.restoreDeleted ? { deleted_at: null } : {}),
+    last_seen_at: now,
+    updated_at: now
+  })).execute();
+
+  if (mappingFingerprint && previous?.workspace_mapping_fingerprint === null) {
+    await db.updateTable("tasks").set({ executor_workspace_mapping_fingerprint: mappingFingerprint, updated_at: now })
+      .where("executor_id", "=", registration.executorId)
+      .where("executor_workspace_mapping_fingerprint", "is", null)
+      .where("executor_home_ref", "=", registration.homeRef)
+      .where("executor_profile", "=", registration.codexProfile)
+      .where("executor_config_fingerprint", "=", registration.configFingerprint)
+      .execute();
+    await db.updateTable("chat_contexts").set({ executor_workspace_mapping_fingerprint: mappingFingerprint, updated_at: now })
+      .where("executor_id", "=", registration.executorId)
+      .where("executor_workspace_mapping_fingerprint", "is", null)
+      .where("executor_home_ref", "=", registration.homeRef)
+      .where("executor_profile", "=", registration.codexProfile)
+      .where("executor_config_fingerprint", "=", registration.configFingerprint)
+      .execute();
+  }
+
+  if (mappingFingerprint && previous?.workspace_mapping_fingerprint && previous.workspace_mapping_fingerprint !== mappingFingerprint) {
+    await db.updateTable("tasks").set({
+      state: "waiting_input",
+      revision: sql`revision + 1`,
+      summary: "执行器工作区映射已变化，需要主人确认",
+      lease_token_hash: null,
+      lease_expires_at: null,
+      updated_at: now
+    }).where("executor_id", "=", registration.executorId)
+      .where("executor_workspace_mapping_fingerprint", "is distinct from", mappingFingerprint)
+      .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
+      .execute();
+    await db.updateTable("chat_contexts").set({
+      state: "blocked",
+      blocked_reason: "固定执行器的工作区映射已变化，需要主人确认",
+      updated_at: now
+    }).where("executor_id", "=", registration.executorId)
+      .where("codex_thread_id", "is not", null)
+      .where("executor_workspace_mapping_fingerprint", "is distinct from", mappingFingerprint)
+      .execute();
+  }
+
+  await db.updateTable("tasks")
+    .set({ state: "waiting_input", revision: sql`revision + 1`, summary: "执行器 CODEX_HOME/profile 配置指纹已变化，需要主人确认", lease_token_hash: null, lease_expires_at: null, updated_at: now })
+    .where("executor_id", "=", registration.executorId)
+    .where("executor_config_fingerprint", "is not", null)
+    .where("executor_config_fingerprint", "!=", registration.configFingerprint)
+    .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
+    .execute();
+  await db.updateTable("chat_contexts")
+    .set({ state: "blocked", blocked_reason: "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认", updated_at: now })
+    .where("executor_id", "=", registration.executorId)
+    .where("codex_thread_id", "is not", null)
+    .where((eb) => eb.or([
+      eb("executor_home_ref", "is distinct from", registration.homeRef),
+      eb("executor_profile", "is distinct from", registration.codexProfile),
+      eb("executor_config_fingerprint", "is distinct from", registration.configFingerprint)
+    ]))
+    .execute();
+}
+
 export class ControlPlaneRepository {
   constructor(private readonly db: Kysely<Database>, private readonly leaseSeconds: number) {}
 
   async upsertWorker(registration: WorkerRegistration): Promise<void> {
-    const now = new Date();
-    await this.db
-      .insertInto("workers")
-      .values({
-        executor_id: registration.executorId,
-        display_name: registration.displayName,
-        home_ref: registration.homeRef,
-        codex_profile: registration.codexProfile,
-        config_fingerprint: registration.configFingerprint,
-        codex_version: registration.codexVersion,
-        capacity: registration.capacity,
-        workspace_aliases: JSON.stringify(registration.workspaceAliases),
-        capabilities: JSON.stringify(registration.capabilities),
-        runner_version: registration.runnerVersion ?? null,
-        architecture: registration.architecture ?? null,
-        registration_source: "quick_install",
-        status: "online",
-        last_seen_at: now,
-        updated_at: now
-      })
-      .onConflict((conflict) =>
-        conflict.column("executor_id").doUpdateSet({
-          display_name: registration.displayName,
-          home_ref: registration.homeRef,
-          codex_profile: registration.codexProfile,
-          config_fingerprint: registration.configFingerprint,
-          codex_version: registration.codexVersion,
-          capacity: registration.capacity,
-          workspace_aliases: JSON.stringify(registration.workspaceAliases),
-          capabilities: JSON.stringify(registration.capabilities),
-          runner_version: registration.runnerVersion ?? null,
-          architecture: registration.architecture ?? null,
-          registration_source: "quick_install",
-          status: "online",
-          last_seen_at: now,
-          updated_at: now
-        })
-      )
-      .execute();
-    await this.db
-      .updateTable("tasks")
-      .set({ state: "waiting_input", revision: sql`revision + 1`, summary: "执行器 CODEX_HOME/profile 配置指纹已变化，需要主人确认", lease_token_hash: null, lease_expires_at: null, updated_at: now })
-      .where("executor_id", "=", registration.executorId)
-      .where("executor_config_fingerprint", "is not", null)
-      .where("executor_config_fingerprint", "!=", registration.configFingerprint)
-      .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
-      .execute();
-    await this.db
-      .updateTable("chat_contexts")
-      .set({
-        state: "blocked",
-        blocked_reason: "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认",
-        updated_at: now
-      })
-      .where("executor_id", "=", registration.executorId)
-      .where("codex_thread_id", "is not", null)
-      .where((eb) => eb.or([
-        eb("executor_home_ref", "is distinct from", registration.homeRef),
-        eb("executor_profile", "is distinct from", registration.codexProfile),
-        eb("executor_config_fingerprint", "is distinct from", registration.configFingerprint)
-      ]))
-      .execute();
+    await this.db.transaction().execute((trx) => upsertWorkerRegistration(trx, registration, {
+      statusOnInsert: "online",
+      statusOnUpdate: "online"
+    }));
   }
 
   async claimTask(principal: {
@@ -83,24 +140,32 @@ export class ControlPlaneRepository {
     homeRef: string;
     codexProfile: string;
     configFingerprint: string;
+    workspaceMappingFingerprint?: string | null;
   }): Promise<null | { task: Task; leaseToken: string; leaseExpiresAt: Date }> {
-    const worker = await this.db.selectFrom("workers").selectAll().where("executor_id", "=", principal.executorId).where("deleted_at", "is", null).executeTakeFirst();
-    if (!worker) throw new AppError("worker is not registered", 401, "unknown_executor");
-    if (worker.operational_mode !== "enabled") return null;
-    const capabilities = Array.isArray(worker.capabilities) ? worker.capabilities.map(String) : [];
-    if (!capabilities.includes("chat_context_v1")) return null;
-    if (
-      worker.home_ref !== principal.homeRef ||
-      worker.codex_profile !== principal.codexProfile ||
-      worker.config_fingerprint !== principal.configFingerprint
-    ) {
-      throw new AppError("worker configuration changed; create a new session", 409, "worker_config_changed");
-    }
-    const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
-    const singleWorkspaceAlias = aliases.length === 1 ? aliases[0] as string : null;
     const leaseToken = randomToken();
     const leaseExpiresAt = new Date(Date.now() + this.leaseSeconds * 1000);
-    const result = await sql<Task>`
+    const task = await this.db.transaction().execute(async (trx) => {
+      await lockExecutorClaim(trx, principal.executorId);
+      const worker = await trx.selectFrom("workers").selectAll().where("executor_id", "=", principal.executorId).where("deleted_at", "is", null).executeTakeFirst();
+      if (!worker) throw new AppError("worker is not registered", 401, "unknown_executor");
+      if (worker.operational_mode !== "enabled") return null;
+      const capabilities = Array.isArray(worker.capabilities) ? worker.capabilities.map(String) : [];
+      if (!capabilities.includes("chat_context_v1")) return null;
+      const workspaceMappingFingerprint = principal.workspaceMappingFingerprint ?? null;
+      if (
+        worker.home_ref !== principal.homeRef ||
+        worker.codex_profile !== principal.codexProfile ||
+        worker.config_fingerprint !== principal.configFingerprint ||
+        (workspaceMappingFingerprint !== null && worker.workspace_mapping_fingerprint !== workspaceMappingFingerprint)
+      ) {
+        throw new AppError("worker configuration changed; create a new session", 409, "worker_config_changed");
+      }
+      if (!await executorHasClaimCapacity(trx, principal.executorId, worker.capacity)) return null;
+      const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
+      const singleWorkspaceAlias = aliases.length === 1 ? aliases[0] as string : null;
+      const workspaceMappingReady = capabilities.includes("workspace_mapping_v1") &&
+        workspaceMappingFingerprint !== null && worker.workspace_mapping_fingerprint === workspaceMappingFingerprint;
+      const result = await sql<Task>`
       WITH candidate AS (
         SELECT tasks.id, tasks.revision
         FROM tasks
@@ -108,8 +173,33 @@ export class ControlPlaneRepository {
         JOIN chat_contexts ON chat_contexts.id = conversations.chat_context_id
         WHERE tasks.state IN ('queued', 'waiting_worker')
           AND chat_contexts.state <> 'blocked'
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM bot_skill_bindings skill_binding
+              WHERE skill_binding.bot_id = tasks.bot_id AND skill_binding.deleted_at IS NULL
+                AND (skill_binding.chat_context_id IS NULL OR skill_binding.chat_context_id = conversations.chat_context_id)
+            )
+            OR (
+              ${capabilities.includes("skillhub_skills_v1")} AND ${capabilities.includes("user_skills_inventory_v1")}
+              AND ${workspaceMappingReady}
+              AND ${worker.user_skills_scan_status === "ready"} AND ${!worker.user_skills_truncated}
+            )
+          )
+          AND (
+            NOT EXISTS (
+              SELECT 1 FROM bot_skill_bindings runtime_binding
+              WHERE runtime_binding.bot_id = tasks.bot_id AND runtime_binding.deleted_at IS NULL
+                AND (runtime_binding.chat_context_id IS NULL OR runtime_binding.chat_context_id = conversations.chat_context_id)
+                AND (
+                  EXISTS (SELECT 1 FROM skill_runtime_environment_revisions env_revision WHERE env_revision.binding_id = runtime_binding.id AND env_revision.superseded_at IS NULL AND env_revision.desired_state = 'present')
+                  OR EXISTS (SELECT 1 FROM skill_runtime_file_revisions file_revision WHERE file_revision.binding_id = runtime_binding.id AND file_revision.superseded_at IS NULL)
+                )
+            )
+            OR (${capabilities.includes("skill_runtime_config_v1")} AND ${workspaceMappingReady})
+          )
           AND (tasks.executor_id IS NULL OR tasks.executor_id = ${principal.executorId})
           AND (tasks.executor_config_fingerprint IS NULL OR tasks.executor_config_fingerprint = ${principal.configFingerprint})
+          AND (tasks.executor_workspace_mapping_fingerprint IS NULL OR tasks.executor_workspace_mapping_fingerprint = ${workspaceMappingFingerprint})
           AND (tasks.preferred_executor_id IS NULL OR tasks.preferred_executor_id = ${principal.executorId})
           AND (
             chat_contexts.codex_thread_id IS NULL
@@ -118,6 +208,7 @@ export class ControlPlaneRepository {
               AND chat_contexts.executor_home_ref = ${principal.homeRef}
               AND chat_contexts.executor_profile = ${principal.codexProfile}
               AND chat_contexts.executor_config_fingerprint = ${principal.configFingerprint}
+              AND chat_contexts.executor_workspace_mapping_fingerprint IS NOT DISTINCT FROM ${workspaceMappingFingerprint}
               AND chat_contexts.workspace_root_alias = ANY(${sql.val(aliases)}::text[])
             )
           )
@@ -137,8 +228,40 @@ export class ControlPlaneRepository {
               WHERE eligible_worker.deleted_at IS NULL
                 AND eligible_worker.operational_mode = 'enabled'
                 AND eligible_worker.capabilities ? 'chat_context_v1'
+                AND (
+                  NOT EXISTS (
+                    SELECT 1 FROM bot_skill_bindings skill_binding
+                    WHERE skill_binding.bot_id = tasks.bot_id AND skill_binding.deleted_at IS NULL
+                      AND (skill_binding.chat_context_id IS NULL OR skill_binding.chat_context_id = conversations.chat_context_id)
+                  )
+                  OR (
+                    eligible_worker.capabilities ? 'skillhub_skills_v1'
+                    AND eligible_worker.capabilities ? 'user_skills_inventory_v1'
+                    AND eligible_worker.capabilities ? 'workspace_mapping_v1'
+                    AND eligible_worker.workspace_mapping_fingerprint IS NOT NULL
+                    AND eligible_worker.user_skills_scan_status = 'ready'
+                    AND NOT eligible_worker.user_skills_truncated
+                  )
+                )
+                AND (
+                  NOT EXISTS (
+                    SELECT 1 FROM bot_skill_bindings runtime_binding
+                    WHERE runtime_binding.bot_id = tasks.bot_id AND runtime_binding.deleted_at IS NULL
+                      AND (runtime_binding.chat_context_id IS NULL OR runtime_binding.chat_context_id = conversations.chat_context_id)
+                      AND (
+                        EXISTS (SELECT 1 FROM skill_runtime_environment_revisions env_revision WHERE env_revision.binding_id = runtime_binding.id AND env_revision.superseded_at IS NULL AND env_revision.desired_state = 'present')
+                        OR EXISTS (SELECT 1 FROM skill_runtime_file_revisions file_revision WHERE file_revision.binding_id = runtime_binding.id AND file_revision.superseded_at IS NULL)
+                      )
+                  )
+                  OR (
+                    eligible_worker.capabilities ? 'skill_runtime_config_v1'
+                    AND eligible_worker.capabilities ? 'workspace_mapping_v1'
+                    AND eligible_worker.workspace_mapping_fingerprint IS NOT NULL
+                  )
+                )
                 AND (tasks.executor_id IS NULL OR tasks.executor_id = eligible_worker.executor_id)
                 AND (tasks.executor_config_fingerprint IS NULL OR tasks.executor_config_fingerprint = eligible_worker.config_fingerprint)
+                AND (tasks.executor_workspace_mapping_fingerprint IS NULL OR tasks.executor_workspace_mapping_fingerprint = eligible_worker.workspace_mapping_fingerprint)
                 AND (
                   eligible_worker.workspace_aliases ? COALESCE(tasks.requested_workspace_alias, tasks.resolved_workspace_alias)
                   OR (
@@ -169,6 +292,7 @@ export class ControlPlaneRepository {
           executor_home_ref = ${principal.homeRef},
           executor_profile = ${principal.codexProfile},
           executor_config_fingerprint = ${principal.configFingerprint},
+          executor_workspace_mapping_fingerprint = ${workspaceMappingFingerprint},
           codex_version = ${worker.codex_version},
           resolved_workspace_alias = COALESCE(t.resolved_workspace_alias, t.requested_workspace_alias, ${singleWorkspaceAlias}),
           lease_token_hash = ${sha256(leaseToken)},
@@ -181,8 +305,9 @@ export class ControlPlaneRepository {
         AND t.state IN ('queued', 'waiting_worker')
         AND t.revision = candidate.revision
       RETURNING t.*
-    `.execute(this.db);
-    const task = result.rows[0];
+      `.execute(trx);
+      return result.rows[0] ?? null;
+    });
     if (!task) return null;
     await this.recordTaskEvent(task.id, "task.claimed", "任务已被执行器领取", {
       executorId: principal.executorId,
@@ -316,15 +441,23 @@ export class ControlPlaneRepository {
       const task = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirstOrThrow();
       this.assertLockedLease(task, lease);
 
+      const runtimeConfig = task.runtime_config_snapshot && typeof task.runtime_config_snapshot === "object"
+        ? task.runtime_config_snapshot as { environment?: unknown; files?: unknown }
+        : {};
+      const requiresWorkspaceMapping = (Array.isArray(task.skill_set_snapshot) && task.skill_set_snapshot.length > 0) ||
+        (Array.isArray(runtimeConfig.environment) && runtimeConfig.environment.length > 0) ||
+        (Array.isArray(runtimeConfig.files) && runtimeConfig.files.length > 0);
       const environmentComplete = Boolean(
         task.executor_id && task.executor_home_ref && task.executor_profile &&
-        task.executor_config_fingerprint && task.resolved_workspace_alias
+        task.executor_config_fingerprint && task.resolved_workspace_alias &&
+        (!requiresWorkspaceMapping || task.executor_workspace_mapping_fingerprint)
       );
       const environmentMatches = !context.executor_id || (
         context.executor_id === task.executor_id &&
         context.executor_home_ref === task.executor_home_ref &&
         context.executor_profile === task.executor_profile &&
         context.executor_config_fingerprint === task.executor_config_fingerprint &&
+        context.executor_workspace_mapping_fingerprint === task.executor_workspace_mapping_fingerprint &&
         context.workspace_root_alias === task.resolved_workspace_alias
       );
       const threadMatches = !context.codex_thread_id || context.codex_thread_id === codexThreadId;
@@ -363,6 +496,7 @@ export class ControlPlaneRepository {
         executor_home_ref: task.executor_home_ref,
         executor_profile: task.executor_profile,
         executor_config_fingerprint: task.executor_config_fingerprint,
+        executor_workspace_mapping_fingerprint: task.executor_workspace_mapping_fingerprint,
         codex_version: task.codex_version,
         workspace_root_alias: task.resolved_workspace_alias,
         state: "ready",

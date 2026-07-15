@@ -1,9 +1,11 @@
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
+import { strToU8, zipSync } from "fflate";
 import pg from "pg";
 import { sql } from "kysely";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDatabase } from "../db/database.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { buildControlPlane } from "./app.js";
@@ -12,6 +14,7 @@ import { ControlPlaneRepository } from "./repository.js";
 import type { LarkGateway } from "../lark/gateway.js";
 import type { LarkMessageDetails, LarkMessageEvent } from "../shared/contracts.js";
 import { sha256 } from "../shared/crypto.js";
+import { workerUserSkillsFingerprint } from "../shared/user-skills.js";
 import { RuntimeStatus } from "./runtime-status.js";
 import { IncidentService } from "./incidents.js";
 import { AdminEventBus } from "./admin-events.js";
@@ -24,6 +27,9 @@ import { MessageRouter } from "./message-router.js";
 import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 import { BotPermissionService } from "./bot-permissions.js";
 import { RetentionService } from "./retention.js";
+import { SkillRuntimeService } from "./skill-runtime-service.js";
+import { inspectSkillArchive, SkillHubService } from "./skillhub-service.js";
+import { issueWorkerSession } from "./auth.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -54,7 +60,12 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     metricsBearerToken: "metrics-test-token",
     alertsEnabled: false,
     runnerArtifactPublicBaseUrl: "https://cdn.example.test/home/cdn/lark-agent",
-    runnerManifestRefreshSeconds: 300
+    runnerManifestRefreshSeconds: 300,
+    skillhubRegistryUrl: "",
+    skillhubApiToken: "",
+    skillhubCacheDir: "/tmp/lark-agent-test-skill-cache",
+    skillRuntimeEncryptionKeys: `test:${Buffer.alloc(32, 7).toString("base64")}`,
+    skillRuntimeActiveKeyId: "test"
   };
   const { app, services } = buildControlPlane(db, config);
   const reconciledBotIds: string[] = [];
@@ -73,11 +84,33 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     },
     permissions: new BotPermissionService(async () => grantedBotScopes)
   });
+  const workspaceMappingFingerprint = "c".repeat(64);
   const insertWorker = async () => db.insertInto("workers").values({
     executor_id: "worker-a", display_name: "Worker A", home_ref: "worker-a:home", codex_profile: "lark-agent",
     config_fingerprint: "a".repeat(64), codex_version: "test", capacity: 1,
     workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "chat_context_v1"]), last_seen_at: new Date(), updated_at: new Date()
   }).execute();
+  const enableWorkerWorkspaceMapping = async () => db.updateTable("workers").set({
+    workspace_mapping_fingerprint: workspaceMappingFingerprint,
+    capabilities: JSON.stringify(["codex", "chat_context_v1", "workspace_mapping_v1"]),
+    updated_at: new Date()
+  }).where("executor_id", "=", "worker-a").execute();
+  const insertSkillContext = async (chatId: string, executorId: string | null = null) => {
+    const worker = executorId ? await db.selectFrom("workers").select("workspace_mapping_fingerprint").where("executor_id", "=", executorId).executeTakeFirst() : null;
+    return db.insertInto("chat_contexts").values({
+    bot_id: "00000000-0000-0000-0000-000000000001", chat_id: chatId, chat_type: "p2p", codex_thread_id: null,
+    executor_id: executorId, executor_home_ref: executorId ? `${executorId}:home` : null, executor_profile: executorId ? "lark-agent" : null,
+    executor_config_fingerprint: executorId ? "a".repeat(64) : null, codex_version: executorId ? "test" : null,
+    executor_workspace_mapping_fingerprint: worker?.workspace_mapping_fingerprint ?? null,
+    workspace_root_alias: executorId ? "repo" : null, state: "uninitialized", blocked_reason: null, last_activity_at: new Date(),
+    last_compacted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+  };
+  const insertSkillPackage = async (namespace: string, slug: string, name = slug) => db.insertInto("skillhub_packages").values({
+    registry_url: "https://registry.example.test", namespace, slug, version: "1.0.0", registry_fingerprint: `sha256:${sha256(`${namespace}/${slug}`)}`,
+    archive_sha256: sha256(`archive:${namespace}/${slug}`), archive_path: `/tmp/${namespace}-${slug}.zip`, archive_size: 1,
+    skill_name: name, description: `${name} test skill`, dependencies: JSON.stringify({ tools: [] })
+  }).returningAll().executeTakeFirstOrThrow();
 
   beforeAll(async () => {
     const initialSql = await readFile(fileURLToPath(new URL("../db/migrations/001_initial.sql", import.meta.url)), "utf8");
@@ -99,6 +132,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextRecoveryAttemptsSql = await readFile(fileURLToPath(new URL("../db/migrations/017_chat_context_recovery_attempts.sql", import.meta.url)), "utf8");
     const chatContextRebindSql = await readFile(fileURLToPath(new URL("../db/migrations/018_rebind_chat_context_fingerprints.sql", import.meta.url)), "utf8");
     const workerDisplayAliasSql = await readFile(fileURLToPath(new URL("../db/migrations/019_worker_display_alias.sql", import.meta.url)), "utf8");
+    const skillhubRuntimeSql = await readFile(fileURLToPath(new URL("../db/migrations/020_skillhub_runtime.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -127,6 +161,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (!chatContextRecoveryAttemptsApplied.rows[0]?.table_name) await client.query(chatContextRecoveryAttemptsSql);
     await client.query(chatContextRebindSql);
     await client.query(workerDisplayAliasSql);
+    await client.query(skillhubRuntimeSql);
     await client.end();
   });
 
@@ -140,6 +175,13 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("admin_sessions").execute();
     await db.deleteFrom("admin_login_tokens").execute();
     await db.deleteFrom("incidents").execute();
+    await db.deleteFrom("skill_admin_audit_events").execute();
+    await db.deleteFrom("skill_file_sync_jobs").execute();
+    await db.deleteFrom("skill_runtime_file_states").execute();
+    await db.deleteFrom("skill_runtime_file_revisions").execute();
+    await db.deleteFrom("skill_runtime_environment_revisions").execute();
+    await db.deleteFrom("bot_skill_bindings").execute();
+    await db.deleteFrom("skillhub_packages").execute();
     await db.deleteFrom("bot_dialogue_guards").execute();
     await db.deleteFrom("task_output_updates").execute();
     await db.deleteFrom("task_outputs").execute();
@@ -177,6 +219,376 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const admin = await app.inject({ method: "GET", url: "/admin" });
     expect(admin.statusCode).toBe(302);
     expect(admin.headers.location).toBe("/admin/");
+  });
+
+  it("repairs a damaged SkillHub cache row when the same content fingerprint is repacked", async () => {
+    const cacheDir = await mkdtemp(join(tmpdir(), "lark-agent-skillhub-repair-"));
+    const skillMd = strToU8("---\nname: repaired-skill\ndescription: damaged cache repair test\n---\n\n# Repair\n");
+    const script = strToU8(`#!/bin/sh\n${"echo repair\n".repeat(2_000)}`);
+    const originalArchive = Buffer.from(zipSync({ "SKILL.md": skillMd, "scripts/run.sh": script }, { level: 0 }));
+    const repackedArchive = Buffer.from(zipSync({ "SKILL.md": skillMd, "scripts/run.sh": script }, { level: 9 }));
+    const registryFingerprint = inspectSkillArchive(originalArchive).registryFingerprint;
+    expect(inspectSkillArchive(repackedArchive).registryFingerprint).toBe(registryFingerprint);
+    expect(sha256(repackedArchive)).not.toBe(sha256(originalArchive));
+    const resolveBody = JSON.stringify({ data: { namespace: "repair", slug: "same-content", version: "1.0.0", fingerprint: registryFingerprint } });
+    const responses = [
+      new Response(resolveBody, { status: 200, headers: { "content-type": "application/json" } }),
+      new Response(new Uint8Array(originalArchive), { status: 200, headers: { "content-length": String(originalArchive.length) } }),
+      new Response(resolveBody, { status: 200, headers: { "content-type": "application/json" } }),
+      new Response(new Uint8Array(repackedArchive), { status: 200, headers: { "content-length": String(repackedArchive.length) } })
+    ];
+    vi.stubGlobal("fetch", vi.fn(async () => responses.shift() ?? new Response(null, { status: 500 })));
+    try {
+      const hub = new SkillHubService(db, {
+        ...config, skillhubRegistryUrl: "https://registry.example.test", skillhubApiToken: "test-token", skillhubCacheDir: cacheDir
+      });
+      const original = await hub.resolveAndCache("@repair/same-content");
+      await writeFile(original.archive_path, Buffer.from("damaged cache"));
+
+      const repaired = await hub.resolveAndCache("@repair/same-content");
+      expect(repaired.id).toBe(original.id);
+      expect(repaired.archive_sha256).toBe(sha256(repackedArchive));
+      expect(repaired.archive_path).not.toBe(original.archive_path);
+      await expect(hub.verifyCachedPackage(repaired.id)).resolves.toMatchObject({ archive_sha256: sha256(repackedArchive) });
+    } finally {
+      vi.unstubAllGlobals();
+      await rm(cacheDir, { recursive: true, force: true });
+    }
+  });
+
+  it("persists encrypted environment revisions and atomically rejects cross-platform file collisions", async () => {
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const firstPackage = await insertSkillPackage("runtime", "first");
+    const firstBinding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: "00000000-0000-0000-0000-000000000001", chat_context_id: null, package_id: firstPackage.id,
+      namespace: firstPackage.namespace, slug: firstPackage.slug, created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+
+    await expect(runtime.putEnvironment(firstBinding.bot_id, firstBinding.id, "API_TOKEN", null, "", "ou_owner"))
+      .rejects.toMatchObject({ statusCode: 400, code: "runtime_environment_value_required" });
+    await expect(runtime.putEnvironment(firstBinding.bot_id, firstBinding.id, "API_TOKEN", null, "bad\0value", "ou_owner"))
+      .rejects.toMatchObject({ statusCode: 400, code: "invalid_runtime_environment_value" });
+    const firstSecret = await runtime.putEnvironment(firstBinding.bot_id, firstBinding.id, "API_TOKEN", null, "secret-one", "ou_owner");
+    const secondSecret = await runtime.putEnvironment(firstBinding.bot_id, firstBinding.id, "API_TOKEN", null, "secret-two", "ou_owner");
+    expect(secondSecret.revision).toBe(firstSecret.revision + 1);
+    await runtime.putEnvironment(firstBinding.bot_id, firstBinding.id, "API_TOKEN", null, null, "ou_owner");
+    const activeEnvironment = await db.selectFrom("skill_runtime_environment_revisions").selectAll().where("binding_id", "=", firstBinding.id).where("superseded_at", "is", null).executeTakeFirstOrThrow();
+    expect({ ...activeEnvironment, value_size: Number(activeEnvironment.value_size) }).toMatchObject({ desired_state: "absent", value_size: 0, ciphertext: null });
+
+    await runtime.putFile(firstBinding.bot_id, firstBinding.id, "A.env", null, Buffer.from("ONE=1\n"), "ou_owner");
+    const secondPackage = await insertSkillPackage("runtime", "second");
+    const secondBinding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: firstBinding.bot_id, chat_context_id: null, package_id: secondPackage.id, namespace: secondPackage.namespace,
+      slug: secondPackage.slug, created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    await expect(runtime.putFile(secondBinding.bot_id, secondBinding.id, "a.env", null, Buffer.from("TWO=2\n"), "ou_owner"))
+      .rejects.toMatchObject({ statusCode: 409, code: "runtime_file_conflict" });
+    expect(await db.selectFrom("skill_runtime_file_revisions").select("id").where("binding_id", "=", secondBinding.id).execute()).toHaveLength(0);
+  });
+
+  it("queues only the latest runtime files when a Thread receives its first executor binding", async () => {
+    await insertWorker();
+    const context = await insertSkillContext("oc_first_executor_binding");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "first-binding");
+    const binding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+
+    const firstFile = await runtime.putFile(context.bot_id, binding.id, ".env", null, Buffer.from("TOKEN=first\n"), "ou_owner");
+    const latestFile = await runtime.putFile(context.bot_id, binding.id, ".env", null, Buffer.from("TOKEN=latest\n"), "ou_owner", firstFile.id);
+    expect(await db.selectFrom("skill_file_sync_jobs").select("id").where("chat_context_id", "=", context.id).execute()).toHaveLength(0);
+    expect(await db.selectFrom("skill_runtime_file_states").select("chat_context_id").where("chat_context_id", "=", context.id).execute()).toHaveLength(0);
+
+    await db.updateTable("chat_contexts").set({
+      executor_id: "worker-a", executor_home_ref: "worker-a:home", executor_profile: "lark-agent",
+      executor_config_fingerprint: "a".repeat(64), codex_version: "test", workspace_root_alias: "repo",
+      state: "ready", updated_at: new Date()
+    }).where("id", "=", context.id).execute();
+    await runtime.enqueueLatestForContext(context.id);
+
+    const job = await db.selectFrom("skill_file_sync_jobs").select(["state", "payload"]).where("chat_context_id", "=", context.id).executeTakeFirstOrThrow();
+    const payload = job.payload as { runtimeConfig: { files: Array<{ id: string }> } };
+    expect(job.state).toBe("queued");
+    expect(payload.runtimeConfig.files.map((file) => file.id)).toEqual([latestFile.id]);
+    expect(await db.selectFrom("skill_runtime_file_states").select(["desired_file_revision_id", "status"]).where("chat_context_id", "=", context.id).executeTakeFirstOrThrow())
+      .toEqual({ desired_file_revision_id: latestFile.id, status: "pending" });
+
+    await db.updateTable("skill_file_sync_jobs").set({ state: "completed", completed_at: new Date(), updated_at: new Date() }).where("chat_context_id", "=", context.id).execute();
+    await db.updateTable("skill_runtime_file_states").set({ status: "applied", applied_revision: latestFile.revision, actual_sha256: latestFile.sha256, updated_at: new Date() }).where("chat_context_id", "=", context.id).execute();
+    await runtime.enqueueLatestForContext(context.id);
+    expect(await db.selectFrom("skill_file_sync_jobs").select("id").where("chat_context_id", "=", context.id).execute()).toHaveLength(1);
+    expect((await db.selectFrom("skill_runtime_file_states").select("status").where("chat_context_id", "=", context.id).executeTakeFirstOrThrow()).status).toBe("applied");
+  });
+
+  it("shows a case-insensitive Thread file override as one effective runtime path", async () => {
+    const context = await insertSkillContext("oc_case_folded_override");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "case-folded-override");
+    const binding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    await runtime.putFile(context.bot_id, binding.id, "A.env", null, Buffer.from("SCOPE=global\n"), "ou_owner");
+    await db.insertInto("skill_runtime_file_revisions").values({
+      id: "99999999-9999-4999-8999-999999999999",
+      binding_id: binding.id, chat_context_id: context.id, target_path: "a.env", target_path_key: "a.env", desired_state: "absent",
+      key_id: null, nonce: null, ciphertext: null, auth_tag: null, content_sha256: null, content_size: 0,
+      revision: 1, superseded_at: null, created_by: "migration:test"
+    }).execute();
+
+    expect((await runtime.listRuntimeConfig(context.bot_id, binding.id, context.id)).files).toEqual([
+      expect.objectContaining({ targetPath: "a.env", sourceScope: "chat_context", desiredState: "absent" })
+    ]);
+  });
+
+  it("allows a same-coordinate Thread override at 64 effective skills and rolls a 65th global skill back", async () => {
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const context = await insertSkillContext("oc_skill_limit");
+    const packages = [];
+    for (let index = 0; index < 65; index += 1) packages.push(await insertSkillPackage("limit", `skill-${index}`, `limit-skill-${index}`));
+    await db.insertInto("bot_skill_bindings").values(packages.slice(0, 64).map((pkg) => ({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }))).execute();
+    const resolve = vi.spyOn(runtime.hub, "resolveAndCache").mockResolvedValueOnce(packages[0]!).mockResolvedValueOnce(packages[64]!);
+    try {
+      await expect(runtime.addBinding(context.bot_id, "@limit/skill-0", context.id, "ou_owner")).resolves.toMatchObject({ chat_context_id: context.id });
+      await expect(runtime.addBinding(context.bot_id, "@limit/skill-64", null, "ou_owner"))
+        .rejects.toMatchObject({ statusCode: 409, code: "skill_limit_exceeded" });
+      expect(await db.selectFrom("bot_skill_bindings").select("id").where("bot_id", "=", context.bot_id).where("deleted_at", "is", null).execute()).toHaveLength(65);
+    } finally {
+      resolve.mockRestore();
+    }
+  });
+
+  it("requeues the latest desired sync when an old lease result arrives and supports heartbeat renewal", async () => {
+    await insertWorker();
+    const context = await insertSkillContext("oc_sync_stale", "worker-a");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const oldDesired = "1".repeat(64); const newDesired = "2".repeat(64);
+    const oldSkill = "3".repeat(64); const oldRuntime = "4".repeat(64);
+    const newPayload = { skillSetFingerprint: "5".repeat(64), runtimeConfig: { fingerprint: "6".repeat(64), files: [] } };
+    const oldPayload = { skillSetFingerprint: oldSkill, runtimeConfig: { fingerprint: oldRuntime, files: [] } };
+    const job = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", desired_fingerprint: newDesired, leased_fingerprint: oldDesired,
+      payload: JSON.stringify(newPayload), leased_payload: JSON.stringify(oldPayload), state: "running", lease_token_hash: sha256("old-lease"),
+      lease_expires_at: new Date(Date.now() + 60_000), attempt: 1, last_error: null, completed_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+
+    await runtime.finishSyncJob("worker-a", job.id, "old-lease", {
+      desiredFingerprint: oldDesired, skillSetFingerprint: oldSkill, runtimeConfigFingerprint: oldRuntime, status: "applied", summary: "old result", files: []
+    });
+    expect(await db.selectFrom("skill_file_sync_jobs").select(["state", "desired_fingerprint", "leased_fingerprint", "leased_payload"]).where("id", "=", job.id).executeTakeFirstOrThrow())
+      .toMatchObject({ state: "queued", desired_fingerprint: newDesired, leased_fingerprint: null, leased_payload: null });
+    const before = new Date(Date.now() + 60_000);
+    await db.updateTable("skill_file_sync_jobs").set({
+      state: "running", leased_fingerprint: newDesired, leased_payload: JSON.stringify(newPayload), lease_token_hash: sha256("new-lease"), lease_expires_at: before
+    }).where("id", "=", job.id).execute();
+    const heartbeat = await runtime.heartbeatSyncJob("worker-a", job.id, "new-lease", 60);
+    expect(new Date(heartbeat.leaseExpiresAt).getTime()).toBeGreaterThan(Date.now() + 14 * 60_000);
+  });
+
+  it("only leases workspace sync to the Runner identity fixed on an unblocked chat context", async () => {
+    await insertWorker();
+    await enableWorkerWorkspaceMapping();
+    const context = await insertSkillContext("oc_sync_identity_gate", "worker-a");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const payload = {
+      botAppId: "cli_bot", resolvedWorkspaceAlias: "repo", skills: [], skillSetFingerprint: "2".repeat(64),
+      runtimeConfig: { fingerprint: "3".repeat(64), files: [] }
+    };
+    const job = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", desired_fingerprint: "1".repeat(64),
+      payload: JSON.stringify(payload), state: "queued", updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const original = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint };
+
+    await db.updateTable("chat_contexts").set({ state: "blocked", updated_at: new Date() }).where("id", "=", context.id).execute();
+    await expect(runtime.claimSyncJob(original, 60)).resolves.toBeNull();
+    expect((await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", job.id).executeTakeFirstOrThrow()).state).toBe("queued");
+
+    await db.updateTable("chat_contexts").set({ state: "ready", updated_at: new Date() }).where("id", "=", context.id).execute();
+    await expect(runtime.claimSyncJob({ ...original, configFingerprint: "b".repeat(64) }, 60))
+      .rejects.toMatchObject({ statusCode: 409, code: "worker_config_changed" });
+
+    await db.updateTable("workers").set({ config_fingerprint: "b".repeat(64), updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    await expect(runtime.claimSyncJob({ ...original, configFingerprint: "b".repeat(64) }, 60)).resolves.toBeNull();
+
+    await db.updateTable("workers").set({ config_fingerprint: original.configFingerprint, workspace_aliases: JSON.stringify([]), updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    await expect(runtime.claimSyncJob(original, 60)).resolves.toBeNull();
+
+    await db.updateTable("workers").set({ workspace_aliases: JSON.stringify(["repo"]), updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    await db.updateTable("skill_file_sync_jobs").set({ payload: JSON.stringify({ ...payload, resolvedWorkspaceAlias: "other" }), updated_at: new Date() }).where("id", "=", job.id).execute();
+    await expect(runtime.claimSyncJob(original, 60)).resolves.toBeNull();
+
+    await db.updateTable("skill_file_sync_jobs").set({ payload: JSON.stringify(payload), updated_at: new Date() }).where("id", "=", job.id).execute();
+    await expect(runtime.claimSyncJob(original, 60)).resolves.toMatchObject({ id: job.id, resolvedWorkspaceAlias: "repo" });
+  });
+
+  it("lets only the owner retry a failed managed-skill-only sync with CSRF protection", async () => {
+    await insertWorker();
+    await enableWorkerWorkspaceMapping();
+    const context = await insertSkillContext("oc_retry_managed_skill", "worker-a");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "retry-managed-only");
+    await db.insertInto("bot_skill_bindings").values({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).execute();
+    await runtime.enqueueLatestForContext(context.id);
+    const first = await runtime.claimSyncJob({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint }, 60);
+    expect(first?.skills).toHaveLength(1);
+    expect(first?.runtimeConfig.files).toEqual([]);
+    await runtime.finishSyncJob("worker-a", first!.id, first!.leaseToken, {
+      desiredFingerprint: first!.desiredFingerprint, skillSetFingerprint: first!.skillSetFingerprint!,
+      runtimeConfigFingerprint: first!.runtimeConfig.fingerprint!, status: "failed", summary: "temporary registry outage", files: []
+    });
+    expect((await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", first!.id).executeTakeFirstOrThrow()).state).toBe("failed");
+
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-skill-retry"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "skill-retry-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const cookie = { cookie: "lark_agent_admin_session=owner-skill-retry" };
+    const missingCsrf = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${context.id}/skill-runtime/retry`, headers: cookie });
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(missingCsrf.json<{ error: { code: string } }>().error.code).toBe("invalid_csrf");
+    const retried = await app.inject({
+      method: "POST", url: `/v1/admin/chat-contexts/${context.id}/skill-runtime/retry`,
+      headers: { ...cookie, "x-csrf-token": "skill-retry-csrf" }
+    });
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toEqual({ ok: true, queued: true });
+    expect(await db.selectFrom("skill_admin_audit_events").select(["actor_open_id", "action", "chat_context_id"]).where("action", "=", "skill.runtime.sync.retry").executeTakeFirstOrThrow())
+      .toEqual({ actor_open_id: "ou_owner", action: "skill.runtime.sync.retry", chat_context_id: context.id });
+
+    const second = await runtime.claimSyncJob({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint }, 60);
+    expect(second?.id).not.toBe(first?.id);
+    expect(second?.skills).toHaveLength(1);
+    await runtime.finishSyncJob("worker-a", second!.id, second!.leaseToken, {
+      desiredFingerprint: second!.desiredFingerprint, skillSetFingerprint: second!.skillSetFingerprint!,
+      runtimeConfigFingerprint: second!.runtimeConfig.fingerprint!, status: "applied", summary: "recovered", files: []
+    });
+    expect((await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", second!.id).executeTakeFirstOrThrow()).state).toBe("completed");
+    expect((await db.selectFrom("incidents").select("state").where("fingerprint", "=", `skill_file_sync:${context.id}`).executeTakeFirstOrThrow()).state).toBe("resolved");
+  });
+
+  it("never lets an old task runtime report overwrite a newer desired file revision", async () => {
+    await insertWorker();
+    await db.updateTable("workers").set({
+      capabilities: JSON.stringify(["codex", "chat_context_v1", "skillhub_skills_v1", "skill_runtime_config_v1", "user_skills_inventory_v1"]),
+      user_skills_scan_status: "ready", user_skills: JSON.stringify([]), user_skills_truncated: false, user_skills_scanned_at: new Date()
+    }).where("executor_id", "=", "worker-a").execute();
+    const context = await insertSkillContext("oc_old_task_runtime");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "old-task");
+    const binding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const firstFile = await runtime.putFile(context.bot_id, binding.id, ".env", null, Buffer.from("TOKEN=first\n"), "ou_owner");
+    await db.updateTable("chat_contexts").set({
+      executor_id: "worker-a", executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64),
+      codex_version: "test", workspace_root_alias: "repo", state: "ready", updated_at: new Date()
+    }).where("id", "=", context.id).execute();
+    const conversation = await db.insertInto("conversations").values({
+      bot_id: context.bot_id, chat_context_id: context.id, bot_config_revision: 1, role_instructions_snapshot: "test",
+      attention_model_snapshot: null, attention_reasoning_effort_snapshot: null, execution_model_snapshot: null, execution_reasoning_effort_snapshot: null,
+      chat_id: context.chat_id, chat_type: "p2p", root_message_id: "om_old_task", thread_id: null, room_seq: 1, active: true,
+      response_message_id: null, followup_expires_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      bot_id: context.bot_id, conversation_id: conversation.id, state: "running", trigger_message_id: "om_old_task", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: "worker-a", executor_id: "worker-a", codex_thread_id: null,
+      executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64), codex_version: "test",
+      lease_token_hash: sha256("task-lease"), lease_expires_at: new Date(Date.now() + 60_000), summary: null, completed_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const snapshot = await runtime.prepareTaskSnapshot(task.id);
+    expect(snapshot.runtimeConfig.files[0]?.id).toBe(firstFile.id);
+
+    await expect(runtime.recordRuntimeFailure(task.id, "worker-a", {
+      skillSetFingerprint: snapshot.skillSetFingerprint, runtimeConfigFingerprint: snapshot.runtimeConfigFingerprint,
+      code: "runtime_file_exists", summary: "unknown path", targetPath: "other.env"
+    })).rejects.toMatchObject({ statusCode: 409, code: "runtime_snapshot_mismatch" });
+    await runtime.recordRuntimeFailure(task.id, "worker-a", {
+      skillSetFingerprint: snapshot.skillSetFingerprint, runtimeConfigFingerprint: snapshot.runtimeConfigFingerprint,
+      code: "runtime_file_exists", summary: "current task observed an unmanaged file", targetPath: ".env"
+    });
+    expect(await db.selectFrom("skill_runtime_file_states").select(["desired_file_revision_id", "status"]).where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow())
+      .toEqual({ desired_file_revision_id: firstFile.id, status: "conflict" });
+    await expect(runtime.forceFile(context.bot_id, binding.id, firstFile.id, context.id)).resolves.toBeUndefined();
+    expect((await db.selectFrom("skill_runtime_file_states").select("status").where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow()).status)
+      .toBe("pending_force");
+
+    const secondFile = await runtime.putFile(context.bot_id, binding.id, ".env", null, Buffer.from("TOKEN=second\n"), "ou_owner", firstFile.id);
+    const pending = await db.selectFrom("skill_runtime_file_states").selectAll().where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow();
+    expect(pending).toMatchObject({ desired_file_revision_id: secondFile.id, status: "pending" });
+
+    await runtime.recordRuntimeFailure(task.id, "worker-a", {
+      skillSetFingerprint: snapshot.skillSetFingerprint, runtimeConfigFingerprint: snapshot.runtimeConfigFingerprint,
+      code: "runtime_file_unmanaged_delete", summary: "old task observed drift", targetPath: ".env"
+    });
+    expect(await db.selectFrom("skill_runtime_file_states").select(["desired_file_revision_id", "status"]).where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow())
+      .toEqual({ desired_file_revision_id: secondFile.id, status: "pending" });
+    await runtime.recordRuntimeSnapshot(task.id, "worker-a", {
+      skillSetFingerprint: snapshot.skillSetFingerprint, runtimeConfigFingerprint: snapshot.runtimeConfigFingerprint,
+      managedSkills: snapshot.skills, userSkills: [], environmentNames: [],
+      files: [{ id: firstFile.id, targetPath: ".env", revision: firstFile.revision, actualSha256: firstFile.sha256, status: "applied", error: null }]
+    });
+    expect(await db.selectFrom("skill_runtime_file_states").select(["desired_file_revision_id", "status"]).where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow())
+      .toEqual({ desired_file_revision_id: secondFile.id, status: "pending" });
+    expect((await db.selectFrom("incidents").select("state").where("fingerprint", "=", `skill_runtime:${context.id}`).executeTakeFirstOrThrow()).state).toBe("resolved");
+  });
+
+  it("marks files removed from the leased manifest deleted before allowing binding cleanup", async () => {
+    await insertWorker();
+    await enableWorkerWorkspaceMapping();
+    const context = await insertSkillContext("oc_restore_file", "worker-a");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "restore-file");
+    const binding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: context.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const file = await runtime.putFile(context.bot_id, binding.id, "thread.env", context.id, Buffer.from("THREAD=1\n"), "ou_owner");
+    await db.updateTable("skill_runtime_file_states").set({
+      applied_revision: file.revision, actual_sha256: file.sha256, status: "applied", checked_at: new Date(), updated_at: new Date()
+    }).where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).execute();
+    await runtime.deleteFile(context.bot_id, binding.id, file.id, context.id, true, "ou_owner");
+    const claimed = await runtime.claimSyncJob({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint }, 60);
+    expect(claimed?.runtimeConfig.files).toEqual([]);
+    await runtime.finishSyncJob("worker-a", claimed!.id, claimed!.leaseToken, {
+      desiredFingerprint: claimed!.desiredFingerprint, skillSetFingerprint: claimed!.skillSetFingerprint!,
+      runtimeConfigFingerprint: claimed!.runtimeConfig.fingerprint!, status: "applied", summary: "removed", files: []
+    });
+    expect((await db.selectFrom("skill_runtime_file_states").select("status").where("chat_context_id", "=", context.id).where("binding_id", "=", binding.id).executeTakeFirstOrThrow()).status).toBe("deleted");
+    await expect(runtime.deleteBinding(context.bot_id, binding.id, "ou_owner")).resolves.toBeUndefined();
+  });
+
+  it("aggregates global file state across bound Threads without reporting a permanent pending state", async () => {
+    await insertWorker();
+    const firstContext = await insertSkillContext("oc_global_file_first", "worker-a");
+    const secondContext = await insertSkillContext("oc_global_file_second", "worker-a");
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const pkg = await insertSkillPackage("runtime", "global-file-state");
+    const binding = await db.insertInto("bot_skill_bindings").values({
+      bot_id: firstContext.bot_id, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const file = await runtime.putFile(firstContext.bot_id, binding.id, "config/global.env", null, Buffer.from("GLOBAL=1\n"), "ou_owner");
+    expect((await runtime.listRuntimeConfig(firstContext.bot_id, binding.id, null)).files[0]).toMatchObject({ status: "pending", actualSha256: null });
+
+    await db.updateTable("skill_runtime_file_states").set({ status: "applied", applied_revision: file.revision, actual_sha256: file.sha256, checked_at: new Date(), updated_at: new Date() })
+      .where("binding_id", "=", binding.id).execute();
+    expect((await runtime.listRuntimeConfig(firstContext.bot_id, binding.id, null)).files[0]).toMatchObject({ status: "applied", actualSha256: file.sha256 });
+
+    await db.updateTable("skill_runtime_file_states").set({ actual_sha256: "f".repeat(64), updated_at: new Date() }).where("chat_context_id", "=", secondContext.id).where("binding_id", "=", binding.id).execute();
+    expect((await runtime.listRuntimeConfig(firstContext.bot_id, binding.id, null)).files[0]).toMatchObject({ status: "drift", actualSha256: null });
+    await db.updateTable("skill_runtime_file_states").set({ status: "conflict", last_error: "workspace file exists", updated_at: new Date() }).where("chat_context_id", "=", firstContext.id).where("binding_id", "=", binding.id).execute();
+    expect((await runtime.listRuntimeConfig(firstContext.bot_id, binding.id, null)).files[0]).toMatchObject({ status: "conflict", lastError: "workspace file exists" });
   });
 
   it("backfills the active historical Thread and its matching execution environment", async () => {
@@ -302,6 +714,28 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("bots").select(["enabled", "is_system", "config_revision"]).where("id", "=", botId).executeTakeFirstOrThrow()).toEqual(before);
   });
 
+  it("blocks bot deletion until every managed skill and its tracked workspace files are removed", async () => {
+    const botId = "00000000-0000-0000-0000-000000000001";
+    await db.updateTable("bots").set({ enabled: false, is_system: false, updated_at: new Date() }).where("id", "=", botId).execute();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-delete-bot-with-skill"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "delete-bot-skill-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const pkg = await insertSkillPackage("runtime", "delete-bot-guard");
+    await db.insertInto("bot_skill_bindings").values({
+      bot_id: botId, chat_context_id: null, package_id: pkg.id, namespace: pkg.namespace, slug: pkg.slug,
+      created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).execute();
+
+    const response = await app.inject({
+      method: "DELETE", url: `/v1/admin/bots/${botId}`,
+      headers: { cookie: "lark_agent_admin_session=owner-delete-bot-with-skill", "x-csrf-token": "delete-bot-skill-csrf" }
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json<{ error: { code: string } }>().error.code).toBe("bot_has_skills");
+    expect((await db.selectFrom("bots").select("deleted_at").where("id", "=", botId).executeTakeFirstOrThrow()).deleted_at).toBeNull();
+  });
+
   it("checks existing bot permissions and blocks enabling until every capability is granted", async () => {
     const now = new Date();
     await db.insertInto("admin_sessions").values({
@@ -333,10 +767,27 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.insertInto("worker_device_credentials").values({
       executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
     }).execute();
+    const context = await insertSkillContext("oc_runner_status", "worker-a");
+    const syncJob = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", desired_fingerprint: "d".repeat(64), leased_fingerprint: "d".repeat(64),
+      payload: JSON.stringify({}), leased_payload: JSON.stringify({}), state: "running", lease_token_hash: sha256("runner-status-sync-lease"),
+      lease_expires_at: new Date(Date.now() + 60_000), attempt: 1, last_error: null, completed_at: null, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
 
     const status = await app.inject({ method: "GET", url: "/v1/runner/status/worker-a", headers: { authorization: `Bearer ${deviceToken}` } });
     expect(status.statusCode).toBe(200);
-    expect(status.json()).toMatchObject({ executorId: "worker-a", activeTasks: 0, workspaceAliases: ["repo"], workspaceAliasesText: "repo" });
+    expect(status.json()).toMatchObject({
+      executorId: "worker-a", activeTasks: 0, activeRuntimeSyncJobs: 1,
+      workspaceAliases: ["repo"], workspaceAliasesText: "repo"
+    });
+
+    const busyUnregister = await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } });
+    expect(busyUnregister.statusCode).toBe(409);
+    expect(busyUnregister.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_runtime_sync");
+    await db.updateTable("skill_file_sync_jobs").set({ lease_expires_at: new Date(Date.now() - 1_000), updated_at: new Date() })
+      .where("id", "=", syncJob.id).execute();
+    expect((await app.inject({ method: "GET", url: "/v1/runner/status/worker-a", headers: { authorization: `Bearer ${deviceToken}` } })).json())
+      .toMatchObject({ activeRuntimeSyncJobs: 0 });
 
     const unregister = await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } });
     expect(unregister.statusCode).toBe(204);
@@ -346,7 +797,121 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect((await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } })).statusCode).toBe(401);
   });
 
-  it("refuses device self-unregister while a task is running", async () => {
+  it("drains an idle executor atomically for upgrade and restores its previous mode", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-upgrade-drain";
+    await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).execute();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_upgrade_drain", eventType: "im.message.receive_v1", messageId: "om_upgrade_drain",
+      chatId: "oc_upgrade_drain", chatType: "p2p", rootMessageId: "om_upgrade_drain",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_upgrade_drain", botDialogueDepth: 0,
+      messageType: "text", content: "upgrade", explicitlyActivated: true
+    });
+    const authorization = { authorization: `Bearer ${deviceToken}` };
+    const drained = await app.inject({ method: "POST", url: "/v1/runner/upgrade-drain/worker-a", headers: authorization });
+    expect(drained.statusCode).toBe(200);
+    const drainToken = drained.json<{ drainToken: string }>().drainToken;
+    expect(drained.json()).toMatchObject({ operationalMode: "maintenance", previousOperationalMode: "enabled" });
+    expect((await app.inject({
+      method: "GET", url: "/v1/runner/status/worker-a",
+      headers: { ...authorization, "x-upgrade-drain-token": drainToken }
+    })).json()).toMatchObject({ upgradeDraining: true, upgradeDrainOwned: true });
+    expect((await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).operational_mode).toBe("maintenance");
+    await expect(new ControlPlaneRepository(db, 60).claimTask({
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64)
+    })).resolves.toBeNull();
+    expect((await app.inject({
+      method: "DELETE", url: "/v1/runner/upgrade-drain/worker-a",
+      headers: { ...authorization, "x-upgrade-drain-token": "wrong-token" }
+    })).statusCode).toBe(409);
+    const released = await app.inject({
+      method: "DELETE", url: "/v1/runner/upgrade-drain/worker-a",
+      headers: { ...authorization, "x-upgrade-drain-token": drainToken }
+    });
+    expect(released.statusCode).toBe(200);
+    expect(released.json()).toMatchObject({ operationalMode: "enabled" });
+    expect((await new ControlPlaneRepository(db, 60).claimTask({
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64)
+    }))?.task.id).toBe(routed.taskId);
+  });
+
+  it("lets an emergency credential revoke invalidate an in-flight upgrade drain", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-emergency-revoke";
+    await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).execute();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-emergency-revoke"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "emergency-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const authorization = { authorization: `Bearer ${deviceToken}` };
+    const drained = await app.inject({ method: "POST", url: "/v1/runner/upgrade-drain/worker-a", headers: authorization });
+    expect(drained.statusCode).toBe(200);
+    const drainToken = drained.json<{ drainToken: string }>().drainToken;
+
+    const revoked = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/commands",
+      headers: { cookie: "lark_agent_admin_session=owner-emergency-revoke", "x-csrf-token": "emergency-csrf" },
+      payload: { command: "revoke_credentials" }
+    });
+    expect(revoked.statusCode).toBe(200);
+    expect(await db.selectFrom("workers")
+      .select(["status", "operational_mode", "upgrade_drain_token_hash", "upgrade_drain_previous_mode"])
+      .where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).toEqual({
+      status: "offline", operational_mode: "disabled", upgrade_drain_token_hash: null, upgrade_drain_previous_mode: null
+    });
+    expect((await app.inject({
+      method: "DELETE", url: "/v1/runner/upgrade-drain/worker-a",
+      headers: { ...authorization, "x-upgrade-drain-token": drainToken }
+    })).statusCode).toBe(401);
+  });
+
+  it("validates user-skill inventory fingerprints before persisting a worker report", async () => {
+    await insertWorker();
+    const credential = await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256("inventory-device-token"), last_used_at: null, revoked_at: null
+    }).returning("id").executeTakeFirstOrThrow();
+    const session = await issueWorkerSession(config, {
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "a".repeat(64), credentialId: credential.id
+    });
+    const payload = {
+      skills: [], fingerprint: workerUserSkillsFingerprint([]), scannedAt: new Date().toISOString(),
+      status: "ready", truncated: false, total: 0, errors: []
+    };
+    const headers = { authorization: `Bearer ${session.token}` };
+
+    const invalid = await app.inject({ method: "PUT", url: "/v1/workers/user-skills", headers, payload: { ...payload, fingerprint: "f".repeat(64) } });
+    expect(invalid.statusCode).toBe(400);
+    expect(invalid.json<{ error: { code: string } }>().error.code).toBe("user_skills_fingerprint_mismatch");
+    expect((await db.selectFrom("workers").select("user_skills_fingerprint").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).user_skills_fingerprint).toBeNull();
+
+    expect((await app.inject({ method: "PUT", url: "/v1/workers/user-skills", headers, payload })).statusCode).toBe(200);
+    expect((await db.selectFrom("workers").select(["user_skills_fingerprint", "user_skills_scan_status"]).where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()))
+      .toEqual({ user_skills_fingerprint: payload.fingerprint, user_skills_scan_status: "ready" });
+
+    await db.updateTable("workers").set({ config_fingerprint: "b".repeat(64), updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    const staleConfig = await app.inject({ method: "PUT", url: "/v1/workers/user-skills", headers, payload });
+    expect(staleConfig.statusCode).toBe(409);
+    expect(staleConfig.json<{ error: { code: string } }>().error.code).toBe("stale_worker_session");
+
+    await db.updateTable("workers").set({ config_fingerprint: "a".repeat(64), workspace_mapping_fingerprint: workspaceMappingFingerprint, updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    const mappingSession = await issueWorkerSession(config, {
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64),
+      workspaceMappingFingerprint, credentialId: credential.id
+    });
+    await db.updateTable("workers").set({ workspace_mapping_fingerprint: "d".repeat(64), updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+    const staleMapping = await app.inject({ method: "PUT", url: "/v1/workers/user-skills", headers: { authorization: `Bearer ${mappingSession.token}` }, payload });
+    expect(staleMapping.statusCode).toBe(409);
+    expect(staleMapping.json<{ error: { code: string } }>().error.code).toBe("stale_worker_session");
+  });
+
+  it("refuses device self-unregister for every executor-occupying task state", async () => {
     await insertWorker();
     const deviceToken = "device-token-active-task";
     await db.insertInto("worker_device_credentials").values({
@@ -364,9 +929,17 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       lease_token_hash: sha256("lease"), lease_expires_at: new Date(Date.now() + 60_000), summary: null, completed_at: null, updated_at: new Date()
     }).execute();
 
-    const response = await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } });
-    expect(response.statusCode).toBe(409);
-    expect(response.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_tasks");
+    for (const state of ["running", "waiting_approval", "held_draft", "human_owned"] as const) {
+      await db.updateTable("tasks").set({ state, updated_at: new Date() }).where("executor_id", "=", "worker-a").execute();
+      const status = await app.inject({ method: "GET", url: "/v1/runner/status/worker-a", headers: { authorization: `Bearer ${deviceToken}` } });
+      expect(status.json()).toMatchObject({ activeTasks: 1 });
+      const response = await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } });
+      expect(response.statusCode).toBe(409);
+      expect(response.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_tasks");
+      const drain = await app.inject({ method: "POST", url: "/v1/runner/upgrade-drain/worker-a", headers: { authorization: `Bearer ${deviceToken}` } });
+      expect(drain.statusCode).toBe(409);
+      expect((await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).operational_mode).toBe("enabled");
+    }
     expect((await db.selectFrom("worker_device_credentials").select("revoked_at").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).revoked_at).toBeNull();
   });
 
@@ -404,12 +977,80 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(active.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_tasks");
 
     await db.updateTable("tasks").set({ state: "completed", completed_at: now }).where("id", "=", task.id).execute();
+    const context = await insertSkillContext("oc_delete_sync", "worker-a");
+    const syncJob = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", desired_fingerprint: "e".repeat(64),
+      payload: JSON.stringify({}), state: "queued", updated_at: now
+    }).returning("id").executeTakeFirstOrThrow();
+    const syncing = await app.inject({ method: "DELETE", url: "/v1/admin/workers/worker-a", headers });
+    expect(syncing.statusCode).toBe(409);
+    expect(syncing.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_runtime_sync");
+    await db.updateTable("skill_file_sync_jobs").set({ state: "completed", completed_at: now, updated_at: now }).where("id", "=", syncJob.id).execute();
     const removed = await app.inject({ method: "DELETE", url: "/v1/admin/workers/worker-a", headers });
     expect(removed.statusCode).toBe(200);
     expect((await db.selectFrom("workers").select("deleted_at").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).deleted_at).not.toBeNull();
     expect((await db.selectFrom("worker_device_credentials").select("revoked_at").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).revoked_at).not.toBeNull();
     expect((await db.selectFrom("tasks").select("executor_id").where("id", "=", task.id).executeTakeFirstOrThrow()).executor_id).toBe("worker-a");
     expect((await app.inject({ method: "GET", url: "/v1/admin/workers", headers })).json<{ items: unknown[] }>().items).toHaveLength(0);
+  });
+
+  it("baselines workspace mappings once, preserves them for old Runners, and blocks later mapping changes", async () => {
+    const now = new Date();
+    await insertWorker();
+    const context = await insertSkillContext("oc_workspace_mapping_upgrade", "worker-a");
+    await db.updateTable("chat_contexts").set({ codex_thread_id: "thread-workspace-mapping", state: "ready", updated_at: now }).where("id", "=", context.id).execute();
+    const conversation = await db.insertInto("conversations").values({
+      bot_id: context.bot_id, chat_context_id: context.id, bot_config_revision: 1, role_instructions_snapshot: "test",
+      attention_model_snapshot: null, attention_reasoning_effort_snapshot: null, execution_model_snapshot: null, execution_reasoning_effort_snapshot: null,
+      chat_id: context.chat_id, chat_type: "p2p", root_message_id: "om_workspace_mapping", thread_id: null, room_seq: 1,
+      active: true, response_message_id: null, followup_expires_at: null, updated_at: now
+    }).returning("id").executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      bot_id: context.bot_id, conversation_id: conversation.id, state: "waiting_worker", trigger_message_id: "om_workspace_mapping",
+      requester_id: "ou_owner", requester_role: "owner", authorization_grant: JSON.stringify({ read: true }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: "worker-a", executor_id: "worker-a",
+      codex_thread_id: "thread-workspace-mapping", executor_home_ref: "worker-a:home", executor_profile: "lark-agent",
+      executor_config_fingerprint: "a".repeat(64), codex_version: "test", lease_token_hash: null, lease_expires_at: null,
+      summary: null, completed_at: null, updated_at: now
+    }).returning("id").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+    const registration = {
+      executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "a".repeat(64), workspaceMappingFingerprint, codexVersion: "test", capacity: 1,
+      workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1", "workspace_mapping_v1"]
+    };
+
+    await repository.upsertWorker(registration);
+    expect((await db.selectFrom("workers").select("workspace_mapping_fingerprint").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).workspace_mapping_fingerprint)
+      .toBe(workspaceMappingFingerprint);
+    expect((await db.selectFrom("chat_contexts").select(["executor_workspace_mapping_fingerprint", "state"]).where("id", "=", context.id).executeTakeFirstOrThrow()))
+      .toEqual({ executor_workspace_mapping_fingerprint: workspaceMappingFingerprint, state: "ready" });
+    expect((await db.selectFrom("tasks").select(["executor_workspace_mapping_fingerprint", "state"]).where("id", "=", task.id).executeTakeFirstOrThrow()))
+      .toEqual({ executor_workspace_mapping_fingerprint: workspaceMappingFingerprint, state: "waiting_worker" });
+
+    const { workspaceMappingFingerprint: _omittedForLegacyRunner, ...legacyRegistration } = registration;
+    await repository.upsertWorker({ ...legacyRegistration, codexVersion: "old-runner-rollback", capabilities: ["codex", "chat_context_v1"] });
+    expect((await db.selectFrom("workers").select("workspace_mapping_fingerprint").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).workspace_mapping_fingerprint)
+      .toBe(workspaceMappingFingerprint);
+
+    const changedMapping = "d".repeat(64);
+    await repository.upsertWorker({ ...registration, workspaceMappingFingerprint: changedMapping });
+    expect(await db.selectFrom("chat_contexts").select(["executor_workspace_mapping_fingerprint", "state"]).where("id", "=", context.id).executeTakeFirstOrThrow())
+      .toEqual({ executor_workspace_mapping_fingerprint: workspaceMappingFingerprint, state: "blocked" });
+    expect(await db.selectFrom("tasks").select(["executor_workspace_mapping_fingerprint", "state"]).where("id", "=", task.id).executeTakeFirstOrThrow())
+      .toEqual({ executor_workspace_mapping_fingerprint: workspaceMappingFingerprint, state: "waiting_input" });
+
+    await db.updateTable("chat_contexts").set({ state: "ready", blocked_reason: null, updated_at: new Date() }).where("id", "=", context.id).execute();
+    await db.updateTable("tasks").set({ state: "queued", summary: null, updated_at: new Date() }).where("id", "=", task.id).execute();
+    const currentPrincipal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint: changedMapping };
+    await expect(repository.claimTask(currentPrincipal)).resolves.toBeNull();
+    const syncJob = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", desired_fingerprint: "e".repeat(64),
+      payload: JSON.stringify({ botAppId: "cli_bot", resolvedWorkspaceAlias: "repo", skills: [], skillSetFingerprint: "1".repeat(64), runtimeConfig: { fingerprint: "2".repeat(64), files: [] } }),
+      state: "queued", updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    await expect(new SkillRuntimeService(db, config, services.adminEvents).claimSyncJob(currentPrincipal, 60)).resolves.toBeNull();
+    expect((await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", syncJob.id).executeTakeFirstOrThrow()).state).toBe("queued");
   });
 
   it("saves, validates and clears a worker alias without changing its stable execution identity", async () => {
@@ -1271,6 +1912,37 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       .toMatchObject({ state: "waiting_input", preferred_executor_id: "worker-a", summary: "指定执行器尚未升级，不支持永久聊天记忆" });
   });
 
+  it("keeps managed-skill tasks queued until the executor inventory is complete", async () => {
+    await insertWorker();
+    await db.updateTable("workers").set({
+      capabilities: JSON.stringify(["codex", "chat_context_v1", "skillhub_skills_v1", "user_skills_inventory_v1", "workspace_mapping_v1"]),
+      workspace_mapping_fingerprint: workspaceMappingFingerprint,
+      user_skills_scan_status: "unknown", user_skills_truncated: false
+    }).where("executor_id", "=", "worker-a").execute();
+    const pkg = await insertSkillPackage("inventory", "ready-gate");
+    await db.insertInto("bot_skill_bindings").values({
+      bot_id: "00000000-0000-0000-0000-000000000001", chat_context_id: null, package_id: pkg.id,
+      namespace: pkg.namespace, slug: pkg.slug, created_by: "ou_owner", deleted_at: null, updated_at: new Date()
+    }).execute();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_inventory_ready_gate", eventType: "im.message.receive_v1", messageId: "om_inventory_ready_gate",
+      chatId: "oc_inventory_ready_gate", chatType: "p2p", rootMessageId: "om_inventory_ready_gate",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_inventory_ready_gate", botDialogueDepth: 0,
+      messageType: "text", content: "run skill", explicitlyActivated: true
+    });
+    const repository = new ControlPlaneRepository(db, 60);
+    const principal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint };
+
+    await expect(repository.claimTask(principal)).resolves.toBeNull();
+    expect((await db.selectFrom("tasks").select("state").where("id", "=", routed.taskId as string).executeTakeFirstOrThrow()).state).toBe("queued");
+    await db.updateTable("workers").set({ user_skills_scan_status: "ready", user_skills_truncated: true }).where("executor_id", "=", "worker-a").execute();
+    await expect(repository.claimTask(principal)).resolves.toBeNull();
+    await db.updateTable("workers").set({ user_skills_truncated: false }).where("executor_id", "=", "worker-a").execute();
+    await expect(repository.claimTask(principal)).resolves.toMatchObject({ task: { id: routed.taskId } });
+  });
+
   it("blocks a fixed chat context when its runner loses chat_context_v1", async () => {
     await insertWorker();
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
@@ -1317,6 +1989,80 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("tasks").select(["state", "attempt", "revision"]).where("id", "=", routed.taskId as string).executeTakeFirstOrThrow())
       .toMatchObject({ state: "running", attempt: 1, revision: 1 });
     expect(await db.selectFrom("task_events").selectAll().where("task_id", "=", routed.taskId as string).where("event_type", "=", "task.claimed").execute()).toHaveLength(1);
+  });
+
+  it("enforces executor capacity across concurrent task claims for different chat contexts", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routeTask = async (suffix: string) => new MessageRouter(db).route(bot, {
+      eventId: `ev_capacity_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_capacity_${suffix}`,
+      chatId: `oc_capacity_${suffix}`, chatType: "p2p", rootMessageId: `om_capacity_${suffix}`,
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: `om_capacity_${suffix}`, botDialogueDepth: 0,
+      messageType: "text", content: suffix, explicitlyActivated: true
+    });
+    const [first, second] = await Promise.all([routeTask("first"), routeTask("second")]);
+    const principal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) };
+    const claims = await Promise.all([new ControlPlaneRepository(db, 60).claimTask(principal), new ControlPlaneRepository(db, 60).claimTask(principal)]);
+
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect([first.taskId, second.taskId]).toContain(claims.find(Boolean)?.task.id);
+    const states = await db.selectFrom("tasks").select(["id", "state"]).where("id", "in", [first.taskId as string, second.taskId as string]).execute();
+    expect(states.filter((task) => task.state === "running")).toHaveLength(1);
+    expect(states.filter((task) => task.state === "queued" || task.state === "waiting_worker")).toHaveLength(1);
+  });
+
+  it("lets only one concurrent task or workspace sync consume a capacity-one executor", async () => {
+    await insertWorker();
+    await enableWorkerWorkspaceMapping();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_task_sync_capacity", eventType: "im.message.receive_v1", messageId: "om_task_sync_capacity",
+      chatId: "oc_task_sync_capacity", chatType: "p2p", rootMessageId: "om_task_sync_capacity",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_task_sync_capacity", botDialogueDepth: 0,
+      messageType: "text", content: "task", explicitlyActivated: true
+    });
+    const syncContext = await insertSkillContext("oc_sync_capacity", "worker-a");
+    const syncJob = await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: syncContext.id, executor_id: "worker-a", desired_fingerprint: "1".repeat(64),
+      payload: JSON.stringify({ botAppId: "cli_bot", resolvedWorkspaceAlias: "repo", skills: [], skillSetFingerprint: "2".repeat(64), runtimeConfig: { fingerprint: "3".repeat(64), files: [] } }),
+      state: "queued", updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const principal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64), workspaceMappingFingerprint };
+    const runtime = new SkillRuntimeService(db, config, services.adminEvents);
+    const [taskClaim, syncClaim] = await Promise.all([
+      new ControlPlaneRepository(db, 60).claimTask(principal),
+      runtime.claimSyncJob(principal, 60)
+    ]);
+
+    expect([taskClaim, syncClaim].filter(Boolean)).toHaveLength(1);
+    const taskState = await db.selectFrom("tasks").select("state").where("id", "=", routed.taskId as string).executeTakeFirstOrThrow();
+    const syncState = await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", syncJob.id).executeTakeFirstOrThrow();
+    expect(Number(taskState.state === "running") + Number(syncState.state === "running")).toBe(1);
+  });
+
+  it("does not let an expired workspace-sync lease permanently consume executor capacity", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_expired_sync_capacity", eventType: "im.message.receive_v1", messageId: "om_expired_sync_capacity",
+      chatId: "oc_expired_sync_capacity", chatType: "p2p", rootMessageId: "om_expired_sync_capacity",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_expired_sync_capacity", botDialogueDepth: 0,
+      messageType: "text", content: "task", explicitlyActivated: true
+    });
+    const syncContext = await insertSkillContext("oc_expired_sync_lease", "worker-a");
+    await db.insertInto("skill_file_sync_jobs").values({
+      chat_context_id: syncContext.id, executor_id: "worker-a", desired_fingerprint: "7".repeat(64), leased_fingerprint: "7".repeat(64),
+      payload: JSON.stringify({}), leased_payload: JSON.stringify({}), state: "running", lease_token_hash: sha256("expired-sync-lease"),
+      lease_expires_at: new Date(Date.now() - 60_000), attempt: 1, updated_at: new Date()
+    }).execute();
+
+    const claimed = await new ControlPlaneRepository(db, 60).claimTask({
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64)
+    });
+    expect(claimed?.task.id).toBe(routed.taskId);
   });
 
   it("rejects late Thread and result writes after the worker lease is cancelled", async () => {
@@ -1537,7 +2283,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
     }).execute();
     await insertWorker();
-    const createContext = async (chatId: string, expectedFingerprint: string | null) => {
+    await enableWorkerWorkspaceMapping();
+    const createContext = async (chatId: string, expectedFingerprint: string | null, expectedMapping = workspaceMappingFingerprint) => {
       const conversation = await db.insertInto("conversations").values({
         chat_id: chatId, chat_type: "p2p", root_message_id: `om_${chatId}`, thread_id: null, room_seq: 1,
         active: true, response_message_id: null, updated_at: now
@@ -1549,6 +2296,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
           executor_home_ref: "worker-a:home",
           executor_profile: "lark-agent",
           executor_config_fingerprint: expectedFingerprint,
+          executor_workspace_mapping_fingerprint: expectedMapping,
           workspace_root_alias: "repo",
           state: "blocked",
           blocked_reason: "恢复前保持阻塞",
@@ -1558,7 +2306,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       return { contextId: conversation.chat_context_id, conversationId: conversation.id };
     };
     const recoverable = await createContext("oc_recoverable", fingerprint);
-    const mismatched = await createContext("oc_recovery_mismatch", "b".repeat(64));
+    const mismatched = await createContext("oc_recovery_mismatch", "b".repeat(64), "d".repeat(64));
     const replaced = await createContext("oc_recovery_replaced", fingerprint);
     const uninitializedContext = await createContext("oc_recovery_uninitialized", null);
     const recoverableId = recoverable.contextId;
@@ -1604,11 +2352,14 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(failed.statusCode).toBe(200);
     const failedBody = failed.json<{ state: string; recovered: boolean; checks: Array<{ key: string; state: string }> }>();
     expect(failedBody).toMatchObject({ state: "blocked", recovered: false });
-    expect(failedBody.checks).toEqual(expect.arrayContaining([expect.objectContaining({ key: "configFingerprint", state: "fail" })]));
+    expect(failedBody.checks).toEqual(expect.arrayContaining([
+      expect.objectContaining({ key: "workspaceMapping", state: "fail" }),
+      expect.objectContaining({ key: "configFingerprint", state: "fail" })
+    ]));
     expect(await db.selectFrom("chat_contexts").select(["state", "blocked_reason"]).where("id", "=", mismatchedId).executeTakeFirstOrThrow())
       .toEqual({ state: "blocked", blocked_reason: "恢复前保持阻塞" });
     expect(await db.selectFrom("chat_context_recovery_attempts").select(["actor_open_id", "result", "failed_check_keys"]).where("chat_context_id", "=", mismatchedId).executeTakeFirstOrThrow())
-      .toEqual({ actor_open_id: "ou_owner", result: "check_failed", failed_check_keys: ["configFingerprint"] });
+      .toEqual({ actor_open_id: "ou_owner", result: "check_failed", failed_check_keys: ["workspaceMapping", "configFingerprint"] });
 
     const replacedThread = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${replacedId}/recover`, headers });
     expect(replacedThread.statusCode).toBe(200);

@@ -22,6 +22,7 @@ rl.on('line', (line) => {
   if (msg.method === 'thread/start') return send({ id: msg.id, result: { thread: { id: 'thr_' + nextThread++ } } });
   if (msg.method === 'thread/resume') return send({ id: msg.id, result: { thread: { id: msg.params.threadId === 'thr_conflict' ? 'thr_unexpected' : msg.params.threadId } } });
   if (msg.method === 'model/list') return send({ id: msg.id, result: { data: [{ id: 'exec-model', model: 'exec-model', displayName: 'Execution Model', isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }] }], nextCursor: null } });
+  if (msg.method === 'skills/list') return send({ id: msg.id, result: { data: [{ cwd: msg.params.cwds[0], errors: [], skills: [{ name: 'user-tool', description: 'tool', path: msg.params.cwds[0] + '/.agents/skills/user-tool/SKILL.md', scope: 'user', enabled: true, shortDescription: null, interface: { displayName: 'User Tool', shortDescription: 'Short' }, dependencies: { tools: [{ type: 'command', value: 'git', description: 'Git CLI' }] } }] }] } });
   if (msg.method === 'turn/start') {
     const turnId = 'turn_' + nextTurn++;
     send({ id: msg.id, result: { turn: { id: turnId } } });
@@ -101,6 +102,20 @@ describe("CodexAdapter", () => {
     const adapter = new CodexAdapter(config, async () => "decline", undefined, async (update) => { commentary.push(update.text); }, (method) => activity.push(method));
     await adapter.start();
     await expect(adapter.listModels()).resolves.toEqual([{ id: "exec-model", displayName: "Execution Model", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["medium", "high"] }]);
+    await expect(adapter.listSkills([config.codexHome], true)).resolves.toEqual([{
+      cwd: config.codexHome,
+      errors: [],
+      skills: [{
+        name: "user-tool",
+        description: "tool",
+        path: join(config.codexHome, ".agents", "skills", "user-tool", "SKILL.md"),
+        scope: "user",
+        enabled: true,
+        shortDescription: null,
+        interface: { displayName: "User Tool", shortDescription: "Short" },
+        dependencies: [{ type: "command", value: "git", description: "Git CLI" }]
+      }]
+    }]);
     const threadId = await adapter.startOrResumeThread(config.codexHome, null);
     expect(threadId).toBe("thr_1");
     await expect(adapter.startOrResumeThread(config.codexHome, "thr_conflict")).rejects.toThrow(/unexpected thread id/);
@@ -116,5 +131,5 @@ describe("CodexAdapter", () => {
     expect(commentary).toEqual(["checking", "checking", "structured checking"]);
     expect(activity).toContain("thread/tokenUsage/updated");
     await adapter.stop();
-  });
+  }, 10_000);
 });

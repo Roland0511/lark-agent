@@ -22,7 +22,7 @@ export class ApiError extends Error {
 
 export async function api<T>(path: string, init: RequestInit = {}, user?: AdminUser): Promise<T> {
   const headers = new Headers(init.headers);
-  if (init.body) headers.set("content-type", "application/json");
+  if (init.body && !(init.body instanceof FormData)) headers.set("content-type", "application/json");
   if (user && init.method && init.method !== "GET") headers.set("x-csrf-token", user.csrfToken);
   const response = await fetch(publicPath(path), { ...init, headers, credentials: "same-origin" });
   if (!response.ok) {

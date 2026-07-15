@@ -17,6 +17,7 @@ if (process.argv.includes("--enrollment-json")) {
       homeRef: config.homeRef,
       codexProfile: config.codexProfile,
       configFingerprint: config.configFingerprint,
+      workspaceMappingFingerprint: config.workspaceMappingFingerprint,
       codexVersion: config.codexVersion,
       capacity: config.capacity,
       workspaceAliases: config.workspaceRoots.map((root) => root.alias),
@@ -45,7 +46,10 @@ process.stdout.write(`worker ${config.executorId} ready home_ref=${config.homeRe
 
 const configTimer = setInterval(() => {
   void loadWorkerConfig(configFile).then((fresh) => {
-    if (fresh.configFingerprint !== config.configFingerprint) {
+    if (
+      fresh.configFingerprint !== config.configFingerprint ||
+      fresh.workspaceMappingFingerprint !== config.workspaceMappingFingerprint
+    ) {
       configChanged = true;
       process.stderr.write("worker configuration fingerprint changed; draining current task before restart\n");
     }
@@ -56,6 +60,11 @@ configTimer.unref();
 while (!stopping) {
   if (configChanged && !processor.isBusy()) break;
   try {
+    const workspaceSync = await client.claimWorkspaceRuntimeSync();
+    if (workspaceSync) {
+      await processor.processWorkspaceRuntimeSync(workspaceSync);
+      continue;
+    }
     const task = await client.claim();
     if (!task) continue;
     await processor.process(task);

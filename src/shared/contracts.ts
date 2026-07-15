@@ -50,6 +50,7 @@ export const workerRegistrationSchema = z.object({
   homeRef: z.string().min(1).max(128),
   codexProfile: z.string().regex(/^[A-Za-z0-9_-]+$/),
   configFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  workspaceMappingFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
   codexVersion: z.string().min(1).max(128),
   capacity: z.number().int().min(1).max(16),
   workspaceAliases: z.array(z.string().min(1).max(128)).max(128),
@@ -138,6 +139,145 @@ export const attachmentPolicySchema = z.object({
   retentionDays: z.number().int().positive()
 }).default({ maxBytes: 104_857_600, taskMaxBytes: 209_715_200, retentionDays: 7 });
 
+export const skillCoordinateSchema = z.string().regex(
+  /^@[a-z0-9][a-z0-9_-]{0,63}\/[a-z0-9][a-z0-9_-]{0,127}$/,
+  "Invalid SkillHub coordinate"
+);
+
+export const taskSkillPackageSchema = z.object({
+  packageId: canonicalUuidSchema,
+  coordinate: skillCoordinateSchema,
+  name: z.string().min(1).max(128),
+  version: z.string().min(1).max(128),
+  registryFingerprint: z.string().min(1).max(256),
+  archiveSha256: z.string().regex(/^[a-f0-9]{64}$/),
+  sourceScope: z.enum(["bot", "chat_context"])
+});
+export type TaskSkillPackage = z.infer<typeof taskSkillPackageSchema>;
+
+export const taskRuntimeEnvironmentSchema = z.object({
+  name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)
+});
+
+export const taskRuntimeFileSchema = z.object({
+  id: canonicalUuidSchema,
+  targetPath: z.string().min(1).max(1_024),
+  revision: z.number().int().positive(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  size: z.number().int().nonnegative().max(1_048_576),
+  desiredState: z.enum(["present", "absent"]).default("present"),
+  force: z.boolean().default(false)
+});
+export type TaskRuntimeFile = z.infer<typeof taskRuntimeFileSchema>;
+
+export const taskRuntimeConfigSchema = z.object({
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  environment: z.array(taskRuntimeEnvironmentSchema).max(64).default([]),
+  files: z.array(taskRuntimeFileSchema).max(40).default([])
+}).default({ fingerprint: "0".repeat(64), environment: [], files: [] });
+export type TaskRuntimeConfig = z.infer<typeof taskRuntimeConfigSchema>;
+
+export const taskRuntimeEnvironmentResponseSchema = z.object({
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  variables: z.array(z.object({
+    name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
+    value: z.string().max(65_536)
+  })).max(64)
+});
+export type TaskRuntimeEnvironmentResponse = z.infer<typeof taskRuntimeEnvironmentResponseSchema>;
+
+export const workerUserSkillSchema = z.object({
+  name: z.string().min(1).max(128),
+  description: z.string().max(2_000),
+  displayName: z.string().max(256).nullable(),
+  shortDescription: z.string().max(500).nullable(),
+  relativePath: z.string().min(1).max(1_024),
+  dependencies: z.array(z.object({
+    type: z.string().min(1).max(64),
+    value: z.string().min(1).max(512),
+    description: z.string().max(500).nullable()
+  })).max(128).default([]),
+  skillhub: z.object({
+    coordinate: skillCoordinateSchema,
+    version: z.string().min(1).max(128)
+  }).nullable().default(null)
+});
+export type WorkerUserSkill = z.infer<typeof workerUserSkillSchema>;
+
+export const workerUserSkillsReportSchema = z.object({
+  skills: z.array(workerUserSkillSchema).max(512),
+  fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  scannedAt: z.string().datetime(),
+  status: z.enum(["ready", "stale", "error"]),
+  truncated: z.boolean().default(false),
+  total: z.number().int().nonnegative(),
+  errors: z.array(z.string().min(1).max(500)).max(50).default([])
+}).superRefine((report, context) => {
+  if (report.total < report.skills.length) {
+    context.addIssue({ code: "custom", path: ["total"], message: "技能总数不能小于已上报技能数" });
+  }
+  if (report.truncated !== (report.total > report.skills.length)) {
+    context.addIssue({ code: "custom", path: ["truncated"], message: "技能清单截断标记与技能总数不一致" });
+  }
+  if (report.status === "ready" && report.errors.length > 0) {
+    context.addIssue({ code: "custom", path: ["errors"], message: "就绪的技能清单不能包含扫描错误" });
+  }
+});
+export type WorkerUserSkillsReport = z.infer<typeof workerUserSkillsReportSchema>;
+
+export const taskRuntimeSnapshotSchema = z.object({
+  skillSetFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  runtimeConfigFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  managedSkills: z.array(taskSkillPackageSchema).max(64),
+  userSkills: z.array(workerUserSkillSchema).max(512),
+  environmentNames: z.array(z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/)).max(64),
+  files: z.array(z.object({
+    id: canonicalUuidSchema,
+    targetPath: z.string().min(1).max(1_024),
+    revision: z.number().int().positive(),
+    actualSha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+    status: z.enum(["applied", "deleted", "unchanged"]),
+    error: z.null()
+  })).max(40),
+  appliedAt: z.string().datetime()
+});
+export type TaskRuntimeSnapshot = z.infer<typeof taskRuntimeSnapshotSchema>;
+
+export const workspaceRuntimeSyncJobSchema = z.object({
+  id: canonicalUuidSchema,
+  botAppId: z.string().regex(/^cli_[A-Za-z0-9]+$/),
+  chatContextId: lowercaseCanonicalUuidSchema,
+  workspaceKey: lowercaseCanonicalUuidSchema,
+  resolvedWorkspaceAlias: z.string().min(1).max(128),
+  leaseToken: z.string().min(1),
+  leaseExpiresAt: z.string().datetime(),
+  desiredFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  skills: z.array(taskSkillPackageSchema).max(64).default([]),
+  skillSetFingerprint: z.string().regex(/^[a-f0-9]{64}$/).default("0".repeat(64)),
+  runtimeConfig: z.object({
+    fingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+    files: z.array(taskRuntimeFileSchema).max(40).default([])
+  })
+});
+export type WorkspaceRuntimeSyncJob = z.infer<typeof workspaceRuntimeSyncJobSchema>;
+
+export const workspaceRuntimeSyncResultSchema = z.object({
+  status: z.enum(["applied", "conflict", "failed"]),
+  summary: z.string().min(1).max(2_000),
+  desiredFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  skillSetFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  runtimeConfigFingerprint: z.string().regex(/^[a-f0-9]{64}$/),
+  files: z.array(z.object({
+    id: canonicalUuidSchema,
+    targetPath: z.string().min(1).max(1_024),
+    revision: z.number().int().positive(),
+    status: z.enum(["applied", "deleted", "unchanged", "conflict", "failed"]),
+    actualSha256: z.string().regex(/^[a-f0-9]{64}$/).nullable(),
+    errorCode: z.string().min(1).max(128).nullable()
+  })).max(40)
+});
+export type WorkspaceRuntimeSyncResult = z.infer<typeof workspaceRuntimeSyncResultSchema>;
+
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
   botId: canonicalUuidSchema,
@@ -169,6 +309,9 @@ export const claimedTaskSchema = z.object({
   triggerMessageId: z.string().min(1),
   attentionContext: z.string().max(2_000),
   attachmentPolicy: attachmentPolicySchema,
+  skills: z.array(taskSkillPackageSchema).max(64).default([]),
+  skillSetFingerprint: z.string().regex(/^[a-f0-9]{64}$/).default("0".repeat(64)),
+  runtimeConfig: taskRuntimeConfigSchema,
   roomSeq: z.number().int().nonnegative(),
   signals: z.array(signalSchema)
 });

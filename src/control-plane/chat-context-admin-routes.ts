@@ -19,7 +19,7 @@ const listQuerySchema = z.object({
 const chatContextIdSchema = z.string().uuid();
 
 export interface ChatContextRecoveryCheck {
-  key: "thread" | "executor" | "claimable" | "capability" | "homeIdentity" | "profile" | "workspaceAlias" | "configFingerprint";
+  key: "thread" | "executor" | "claimable" | "capability" | "homeIdentity" | "profile" | "workspaceAlias" | "workspaceMapping" | "configFingerprint";
   label: string;
   state: "pass" | "fail";
   detail: string;
@@ -32,6 +32,7 @@ interface RecoveryContextSnapshot {
   executor_home_ref: string | null;
   executor_profile: string | null;
   executor_config_fingerprint: string | null;
+  executor_workspace_mapping_fingerprint: string | null;
   workspace_root_alias: string | null;
 }
 
@@ -40,6 +41,7 @@ interface RecoveryWorkerSnapshot {
   home_ref: string;
   codex_profile: string;
   config_fingerprint: string;
+  workspace_mapping_fingerprint: string | null;
   workspace_aliases: unknown;
   capabilities: unknown;
   operational_mode: "enabled" | "maintenance" | "disabled";
@@ -100,6 +102,11 @@ export function buildChatContextRecoveryChecks(
   const workspaceMatches = Boolean(
     executorActive && context.workspace_root_alias && workspaceAliases.includes(context.workspace_root_alias)
   );
+  const workspaceMappingMatches = Boolean(
+    executorActive && capabilities.includes("workspace_mapping_v1") &&
+    context.executor_workspace_mapping_fingerprint &&
+    worker?.workspace_mapping_fingerprint === context.executor_workspace_mapping_fingerprint
+  );
 
   return [
     check(
@@ -127,6 +134,7 @@ export function buildChatContextRecoveryChecks(
     check("homeIdentity", "Home 身份", homeMatches, "Home 身份与原绑定一致", "Home 身份与原绑定不一致或缺失"),
     check("profile", "Codex Profile", profileMatches, "Codex Profile 与原绑定一致", "Codex Profile 与原绑定不一致或缺失"),
     check("workspaceAlias", "工作区别名", workspaceMatches, "原工作区别名仍可用", "原工作区别名在执行器当前配置中不存在"),
+    check("workspaceMapping", "工作区映射", workspaceMappingMatches, "工作区映射与原绑定一致", "工作区映射与原绑定不一致或缺失"),
     check("configFingerprint", "配置指纹", fingerprintMatches, "配置指纹与原绑定一致", "配置指纹与原绑定不一致或缺失")
   ];
 }
@@ -144,6 +152,7 @@ function publicContext(row: {
   executor_display_name: string | null;
   executor_profile: string | null;
   executor_config_fingerprint: string | null;
+  executor_workspace_mapping_fingerprint: string | null;
   codex_version: string | null;
   workspace_root_alias: string | null;
   state: string;
@@ -151,6 +160,10 @@ function publicContext(row: {
   last_activity_at: Date | string;
   last_compacted_at: Date | string | null;
   auto_compaction_count: number;
+  desired_skill_set_fingerprint: string | null;
+  applied_skill_set_fingerprint: string | null;
+  skills_synced_at: Date | string | null;
+  skills_sync_error: string | null;
   created_at: Date | string;
   updated_at: Date | string;
 }) {
@@ -168,6 +181,7 @@ function publicContext(row: {
     executorDisplayName: row.executor_display_name,
     executorProfile: row.executor_profile,
     executorConfigFingerprint: row.executor_config_fingerprint ? "已记录（值已隐藏）" : null,
+    executorWorkspaceMappingFingerprint: row.executor_workspace_mapping_fingerprint ? "已记录（值已隐藏）" : null,
     codexVersion: row.codex_version,
     workspaceRootAlias: redactAbsoluteLocalPath(row.workspace_root_alias),
     state: row.state,
@@ -175,6 +189,10 @@ function publicContext(row: {
     lastActivityAt: iso(row.last_activity_at),
     lastCompactedAt: iso(row.last_compacted_at),
     autoCompactionCount: Number(row.auto_compaction_count),
+    desiredSkillSetFingerprint: row.desired_skill_set_fingerprint,
+    appliedSkillSetFingerprint: row.applied_skill_set_fingerprint,
+    skillsSyncedAt: iso(row.skills_synced_at),
+    skillsSyncError: row.skills_sync_error,
     createdAt: iso(row.created_at),
     updatedAt: iso(row.updated_at)
   };
@@ -198,8 +216,10 @@ export function registerChatContextAdminRoutes(
       "chat_contexts.chat_id", "chat_contexts.chat_type", "bot_chat_bindings.chat_name",
       "chat_contexts.codex_thread_id", "chat_contexts.executor_id", "chat_contexts.executor_profile",
       sql<string | null>`coalesce(context_workers.display_alias, context_workers.display_name)`.as("executor_display_name"),
-      "chat_contexts.executor_config_fingerprint", "chat_contexts.codex_version", "chat_contexts.workspace_root_alias",
+      "chat_contexts.executor_config_fingerprint", "chat_contexts.executor_workspace_mapping_fingerprint", "chat_contexts.codex_version", "chat_contexts.workspace_root_alias",
       "chat_contexts.state", "chat_contexts.blocked_reason", "chat_contexts.last_activity_at",
+      "chat_contexts.desired_skill_set_fingerprint", "chat_contexts.applied_skill_set_fingerprint",
+      "chat_contexts.skills_synced_at", "chat_contexts.skills_sync_error",
       "chat_contexts.last_compacted_at", "chat_contexts.auto_compaction_count", "chat_contexts.created_at", "chat_contexts.updated_at"
     ]);
 
@@ -311,7 +331,7 @@ export function registerChatContextAdminRoutes(
 
       const worker = context.executor_id
         ? await trx.selectFrom("workers").select([
-            "executor_id", "home_ref", "codex_profile", "config_fingerprint", "workspace_aliases", "capabilities",
+            "executor_id", "home_ref", "codex_profile", "config_fingerprint", "workspace_mapping_fingerprint", "workspace_aliases", "capabilities",
             "operational_mode", "deleted_at"
           ]).where("executor_id", "=", context.executor_id).executeTakeFirst() ?? null
         : null;

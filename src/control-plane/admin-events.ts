@@ -1,7 +1,7 @@
 import { EventEmitter } from "node:events";
 
 export interface AdminChangeEvent {
-  type: "task" | "worker" | "bot" | "chat_context" | "approval" | "outbox" | "incident" | "runtime" | "settings";
+  type: "task" | "worker" | "bot" | "chat_context" | "skill" | "approval" | "outbox" | "incident" | "runtime" | "settings";
   id?: string;
   at: string;
 }

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { claimedTaskSchema, signalSchema } from "./contracts.js";
+import { claimedTaskSchema, signalSchema, workerRegistrationSchema, workerUserSkillsReportSchema } from "./contracts.js";
 
 function claim(botId: string) {
   return {
@@ -82,5 +82,37 @@ describe("signalSchema attachment compatibility", () => {
       createdAt: new Date().toISOString()
     });
     expect(signal.attachments).toEqual([]);
+  });
+});
+
+describe("workerUserSkillsReportSchema", () => {
+  const report = {
+    skills: [], fingerprint: "a".repeat(64), scannedAt: new Date().toISOString(),
+    status: "ready" as const, truncated: false, total: 0, errors: []
+  };
+
+  it("要求总数与截断标记相互一致", () => {
+    expect(workerUserSkillsReportSchema.safeParse({ ...report, total: 1, truncated: false }).success).toBe(false);
+    expect(workerUserSkillsReportSchema.safeParse({ ...report, total: 0, truncated: true }).success).toBe(false);
+    expect(workerUserSkillsReportSchema.safeParse({ ...report, total: 1, truncated: true }).success).toBe(true);
+  });
+
+  it("拒绝把带扫描错误的清单标记为就绪", () => {
+    expect(workerUserSkillsReportSchema.safeParse({ ...report, errors: ["scan failed"] }).success).toBe(false);
+    expect(workerUserSkillsReportSchema.safeParse({ ...report, status: "stale", errors: ["scan failed"] }).success).toBe(true);
+  });
+});
+
+describe("workerRegistrationSchema workspace mapping compatibility", () => {
+  const registration = {
+    executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
+    configFingerprint: "a".repeat(64), codexVersion: "codex test", capacity: 1,
+    workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"]
+  };
+
+  it("accepts both legacy registrations and the independent mapping fingerprint", () => {
+    expect(workerRegistrationSchema.safeParse(registration).success).toBe(true);
+    expect(workerRegistrationSchema.safeParse({ ...registration, workspaceMappingFingerprint: "b".repeat(64) }).success).toBe(true);
+    expect(workerRegistrationSchema.safeParse({ ...registration, workspaceMappingFingerprint: "invalid" }).success).toBe(false);
   });
 });

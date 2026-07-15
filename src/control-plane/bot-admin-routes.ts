@@ -287,6 +287,8 @@ export function registerBotAdminRoutes(
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
     if (!bot) throw new AppError("机器人不存在", 404, "bot_not_found");
     if (bot.enabled || bot.is_system) throw new AppError("请先停用机器人并切换系统通知机器人", 409, "bot_not_disabled");
+    const activeSkill = await db.selectFrom("bot_skill_bindings").select("id").where("bot_id", "=", bot.id).where("deleted_at", "is", null).executeTakeFirst();
+    if (activeSkill) throw new AppError("机器人仍有受控技能；请先逐个移除技能并等待工作区文件清理完成", 409, "bot_has_skills");
     const [activeConversation, activeTasks, pendingOutbox] = await Promise.all([
       db.selectFrom("conversations").select("id").where("bot_id", "=", bot.id).where("active", "=", true).executeTakeFirst(),
       db.selectFrom("tasks").select("id").where("bot_id", "=", bot.id).where("state", "in", ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"]).executeTakeFirst(),

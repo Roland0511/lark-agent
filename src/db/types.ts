@@ -47,6 +47,7 @@ export interface ChatContextsTable {
   executor_home_ref: string | null;
   executor_profile: string | null;
   executor_config_fingerprint: string | null;
+  executor_workspace_mapping_fingerprint: Generated<string | null>;
   codex_version: string | null;
   workspace_root_alias: string | null;
   state: Generated<"uninitialized" | "ready" | "blocked">;
@@ -54,6 +55,10 @@ export interface ChatContextsTable {
   last_activity_at: Timestamp;
   last_compacted_at: NullableTimestamp;
   auto_compaction_count: Generated<number>;
+  desired_skill_set_fingerprint: string | null;
+  applied_skill_set_fingerprint: string | null;
+  skills_synced_at: NullableTimestamp;
+  skills_sync_error: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -101,12 +106,18 @@ export interface TasksTable {
   executor_home_ref: string | null;
   executor_profile: string | null;
   executor_config_fingerprint: string | null;
+  executor_workspace_mapping_fingerprint: Generated<string | null>;
   codex_version: string | null;
   lease_token_hash: string | null;
   lease_expires_at: NullableTimestamp;
   attempt: Generated<number>;
   revision: Generated<number>;
   summary: string | null;
+  skill_set_snapshot: GeneratedJson;
+  skill_set_fingerprint: string | null;
+  runtime_config_snapshot: GeneratedJson;
+  runtime_config_fingerprint: string | null;
+  user_skills_snapshot: GeneratedJson;
   created_at: Timestamp;
   updated_at: Timestamp;
   completed_at: NullableTimestamp;
@@ -161,6 +172,7 @@ export interface WorkersTable {
   home_ref: string;
   codex_profile: string;
   config_fingerprint: string;
+  workspace_mapping_fingerprint: Generated<string | null>;
   codex_version: string;
   capacity: number;
   workspace_aliases: Json;
@@ -173,6 +185,14 @@ export interface WorkersTable {
   status: Generated<string>;
   operational_mode: Generated<"enabled" | "maintenance" | "disabled">;
   deleted_at: NullableTimestamp;
+  user_skills: GeneratedJson;
+  user_skills_fingerprint: string | null;
+  user_skills_scan_status: Generated<"unknown" | "ready" | "stale" | "error">;
+  user_skills_truncated: Generated<boolean>;
+  user_skills_scanned_at: NullableTimestamp;
+  user_skills_scan_error: string | null;
+  upgrade_drain_token_hash: Generated<string | null>;
+  upgrade_drain_previous_mode: Generated<"enabled" | "maintenance" | "disabled" | null>;
   last_seen_at: Timestamp;
   created_at: Timestamp;
   updated_at: Timestamp;
@@ -397,10 +417,127 @@ export interface BotOwnerBindingTokensTable {
   created_at: Timestamp;
 }
 
+export interface SkillhubPackagesTable {
+  id: Generated<string>;
+  registry_url: string;
+  namespace: string;
+  slug: string;
+  version: string;
+  registry_fingerprint: string;
+  archive_sha256: string;
+  archive_path: string;
+  archive_size: number;
+  skill_name: string;
+  description: string;
+  dependencies: GeneratedJson;
+  created_at: Timestamp;
+}
+
+export interface BotSkillBindingsTable {
+  id: Generated<string>;
+  bot_id: string;
+  chat_context_id: string | null;
+  package_id: string;
+  namespace: string;
+  slug: string;
+  created_by: string;
+  deleted_at: NullableTimestamp;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface SkillRuntimeEnvironmentRevisionsTable {
+  id: string;
+  binding_id: string;
+  chat_context_id: string | null;
+  name: string;
+  desired_state: "present" | "absent";
+  key_id: string | null;
+  nonce: string | null;
+  ciphertext: string | null;
+  auth_tag: string | null;
+  value_size: number;
+  revision: number;
+  superseded_at: NullableTimestamp;
+  created_by: string;
+  created_at: Timestamp;
+}
+
+export interface SkillRuntimeFileRevisionsTable {
+  id: string;
+  binding_id: string;
+  chat_context_id: string | null;
+  target_path: string;
+  target_path_key: string;
+  desired_state: "present" | "absent";
+  key_id: string | null;
+  nonce: string | null;
+  ciphertext: string | null;
+  auth_tag: string | null;
+  content_sha256: string | null;
+  content_size: number;
+  revision: number;
+  superseded_at: NullableTimestamp;
+  created_by: string;
+  created_at: Timestamp;
+}
+
+export interface SkillRuntimeFileStatesTable {
+  chat_context_id: string;
+  binding_id: string;
+  target_path: string;
+  desired_file_revision_id: string;
+  desired_revision: number;
+  applied_revision: number | null;
+  actual_sha256: string | null;
+  status: "pending" | "pending_force" | "applied" | "pending_delete" | "deleted" | "drift" | "conflict" | "error";
+  last_error: string | null;
+  checked_at: NullableTimestamp;
+  updated_at: Timestamp;
+}
+
+export interface SkillAdminAuditEventsTable {
+  id: Generated<string>;
+  actor_open_id: string;
+  action: string;
+  bot_id: string;
+  binding_id: string | null;
+  chat_context_id: string | null;
+  target_name: string | null;
+  revision: number | null;
+  result: string;
+  created_at: Timestamp;
+}
+
+export interface SkillFileSyncJobsTable {
+  id: Generated<string>;
+  chat_context_id: string;
+  executor_id: string;
+  desired_fingerprint: string;
+  leased_fingerprint: string | null;
+  payload: Json;
+  leased_payload: Json | null;
+  state: Generated<"queued" | "running" | "completed" | "failed">;
+  lease_token_hash: string | null;
+  lease_expires_at: NullableTimestamp;
+  attempt: Generated<number>;
+  last_error: string | null;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+  completed_at: NullableTimestamp;
+}
+
 export interface Database {
   bots: BotsTable;
   bot_chat_bindings: BotChatBindingsTable;
   bot_owner_binding_tokens: BotOwnerBindingTokensTable;
+  skillhub_packages: SkillhubPackagesTable;
+  bot_skill_bindings: BotSkillBindingsTable;
+  skill_runtime_environment_revisions: SkillRuntimeEnvironmentRevisionsTable;
+  skill_runtime_file_revisions: SkillRuntimeFileRevisionsTable;
+  skill_runtime_file_states: SkillRuntimeFileStatesTable;
+  skill_admin_audit_events: SkillAdminAuditEventsTable;
+  skill_file_sync_jobs: SkillFileSyncJobsTable;
   chat_contexts: ChatContextsTable;
   chat_context_compactions: ChatContextCompactionsTable;
   chat_context_recovery_attempts: ChatContextRecoveryAttemptsTable;

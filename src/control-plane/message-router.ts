@@ -106,6 +106,7 @@ export class MessageRouter {
           executor_home_ref: null,
           executor_profile: null,
           executor_config_fingerprint: null,
+          executor_workspace_mapping_fingerprint: null,
           codex_version: null,
           workspace_root_alias: null,
           state: "uninitialized",
@@ -155,21 +156,46 @@ export class MessageRouter {
         let routeAmbiguous = false;
         let routeBlocked = chatContext.state === "blocked";
         let routeBlockedReason = chatContext.blocked_reason;
+        const scopedBindings = await trx.selectFrom("bot_skill_bindings").select(["id", "namespace", "slug", "chat_context_id"])
+          .where("bot_id", "=", bot.id).where("deleted_at", "is", null)
+          .where((eb) => eb.or([eb("chat_context_id", "is", null), eb("chat_context_id", "=", chatContext.id)])).execute();
+        const effectiveBindings = new Map<string, typeof scopedBindings[number]>();
+        for (const binding of scopedBindings.sort((left, right) => Number(Boolean(left.chat_context_id)) - Number(Boolean(right.chat_context_id)))) {
+          effectiveBindings.set(`${binding.namespace}/${binding.slug}`, binding);
+        }
+        const bindingIds = [...effectiveBindings.values()].map((binding) => binding.id);
+        let requiresRuntimeConfig = false;
+        if (bindingIds.length) {
+          const [environment, files] = await Promise.all([
+            trx.selectFrom("skill_runtime_environment_revisions").select("id").where("binding_id", "in", bindingIds).where("superseded_at", "is", null)
+              .where((eb) => eb.or([eb("chat_context_id", "is", null), eb("chat_context_id", "=", chatContext.id)])).limit(1).executeTakeFirst(),
+            trx.selectFrom("skill_runtime_file_revisions").select("id").where("binding_id", "in", bindingIds).where("superseded_at", "is", null)
+              .where((eb) => eb.or([eb("chat_context_id", "is", null), eb("chat_context_id", "=", chatContext.id)])).limit(1).executeTakeFirst()
+          ]);
+          requiresRuntimeConfig = Boolean(environment || files);
+        }
+        const requiredCapabilities = ["chat_context_v1", ...(bindingIds.length ? ["skillhub_skills_v1", "user_skills_inventory_v1", "workspace_mapping_v1"] : []), ...(requiresRuntimeConfig ? ["skill_runtime_config_v1"] : [])];
+        const missingCapabilities = (capabilities: string[]) => requiredCapabilities.filter((capability) => !capabilities.includes(capability));
         if (chatContext.codex_thread_id && chatContext.executor_id) {
           const fixedWorker = await trx.selectFrom("workers").selectAll().where("executor_id", "=", chatContext.executor_id).executeTakeFirst();
           const aliases = Array.isArray(fixedWorker?.workspace_aliases) ? fixedWorker.workspace_aliases.map(String) : [];
           const capabilities = Array.isArray(fixedWorker?.capabilities) ? fixedWorker.capabilities.map(String) : [];
+          const missing = missingCapabilities(capabilities);
           const environmentMatches = Boolean(
             fixedWorker && !fixedWorker.deleted_at && fixedWorker.operational_mode === "enabled" &&
-            capabilities.includes("chat_context_v1") &&
+            missing.length === 0 &&
+            (!bindingIds.length || fixedWorker.workspace_mapping_fingerprint !== null) &&
             fixedWorker.home_ref === chatContext.executor_home_ref &&
             fixedWorker.codex_profile === chatContext.executor_profile &&
             fixedWorker.config_fingerprint === chatContext.executor_config_fingerprint &&
+            fixedWorker.workspace_mapping_fingerprint === chatContext.executor_workspace_mapping_fingerprint &&
             chatContext.workspace_root_alias && aliases.includes(chatContext.workspace_root_alias)
           );
           if (!environmentMatches) {
             routeBlocked = true;
-            routeBlockedReason = "聊天绑定的执行器、CODEX_HOME、Profile、配置指纹或工作区别名已不匹配";
+            routeBlockedReason = missing.length
+              ? `聊天绑定的执行器缺少当前技能配置所需能力：${missing.join("、")}`
+              : "聊天绑定的执行器、CODEX_HOME、Profile、配置指纹或工作区别名已不匹配";
             await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: routeBlockedReason, updated_at: now }).where("id", "=", chatContext.id).execute();
           }
         } else if (chatContext.codex_thread_id) {
@@ -177,20 +203,26 @@ export class MessageRouter {
           routeBlockedReason = "历史 Thread 缺少完整的固定执行环境，无法安全恢复";
           await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: routeBlockedReason, updated_at: now }).where("id", "=", chatContext.id).execute();
         } else if (preferredExecutorId) {
-          const preferredWorker = await trx.selectFrom("workers").select(["capabilities"])
+          const preferredWorker = await trx.selectFrom("workers").select(["capabilities", "operational_mode", "workspace_mapping_fingerprint"])
             .where("executor_id", "=", preferredExecutorId).where("deleted_at", "is", null).executeTakeFirst();
           const capabilities = Array.isArray(preferredWorker?.capabilities) ? preferredWorker.capabilities.map(String) : [];
-          if (!capabilities.includes("chat_context_v1")) {
+          const missing = missingCapabilities(capabilities);
+          if (!preferredWorker || preferredWorker.operational_mode !== "enabled" || missing.length || (bindingIds.length > 0 && preferredWorker.workspace_mapping_fingerprint === null)) {
             routeBlocked = true;
-            routeBlockedReason = "指定执行器尚未升级，不支持永久聊天记忆";
+            routeBlockedReason = missing.length
+              ? missing.length === 1 && missing[0] === "chat_context_v1"
+                ? "指定执行器尚未升级，不支持永久聊天记忆"
+                : `指定执行器缺少当前技能配置所需能力：${missing.join("、")}`
+              : "指定执行器当前不可用";
           }
         } else if (!preferredExecutorId) {
-          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases", "capabilities"])
+          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases", "capabilities", "workspace_mapping_fingerprint"])
             .where("deleted_at", "is", null).where("operational_mode", "=", "enabled").execute();
           const eligible = workers.filter((worker) => {
             const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
             const capabilities = Array.isArray(worker.capabilities) ? worker.capabilities.map(String) : [];
-            return capabilities.includes("chat_context_v1") && (requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1);
+            return missingCapabilities(capabilities).length === 0 && (!bindingIds.length || worker.workspace_mapping_fingerprint !== null) &&
+              (requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1);
           });
           if (eligible.length === 1) preferredExecutorId = eligible[0]!.executor_id;
           else if (eligible.length > 1) routeAmbiguous = true;
@@ -214,6 +246,7 @@ export class MessageRouter {
           executor_home_ref: chatContext.executor_home_ref,
           executor_profile: chatContext.executor_profile,
           executor_config_fingerprint: chatContext.executor_config_fingerprint,
+          executor_workspace_mapping_fingerprint: chatContext.executor_workspace_mapping_fingerprint,
           codex_version: chatContext.codex_version,
           lease_token_hash: null,
           lease_expires_at: null,

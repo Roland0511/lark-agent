@@ -2,19 +2,31 @@ import {
   attentionResultSchema,
   claimedTaskSchema,
   signalSchema,
+  taskRuntimeEnvironmentResponseSchema,
+  taskRuntimeSnapshotSchema,
+  workerUserSkillsReportSchema,
   workerSessionResponseSchema,
+  workspaceRuntimeSyncJobSchema,
+  workspaceRuntimeSyncResultSchema,
   type AttentionResult,
   type ClaimedTask,
   type InboxDecision,
   type Signal,
+  type TaskRuntimeEnvironmentResponse,
+  type TaskRuntimeFile,
+  type TaskRuntimeSnapshot,
+  type TaskSkillPackage,
   type WorkerRegistration,
-  type WorkerModelCatalogEntry
+  type WorkerModelCatalogEntry,
+  type WorkerUserSkillsReport,
+  type WorkspaceRuntimeSyncJob,
+  type WorkspaceRuntimeSyncResult
 } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { createWriteStream } from "node:fs";
 import { chmod, mkdir, rename, rm } from "node:fs/promises";
 import { dirname, extname } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
@@ -30,6 +42,7 @@ export class ControlPlaneClient {
       homeRef: this.config.homeRef,
       codexProfile: this.config.codexProfile,
       configFingerprint: this.config.configFingerprint,
+      workspaceMappingFingerprint: this.config.workspaceMappingFingerprint,
       codexVersion: this.config.codexVersion,
       capacity: this.config.capacity,
       workspaceAliases: this.config.workspaceRoots.map((root) => root.alias),
@@ -68,6 +81,106 @@ export class ControlPlaneClient {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ models })
     }).then(jsonResponse);
+  }
+
+  async reportUserSkills(report: WorkerUserSkillsReport): Promise<void> {
+    workerUserSkillsReportSchema.parse(report);
+    await this.authorizedFetch("/v1/workers/user-skills", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(report)
+    }).then(jsonResponse);
+  }
+
+  async runtimeEnvironment(task: ClaimedTask): Promise<TaskRuntimeEnvironmentResponse> {
+    const response = await this.authorizedFetch(`/v1/tasks/${task.id}/runtime-config/environment`, {
+      headers: leaseHeaders(task.leaseToken)
+    });
+    return taskRuntimeEnvironmentResponseSchema.parse(await jsonResponse(response));
+  }
+
+  async reportRuntimeSnapshot(task: ClaimedTask, snapshot: TaskRuntimeSnapshot): Promise<void> {
+    taskRuntimeSnapshotSchema.parse(snapshot);
+    await this.authorizedFetch(`/v1/tasks/${task.id}/runtime-snapshot`, {
+      method: "POST",
+      headers: { ...leaseHeaders(task.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(snapshot)
+    }).then(jsonResponse);
+  }
+
+  async reportRuntimeFailure(task: ClaimedTask, failure: {
+    skillSetFingerprint: string;
+    runtimeConfigFingerprint: string;
+    code: string;
+    summary: string;
+    targetPath?: string | null;
+  }): Promise<void> {
+    await this.authorizedFetch(`/v1/tasks/${task.id}/runtime-snapshot/failure`, {
+      method: "POST",
+      headers: { ...leaseHeaders(task.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(failure)
+    }).then(jsonResponse);
+  }
+
+  async downloadSkillPackage(task: ClaimedTask, skill: TaskSkillPackage, target: string): Promise<{ path: string; size: number; sha256: string }> {
+    const response = await this.authorizedFetch(`/v1/tasks/${task.id}/skills/${skill.packageId}/download`, {
+      headers: leaseHeaders(task.leaseToken)
+    });
+    return downloadBoundedResponse(response, target, 104_857_600, skill.archiveSha256, "skill package");
+  }
+
+  async downloadRuntimeFile(task: ClaimedTask, file: TaskRuntimeFile, target: string): Promise<{ path: string; size: number; sha256: string }> {
+    const params = new URLSearchParams({ revision: String(file.revision) });
+    const response = await this.authorizedFetch(`/v1/tasks/${task.id}/runtime-config/files/${file.id}/download?${params}`, {
+      headers: leaseHeaders(task.leaseToken)
+    });
+    return downloadBoundedResponse(response, target, Math.min(file.size, 1_048_576), file.sha256, "runtime file");
+  }
+
+  async claimWorkspaceRuntimeSync(): Promise<WorkspaceRuntimeSyncJob | null> {
+    const response = await this.authorizedFetch("/v1/workers/runtime-sync-jobs/claim", { method: "POST" });
+    if (response.status === 204) return null;
+    if (response.status === 404 || response.status === 405) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    return workspaceRuntimeSyncJobSchema.parse(await jsonResponse(response));
+  }
+
+  async downloadWorkspaceRuntimeFile(job: WorkspaceRuntimeSyncJob, file: TaskRuntimeFile, target: string): Promise<{ path: string; size: number; sha256: string }> {
+    const params = new URLSearchParams({ revision: String(file.revision) });
+    const response = await this.authorizedFetch(`/v1/workers/runtime-sync-jobs/${job.id}/files/${file.id}/download?${params}`, {
+      headers: syncLeaseHeaders(job.leaseToken)
+    });
+    return downloadBoundedResponse(response, target, Math.min(file.size, 1_048_576), file.sha256, "runtime file");
+  }
+
+  async downloadWorkspaceSkillPackage(job: WorkspaceRuntimeSyncJob, skill: TaskSkillPackage, target: string): Promise<{ path: string; size: number; sha256: string }> {
+    const response = await this.authorizedFetch(`/v1/workers/runtime-sync-jobs/${job.id}/skills/${skill.packageId}/download`, {
+      headers: syncLeaseHeaders(job.leaseToken)
+    });
+    return downloadBoundedResponse(response, target, 104_857_600, skill.archiveSha256, "skill package");
+  }
+
+  async completeWorkspaceRuntimeSync(job: WorkspaceRuntimeSyncJob, result: WorkspaceRuntimeSyncResult): Promise<void> {
+    workspaceRuntimeSyncResultSchema.parse(result);
+    await this.authorizedFetch(`/v1/workers/runtime-sync-jobs/${job.id}/result`, {
+      method: "POST",
+      headers: { ...syncLeaseHeaders(job.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(result)
+    }).then(jsonResponse);
+  }
+
+  async heartbeatWorkspaceRuntimeSync(job: WorkspaceRuntimeSyncJob): Promise<{ leaseExpiresAt: string }> {
+    const response = await this.authorizedFetch(`/v1/workers/runtime-sync-jobs/${job.id}/heartbeat`, {
+      method: "POST",
+      headers: syncLeaseHeaders(job.leaseToken)
+    });
+    const body = (await jsonResponse(response)) as { leaseExpiresAt?: unknown };
+    if (typeof body.leaseExpiresAt !== "string" || !Number.isFinite(Date.parse(body.leaseExpiresAt))) {
+      throw new Error("runtime sync heartbeat response is invalid");
+    }
+    return { leaseExpiresAt: body.leaseExpiresAt };
   }
 
   async heartbeat(taskId: string, leaseToken: string): Promise<{ leaseExpiresAt: string; state: string }> {
@@ -226,6 +339,10 @@ function leaseHeaders(token: string): Record<string, string> {
   return { "x-lease-token": token };
 }
 
+function syncLeaseHeaders(token: string): Record<string, string> {
+  return { "x-sync-lease-token": token };
+}
+
 async function jsonResponse(response: Response): Promise<unknown> {
   if (!response.ok) {
     const text = await response.text();
@@ -233,4 +350,48 @@ async function jsonResponse(response: Response): Promise<unknown> {
   }
   if (response.status === 204) return null;
   return response.json();
+}
+
+async function downloadBoundedResponse(
+  response: Response,
+  target: string,
+  maxBytes: number,
+  expectedSha256: string,
+  label: string
+): Promise<{ path: string; size: number; sha256: string }> {
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`${label} download failed with status ${response.status}`);
+  }
+  const declared = Number(response.headers.get("content-length") ?? "0");
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel();
+    throw new Error(`${label} exceeds the configured size limit`);
+  }
+  if (!response.body) throw new Error(`${label} response has no body`);
+  await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  let bytes = 0;
+  const digest = createHash("sha256");
+  try {
+    const source = Readable.fromWeb(response.body as import("node:stream/web").ReadableStream<Uint8Array>);
+    const destination = createWriteStream(temporary, { flags: "wx", mode: 0o600 });
+    const counter = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        bytes += chunk.length;
+        if (bytes > maxBytes) return callback(new Error(`${label} exceeds the configured size limit`));
+        digest.update(chunk);
+        callback(null, chunk);
+      }
+    });
+    await pipeline(source, counter, destination);
+    const actualSha256 = digest.digest("hex");
+    if (actualSha256 !== expectedSha256) throw new Error(`${label} digest mismatch`);
+    await chmod(temporary, 0o600);
+    await rename(temporary, target);
+    return { path: target, size: bytes, sha256: actualSha256 };
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
 }

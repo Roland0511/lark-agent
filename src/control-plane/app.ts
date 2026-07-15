@@ -1,10 +1,12 @@
 import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import cookie from "@fastify/cookie";
+import multipart from "@fastify/multipart";
 import staticPlugin from "@fastify/static";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { Kysely } from "kysely";
+import { ZodError } from "zod";
 import type { Database } from "../db/types.js";
 import {
   approvalRequestSchema,
@@ -39,6 +41,8 @@ import { BotGatewayRegistry } from "./bot-runtime.js";
 import { MessageRouter } from "./message-router.js";
 import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 import { publicAttachments, storedAttachments } from "../lark/attachments.js";
+import { registerSkillRoutes } from "./skill-routes.js";
+import { SkillRuntimeService } from "./skill-runtime-service.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -95,13 +99,14 @@ export function buildControlPlane(
 ): { app: FastifyInstance; services: ControlPlaneServices } {
   const app = Fastify({
     forceCloseConnections: true,
-    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "body.token", "body.appSecret", "body.content", "body.text", "body.payload", "body.result"] }
+    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "req.headers.x-sync-lease-token", "req.headers.x-upgrade-drain-token", "body.token", "body.appSecret", "body.value", "body.contentBase64", "body.content", "body.text", "body.payload", "body.result"] }
   });
   const runtime = services?.runtime ?? readiness.runtime ?? new RuntimeStatus();
   const lark = services?.lark ?? new LarkGateway(config.larkCliPath);
   const gateways = services?.gateways ?? new BotGatewayRegistry(db, config.larkCliPath, services?.lark);
   const repository = services?.repository ?? new ControlPlaneRepository(db, config.leaseSeconds);
   const adminEvents = services?.adminEvents ?? new AdminEventBus();
+  const skillRuntime = new SkillRuntimeService(db, config, adminEvents);
   const messageRouter = services?.messageRouter ?? new MessageRouter(db);
   const dialogueGuard = services?.dialogueGuard ?? new BotDialogueGuardService(db, gateways, adminEvents);
   const router = services?.router ?? new EventRouter(db, config, lark, repository, undefined, messageRouter, dialogueGuard);
@@ -114,9 +119,12 @@ export function buildControlPlane(
   const resolvedServices = { repository, router, drafts, outputs, lark, gateways, adminEvents, runtime, messageRouter, dialogueGuard };
 
   void app.register(cookie);
+  void app.register(multipart, { limits: { fileSize: 1_048_576, files: 1, fields: 10 } });
 
   app.setErrorHandler((error, _request, reply) => {
-    const appError = error instanceof AppError ? error : new AppError(errorMessage(error));
+    const appError = error instanceof AppError ? error : error instanceof ZodError
+      ? new AppError("请求参数格式无效", 400, "invalid_request")
+      : new AppError(errorMessage(error));
     if (appError.statusCode >= 500) app.log.error({ err: error, code: appError.code }, "request failed");
     void reply.status(appError.statusCode).send({ error: { code: appError.code, message: appError.message } });
   });
@@ -141,6 +149,7 @@ export function buildControlPlane(
       homeRef: registration.homeRef,
       codexProfile: registration.codexProfile,
       configFingerprint: registration.configFingerprint,
+      workspaceMappingFingerprint: registration.workspaceMappingFingerprint ?? null,
       credentialId
     });
     return reply.send({ sessionToken: session.token, expiresAt: session.expiresAt.toISOString() });
@@ -166,6 +175,22 @@ export function buildControlPlane(
     do {
       const claimed = await repository.claimTask(principal);
       if (claimed) {
+        let taskRuntime;
+        try {
+          taskRuntime = await skillRuntime.prepareTaskSnapshot(claimed.task.id);
+        } catch (error) {
+          const detail = errorMessage(error).slice(0, 1_000);
+          await repository.rejectInvalidClaim(claimed.task.id, claimed.leaseToken, `技能或运行依赖准备失败：${detail}`);
+          const fingerprint = `skill_runtime_sync:${claimed.task.id}`;
+          await db.insertInto("incidents").values({
+            fingerprint, kind: "skill_runtime_sync", severity: "critical", title: "技能运行依赖未就绪", summary: detail,
+            state: "open", related_type: "task", related_id: claimed.task.id, first_seen_at: new Date(), last_seen_at: new Date(),
+            acknowledged_by: null, acknowledged_at: null, resolved_at: null, notification_message_id: null, last_notified_at: null,
+            last_notification_error: null, updated_at: new Date()
+          }).onConflict((conflict) => conflict.column("fingerprint").doUpdateSet({ summary: detail, state: "open", last_seen_at: new Date(), resolved_at: null, updated_at: new Date() })).execute();
+          adminEvents.publish("task", claimed.task.id); adminEvents.publish("incident");
+          continue;
+        }
         const conversation = await db.selectFrom("conversations")
           .innerJoin("bots", "bots.id", "conversations.bot_id")
           .innerJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
@@ -226,6 +251,9 @@ export function buildControlPlane(
             taskMaxBytes: config.attachmentTaskMaxBytes,
             retentionDays: config.attachmentRetentionDays
           },
+          skills: taskRuntime.skills,
+          skillSetFingerprint: taskRuntime.skillSetFingerprint,
+          runtimeConfig: taskRuntime.runtimeConfig,
           roomSeq: conversation.room_seq,
           signals: signals.map(publicSignal)
         };
@@ -313,6 +341,7 @@ export function buildControlPlane(
       const binding = await repository.bindTaskThread(request.params.id, threadId, lease);
       chatContextId = binding.chatContextId;
       bindingBlocked = binding.status === "blocked";
+      if (binding.status === "bound") await skillRuntime.enqueueLatestForContext(binding.chatContextId);
     } else if (event.type === "codex.thread.resume_failed" || event.type === "codex.context.blocked") {
       const blocked = await repository.blockTaskContext(request.params.id, event.summary || "固定 Codex Thread 无法安全恢复", lease);
       chatContextId = blocked.chatContextId;
@@ -352,6 +381,7 @@ export function buildControlPlane(
       const binding = await repository.bindTaskThread(request.params.id, draft.codexThreadId, { executorId: principal.executorId, leaseToken: currentLeaseToken });
       adminEvents.publish("chat_context", binding.chatContextId);
       if (binding.status === "blocked") throw new AppError("Codex Thread 与聊天固定绑定冲突，任务已暂停", 409, "chat_context_conflict");
+      if (binding.status === "bound") await skillRuntime.enqueueLatestForContext(binding.chatContextId);
     }
     const result = await drafts.submit(request.params.id, draft.content, draft.baseRoomSeq, draft.force);
     adminEvents.publish("task", request.params.id);
@@ -410,6 +440,7 @@ export function buildControlPlane(
   registerAdminAuth(app, db, config);
   registerRunnerRoutes(app, db, config, runnerReleases, adminEvents);
   registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
+  registerSkillRoutes(app, db, config, repository, adminEvents, skillRuntime);
   registerChatContextAdminRoutes(app, db, config, adminEvents);
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);

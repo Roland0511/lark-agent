@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
-import type { AttentionResult, ClaimedTask, Signal, SignalAttachment } from "../shared/contracts.js";
+import { mkdir } from "node:fs/promises";
+import { join } from "node:path";
+import type { AttentionResult, ClaimedTask, Signal, SignalAttachment, WorkerUserSkillsReport, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import { taskTurnResultSchema, type TaskTurnResult } from "../shared/contracts.js";
 import { errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-client.js";
 import { CodexAdapter } from "./codex-adapter.js";
+import { buildUserSkillsReport, isolatedCodexEnvironment, SkillRuntimeError, SkillRuntimeManager } from "./skills.js";
 import { resolveBotWorkspace, resolveChatWorkspace, type BotWorkspace } from "./workspace.js";
 import { attachmentTarget, cleanupAllAttachmentRoots, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
 
@@ -27,20 +30,40 @@ export class TaskProcessor {
   private compactionChain: Promise<void> = Promise.resolve();
   private latestTokenUsage: Record<string, number> | null = null;
   private codex: CodexAdapter;
+  private taskCodex: CodexAdapter | null = null;
+  private readonly skillRuntime: SkillRuntimeManager;
+  private userSkillTimer: NodeJS.Timeout | null = null;
+  private userSkillRefresh: Promise<void> = Promise.resolve();
+  private lastUserSkillsReport: WorkerUserSkillsReport | null = null;
+  private workspaceSyncBusy = false;
+  private readonly attentionWorkspace: string;
+  private activeSecretValues: string[] = [];
 
   constructor(private readonly config: ResolvedWorkerConfig, private readonly client: ControlPlaneClient) {
+    // Programmatic/test callers created before runtime_state_dir existed may
+    // still provide a partial ResolvedWorkerConfig. File-backed production
+    // configs always resolve the explicit private state directory.
+    const runtimeStateDir = config.runtimeStateDir ?? join(config.workspaceRoots[0]?.path ?? process.cwd(), ".lark-agent-runner-state");
+    this.attentionWorkspace = join(runtimeStateDir, "attention");
+    this.skillRuntime = new SkillRuntimeManager({ ...config, runtimeStateDir }, client);
+    const isolated = isolatedCodexEnvironment({}, [], config.deviceTokenEnvironmentName ? [config.deviceTokenEnvironmentName] : []);
     this.codex = new CodexAdapter(
       config,
       async (request) => this.handleApproval(request),
       async (item) => this.handleCompletedItem(item),
       async (update) => this.handleCommentary(update),
-      (method, params) => this.handleCodexActivity(method, params)
+      (method, params) => this.handleCodexActivity(method, params),
+      { environment: isolated.environment, shellEnvironmentAllowlist: isolated.allowlist }
     );
   }
 
   async start(): Promise<void> {
     await cleanupAllAttachmentRoots(this.config.workspaceRoots, this.config.attachmentRetentionDays);
+    await mkdir(this.attentionWorkspace, { recursive: true, mode: 0o700 });
     await this.codex.start();
+    await this.refreshUserSkills().catch((error) => process.stderr.write(`worker user skill inventory unavailable: ${this.safeErrorSummary(error)}\n`));
+    this.userSkillTimer = setInterval(() => this.scheduleUserSkillRefresh(), 5 * 60_000);
+    this.userSkillTimer.unref();
   }
 
   async modelCatalog() {
@@ -49,11 +72,71 @@ export class TaskProcessor {
   }
 
   async stop(): Promise<void> {
+    if (this.userSkillTimer) clearInterval(this.userSkillTimer);
+    this.userSkillTimer = null;
+    await this.taskCodex?.stop().catch(() => undefined);
+    this.taskCodex = null;
     await this.codex.stop();
   }
 
   isBusy(): boolean {
-    return this.currentTask !== null;
+    return this.currentTask !== null || this.workspaceSyncBusy;
+  }
+
+  async processWorkspaceRuntimeSync(job: WorkspaceRuntimeSyncJob): Promise<void> {
+    if (this.isBusy()) throw new Error("runner is busy");
+    this.workspaceSyncBusy = true;
+    let leaseExpiresAt = Date.parse(job.leaseExpiresAt);
+    let leaseValidated = false;
+    let leaseLost = false;
+    const renewLease = async () => {
+      const heartbeat = await this.client.heartbeatWorkspaceRuntimeSync(job);
+      leaseExpiresAt = Date.parse(heartbeat.leaseExpiresAt);
+      leaseValidated = true;
+      leaseLost = false;
+    };
+    let heartbeatTimer: NodeJS.Timeout | null = null;
+    let completionAttempted = false;
+    try {
+      await renewLease();
+      heartbeatTimer = setInterval(() => {
+        void renewLease().catch(() => {
+          if (!Number.isFinite(leaseExpiresAt) || Date.now() >= leaseExpiresAt) leaseLost = true;
+        });
+      }, 20_000);
+      heartbeatTimer.unref();
+      if (job.workspaceKey !== job.chatContextId) throw new Error("workspace sync key does not match chat context id");
+      const workspace = await resolveChatWorkspace(
+        this.config.workspaceRoots,
+        job.resolvedWorkspaceAlias,
+        job.botAppId,
+        job.chatContextId,
+        job.workspaceKey
+      );
+      const assertLease = () => {
+        if (leaseLost || !Number.isFinite(leaseExpiresAt) || Date.now() >= leaseExpiresAt) throw new Error("workspace runtime sync lease expired");
+      };
+      const result = await this.skillRuntime.applyWorkspaceSync(job, workspace.path, this.codex, assertLease);
+      assertLease();
+      completionAttempted = true;
+      await this.client.completeWorkspaceRuntimeSync(job, result);
+    } catch (error) {
+      if (leaseValidated && !completionAttempted && Number.isFinite(leaseExpiresAt) && Date.now() < leaseExpiresAt) {
+        completionAttempted = true;
+        await this.client.completeWorkspaceRuntimeSync(job, {
+          status: "failed",
+          summary: "工作区无法准备，技能与运行配置未同步。",
+          desiredFingerprint: job.desiredFingerprint,
+          skillSetFingerprint: job.skillSetFingerprint,
+          runtimeConfigFingerprint: job.runtimeConfig.fingerprint,
+          files: []
+        }).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      this.workspaceSyncBusy = false;
+    }
   }
 
   async process(task: ClaimedTask): Promise<void> {
@@ -80,44 +163,16 @@ export class TaskProcessor {
             stoppedByControl = true;
             controlState = status.state;
             await this.client.event(task.id, task.leaseToken, "task.control", `任务状态已切换为 ${status.state}`);
-            const active = this.codex.activeTurn();
-            if (active) await this.codex.interrupt(active.threadId, active.turnId).catch(() => undefined);
+            const adapter = this.activeCodex();
+            const active = adapter.activeTurn();
+            if (active) await adapter.interrupt(active.threadId, active.turnId).catch(() => undefined);
             if (status.state === "human_owned") await this.openHandoff(task).catch(() => undefined);
           }
         }).catch(() => undefined);
       }, 20_000);
 
       const requestedThreadId = task.chatContextThreadId !== undefined ? task.chatContextThreadId : task.codexThreadId;
-      let threadId: string;
-      try {
-        threadId = await this.codex.startOrResumeThread(workspace.path, requestedThreadId, task.executionModel);
-      } catch (error) {
-        if (requestedThreadId && task.chatContextId) {
-          await this.reportResumeFailure(task, requestedThreadId, error);
-          return;
-        }
-        throw error;
-      }
-      this.currentCodexThreadId = threadId;
-      try {
-        await this.client.event(task.id, task.leaseToken, "codex.thread.ready", "Codex 线程已就绪", {
-          threadId,
-          executorId: this.config.executorId,
-          homeRef: this.config.homeRef,
-          profile: this.config.codexProfile,
-          configFingerprint: this.config.configFingerprint,
-          codexVersion: this.config.codexVersion,
-          workspaceAlias: workspace.rootAlias,
-          workspaceKey: task.workspaceKey ?? null,
-          chatContextId: task.chatContextId ?? null,
-          ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort)
-        });
-      } catch (error) {
-        if (/control plane 409:/i.test(errorMessage(error)) && task.chatContextId) {
-          return;
-        }
-        throw error;
-      }
+      let threadId: string | null = null;
       let baseRoomSeq = task.roomSeq;
       this.currentBaseRoomSeq = baseRoomSeq;
       let signals = task.signals;
@@ -141,7 +196,7 @@ export class TaskProcessor {
             let attention: AttentionResult;
             try {
               attention = await this.codex.attention(
-                workspace.path,
+                this.attentionWorkspace,
                 [`当前机器人：${task.botDisplayName}`, `飞书会话 ${task.conversationId} 第 ${task.turnIndex} 回合`, task.attentionContext].join("\n"),
                 signal.senderType === "bot"
                   ? `[bot:${signal.senderDisplayName ?? signal.senderId}|member|depth=${signal.botDialogueDepth}] ${signal.preview}`
@@ -171,6 +226,63 @@ export class TaskProcessor {
           });
           return;
         }
+        if (!threadId) {
+          await this.client.event(task.id, task.leaseToken, "skill_runtime.sync_started", "开始同步任务技能与运行配置", {
+            skillSetFingerprint: task.skillSetFingerprint,
+            runtimeConfigFingerprint: task.runtimeConfig.fingerprint,
+            managedSkillCount: task.skills.length,
+            environmentCount: task.runtimeConfig.environment.length,
+            fileCount: task.runtimeConfig.files.length
+          });
+          const appliedRuntime = await this.skillRuntime.prepareTaskFilesystem(task, workspace.path);
+          const runtime = await this.skillRuntime.environmentForTask(task);
+          this.activeSecretValues = [...new Set([...appliedRuntime.redactionValues, ...runtime.redactionValues])]
+            .filter((value) => value.length >= 4)
+            .sort((a, b) => b.length - a.length);
+          const adapter = this.createTaskCodex(runtime.environment, runtime.allowlist);
+          this.taskCodex = adapter;
+          try {
+            await adapter.start();
+          } finally {
+            // spawn() has copied the environment into the child. Remove plaintext
+            // runtime values from the adapter-owned object immediately.
+            for (const name of runtime.names) delete runtime.environment[name];
+          }
+          await this.skillRuntime.verifyTaskRuntime(task, workspace.path, adapter, runtime.names, appliedRuntime.files);
+          try {
+            threadId = await adapter.startOrResumeThread(workspace.path, requestedThreadId, task.executionModel);
+          } catch (error) {
+            if (requestedThreadId && task.chatContextId) {
+              await this.reportResumeFailure(task, requestedThreadId, error);
+              return;
+            }
+            throw error;
+          }
+          this.currentCodexThreadId = threadId;
+          try {
+            await this.client.event(task.id, task.leaseToken, "codex.thread.ready", "Codex 线程已就绪", {
+              threadId,
+              executorId: this.config.executorId,
+              homeRef: this.config.homeRef,
+              profile: this.config.codexProfile,
+              configFingerprint: this.config.configFingerprint,
+              codexVersion: this.config.codexVersion,
+              workspaceAlias: workspace.rootAlias,
+              workspaceKey: task.workspaceKey ?? null,
+              chatContextId: task.chatContextId ?? null,
+              skillSetFingerprint: task.skillSetFingerprint,
+              runtimeConfigFingerprint: task.runtimeConfig.fingerprint,
+              ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort)
+            });
+          } catch (error) {
+            if (/control plane 409:/i.test(errorMessage(error)) && task.chatContextId) return;
+            throw error;
+          }
+          await this.client.event(task.id, task.leaseToken, "skill_runtime.synced", "任务技能与运行配置已生效", {
+            skillSetFingerprint: task.skillSetFingerprint,
+            runtimeConfigFingerprint: task.runtimeConfig.fingerprint
+          });
+        }
         const resolvedAttachments = await this.resolveAttachments(task, workspace.path, consumed, downloadedAttachments, failedAttachments);
         const prompt = buildTaskPrompt(task, consumed, revision > 0, resolvedAttachments.available, resolvedAttachments.unavailable);
         this.currentCodexStage = "execution";
@@ -195,7 +307,8 @@ export class TaskProcessor {
           await this.finishTask(task, "waiting_input", `Codex 生命周期结果无效：${errorMessage(error).slice(0, 500)}`);
           return;
         }
-        finalText = turnResult.reply;
+        finalText = this.redactSecrets(turnResult.reply);
+        turnResult.rationale = this.redactSecrets(turnResult.rationale);
         await this.flushCommentary();
         const draft = await this.client.submitDraft(task, finalText, baseRoomSeq, threadId);
         if (!draft.held) {
@@ -213,7 +326,26 @@ export class TaskProcessor {
       await this.finishTask(task, "waiting_input", "草稿连续两次因线程变化被搁置，需要主人决定后续处理。" );
     } catch (error) {
       if (controlState === "human_owned" || controlState === "cancelled") return;
-      const summary = errorMessage(error);
+      if (error instanceof SkillRuntimeError) {
+        const failureSummary = this.redactSecrets(error.message);
+        await this.client.reportRuntimeFailure(task, {
+          skillSetFingerprint: task.skillSetFingerprint,
+          runtimeConfigFingerprint: task.runtimeConfig.fingerprint,
+          code: error.code,
+          summary: failureSummary,
+          targetPath: error.targetPath
+        }).catch(() => undefined);
+        await this.client.event(task.id, task.leaseToken, "skill_runtime.failed", failureSummary, {
+          code: error.code,
+          conflict: error.conflict,
+          targetPath: error.targetPath,
+          skillSetFingerprint: task.skillSetFingerprint,
+          runtimeConfigFingerprint: task.runtimeConfig.fingerprint
+        }).catch(() => undefined);
+        await this.finishTask(task, "waiting_input", failureSummary).catch(() => undefined);
+        return;
+      }
+      const summary = this.redactSecrets(errorMessage(error));
       if (/model|reasoning effort|reasoning_effort|推理强度/i.test(summary)) {
         await this.finishTask(task, "waiting_input", `所选模型或推理强度不可用：${summary.slice(0, 4_500)}`).catch(() => undefined);
         return;
@@ -226,6 +358,9 @@ export class TaskProcessor {
       throw error;
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      const taskCodex = this.taskCodex;
+      this.taskCodex = null;
+      await taskCodex?.stop().catch(() => undefined);
       await this.flushCompactions().catch(() => undefined);
       await this.flushCommentary().catch(() => undefined);
       this.currentTask = null;
@@ -241,6 +376,54 @@ export class TaskProcessor {
       this.compactionFailures.clear();
       this.compactionChain = Promise.resolve();
       this.latestTokenUsage = null;
+      this.activeSecretValues = [];
+    }
+  }
+
+  private activeCodex(): CodexAdapter {
+    return this.taskCodex ?? this.codex;
+  }
+
+  private createTaskCodex(environment: NodeJS.ProcessEnv, allowlist: string[]): CodexAdapter {
+    return new CodexAdapter(
+      this.config,
+      async (request) => this.handleApproval(request),
+      async (item) => this.handleCompletedItem(item),
+      async (update) => this.handleCommentary(update),
+      (method, params) => this.handleCodexActivity(method, params),
+      { environment, shellEnvironmentAllowlist: allowlist, redactStderr: (chunk) => this.redactSecrets(chunk) }
+    );
+  }
+
+  private scheduleUserSkillRefresh(): void {
+    this.userSkillRefresh = this.userSkillRefresh
+      .then(() => this.refreshUserSkills())
+      .catch((error) => { process.stderr.write(`worker user skill inventory refresh failed: ${this.safeErrorSummary(error)}\n`); });
+  }
+
+  private async refreshUserSkills(): Promise<void> {
+    try {
+      const entries = await this.codex.listSkills(this.config.workspaceRoots.map((root) => root.path), true);
+      const report = await buildUserSkillsReport(entries);
+      await this.client.reportUserSkills(report);
+      this.lastUserSkillsReport = report;
+    } catch (error) {
+      const report: WorkerUserSkillsReport = this.lastUserSkillsReport ? {
+        ...this.lastUserSkillsReport,
+        scannedAt: new Date().toISOString(),
+        status: "stale",
+        errors: ["Runner 未能刷新用户级技能，当前展示上次成功快照。"]
+      } : {
+        skills: [],
+        fingerprint: sha256("[]"),
+        scannedAt: new Date().toISOString(),
+        status: "error",
+        truncated: false,
+        total: 0,
+        errors: ["Runner 尚未成功扫描用户级技能。"]
+      };
+      await this.client.reportUserSkills(report).catch(() => undefined);
+      throw error;
     }
   }
 
@@ -345,7 +528,7 @@ export class TaskProcessor {
   }
 
   private safeErrorSummary(error: unknown): string {
-    let summary = errorMessage(error);
+    let summary = this.redactSecrets(errorMessage(error));
     for (const localPath of [this.config.codexHome, ...this.config.workspaceRoots.map((root) => root.path)]) {
       summary = summary.split(localPath).join("[local path]");
     }
@@ -419,6 +602,7 @@ export class TaskProcessor {
 
   private handleCodexActivity(method: string, params: Record<string, unknown>): void {
     this.lastCodexActivityAt = Date.now();
+    if (method === "skills/changed") this.scheduleUserSkillRefresh();
     const compaction = codexCompactionFromActivity(method, params);
     const task = this.currentTask;
     if (compaction && task?.chatContextId && this.currentCodexThreadId === compaction.threadId) {
@@ -479,14 +663,15 @@ export class TaskProcessor {
       }
       if (quietMs >= 10 * 60_000) {
         clearInterval(watchdog);
-        const active = this.codex.activeTurn();
-        if (active) void this.codex.interrupt(active.threadId, active.turnId).catch(() => undefined);
+        const adapter = this.activeCodex();
+        const active = adapter.activeTurn();
+        if (active) void adapter.interrupt(active.threadId, active.turnId).catch(() => undefined);
         rejectStall(new CodexStallError());
       }
     }, 5_000);
     try {
       return await Promise.race([
-        this.codex.runTurn(threadId, prompt, { outputSchema: taskTurnOutputSchema, publishCommentary: true, model: task.executionModel, effort: task.executionReasoningEffort, localImages }),
+        this.activeCodex().runTurn(threadId, prompt, { outputSchema: taskTurnOutputSchema, publishCommentary: true, model: task.executionModel, effort: task.executionReasoningEffort, localImages }),
         stalled
       ]);
     } finally {
@@ -497,7 +682,10 @@ export class TaskProcessor {
   async openHandoff(task: ClaimedTask): Promise<void> {
     if (!this.config.appLauncher) throw new Error("this executor has no app_launcher capability");
     const workspace = await this.resolveTaskWorkspace(task);
-    const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: this.config.codexHome };
+    const env: NodeJS.ProcessEnv = {
+      ...isolatedCodexEnvironment({}, [], this.config.deviceTokenEnvironmentName ? [this.config.deviceTokenEnvironmentName] : []).environment,
+      CODEX_HOME: this.config.codexHome
+    };
     delete env.CODEX_SQLITE_HOME;
     const child = spawn(this.config.appLauncher, [workspace.path], { env, detached: true, stdio: "ignore" });
     child.unref();
@@ -506,7 +694,13 @@ export class TaskProcessor {
   private async handleApproval(request: { id: string; method: string; params: Record<string, unknown>; summary: string }): Promise<"accept" | "decline" | "cancel"> {
     const task = this.currentTask;
     if (!task) return "decline";
-    const approval = await this.client.requestApproval(task, request.id, request.method, request.summary, request.params);
+    const approval = await this.client.requestApproval(
+      task,
+      request.id,
+      request.method,
+      this.redactSecrets(request.summary),
+      this.redactUnknown(request.params) as Record<string, unknown>
+    );
     if (approval.state === "approved") return "accept";
     if (approval.state === "rejected" || approval.state === "expired") return "decline";
     while (Date.now() < new Date(approval.expiresAt).getTime()) {
@@ -525,7 +719,8 @@ export class TaskProcessor {
     if (!/command|fileChange|mcpToolCall|dynamicToolCall/i.test(actionType)) return;
     const serialized = JSON.stringify(item);
     const actionKey = String(item.id ?? sha256(serialized).slice(0, 32));
-    const result = serialized.length <= 10_000 ? item : { type: actionType, id: item.id, status: item.status, truncated: true };
+    const redacted = this.redactUnknown(item) as Record<string, unknown>;
+    const result = serialized.length <= 10_000 ? redacted : { type: actionType, id: item.id, status: item.status, truncated: true };
     await this.client.action(task, actionKey, actionType, sha256(serialized), result);
   }
 
@@ -535,7 +730,7 @@ export class TaskProcessor {
       this.firstCommentaryRecorded = true;
       await this.client.event(this.currentTask.id, this.currentTask.leaseToken, "execution.first_commentary", "Codex 产生首条 commentary");
     }
-    this.commentaryPending = update;
+    this.commentaryPending = { ...update, text: this.redactSecrets(update.text) };
     const wait = Math.max(0, 500 - (Date.now() - this.commentaryLastSentAt));
     if (wait === 0) {
       await this.flushCommentary();
@@ -561,6 +756,24 @@ export class TaskProcessor {
     this.commentaryLastSentAt = Date.now();
     this.commentaryChain = this.commentaryChain.then(() => this.client.streamCommentary(task, pending, this.currentBaseRoomSeq));
     return this.commentaryChain;
+  }
+
+  private redactSecrets(value: string): string {
+    let result = value.replace(
+      /-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?-----END [^-\r\n]*PRIVATE KEY-----/g,
+      "[REDACTED PRIVATE KEY]"
+    );
+    for (const secret of this.activeSecretValues) result = result.split(secret).join("[REDACTED]");
+    return result;
+  }
+
+  private redactUnknown(value: unknown): unknown {
+    if (typeof value === "string") return this.redactSecrets(value);
+    if (Array.isArray(value)) return value.map((item) => this.redactUnknown(item));
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, nested]) => [key, this.redactUnknown(nested)]));
+    }
+    return value;
   }
 }
 

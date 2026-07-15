@@ -12,6 +12,7 @@ export interface WorkerPrincipal {
   homeRef: string;
   codexProfile: string;
   configFingerprint: string;
+  workspaceMappingFingerprint?: string | null;
   credentialId: string;
 }
 
@@ -39,12 +40,14 @@ export async function issueWorkerSession(
 ): Promise<{ token: string; expiresAt: Date }> {
   const expiresAt = new Date(Date.now() + config.sessionMinutes * 60_000);
   const key = createSecretKey(Buffer.from(config.sessionSigningSecret));
-  const token = await new SignJWT({
+  const claims: Record<string, string> = {
     homeRef: principal.homeRef,
     codexProfile: principal.codexProfile,
     configFingerprint: principal.configFingerprint,
     credentialId: principal.credentialId
-  })
+  };
+  if (principal.workspaceMappingFingerprint) claims.workspaceMappingFingerprint = principal.workspaceMappingFingerprint;
+  const token = await new SignJWT(claims)
     .setProtectedHeader({ alg: "HS256" })
     .setSubject(principal.executorId)
     .setIssuer("lark-agent")
@@ -74,6 +77,9 @@ export async function requireWorkerSession(
       homeRef: String(verified.payload.homeRef),
       codexProfile: String(verified.payload.codexProfile),
       configFingerprint: String(verified.payload.configFingerprint),
+      workspaceMappingFingerprint: typeof verified.payload.workspaceMappingFingerprint === "string"
+        ? verified.payload.workspaceMappingFingerprint
+        : null,
       credentialId
     };
   } catch {

@@ -41,8 +41,14 @@ services:
       TRACE_RETENTION_DAYS: ${TRACE_RETENTION_DAYS:-180}
       RUNNER_ARTIFACT_PUBLIC_BASE_URL: ${RUNNER_ARTIFACT_PUBLIC_BASE_URL:?RUNNER_ARTIFACT_PUBLIC_BASE_URL is required}
       RUNNER_MANIFEST_REFRESH_SECONDS: ${RUNNER_MANIFEST_REFRESH_SECONDS:-300}
+      SKILLHUB_REGISTRY_URL: ${SKILLHUB_REGISTRY_URL:-}
+      SKILLHUB_API_TOKEN: ${SKILLHUB_API_TOKEN:-}
+      SKILLHUB_CACHE_DIR: /home/agent/.lark-agent/skillhub-cache
+      SKILL_RUNTIME_ENCRYPTION_KEYS: ${SKILL_RUNTIME_ENCRYPTION_KEYS:-}
+      SKILL_RUNTIME_ACTIVE_KEY_ID: ${SKILL_RUNTIME_ACTIVE_KEY_ID:-}
     volumes:
       - lark_cli_config:/home/agent/.lark-cli
+      - skillhub_cache:/home/agent/.lark-agent/skillhub-cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,5 +79,6 @@ services:
 volumes:
   postgres_data:
   lark_cli_config:
+  skillhub_cache:
   caddy_data:
   caddy_config:

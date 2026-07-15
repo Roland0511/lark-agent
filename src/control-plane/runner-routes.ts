@@ -8,6 +8,8 @@ import { AppError } from "../shared/errors.js";
 import type { ControlPlaneConfig } from "./config.js";
 import { requireAdmin, requireCsrf } from "./admin-auth.js";
 import type { AdminEventBus } from "./admin-events.js";
+import { executorActiveTaskStates, lockExecutorClaim } from "./executor-claim-lock.js";
+import { upsertWorkerRegistration } from "./repository.js";
 
 const artifactPathSchema = z.string().min(1).refine((value) => !value.startsWith("/") && !value.split("/").includes(".."), "artifact path must be relative");
 
@@ -65,6 +67,20 @@ function iso(value: Date | string | null): string | null {
 
 function registrationCommand(config: ControlPlaneConfig, releases: RunnerReleaseService, token: string): string {
   return `curl -fsSL '${releases.installUrl()}' | /bin/zsh -s -- --artifact-base '${config.runnerArtifactPublicBaseUrl}' --server '${config.adminOrigin}' --token '${token}'`;
+}
+
+function deviceCredentialHash(authorization: string | undefined): string {
+  if (!authorization?.startsWith("Bearer ")) throw new AppError("missing device credential", 401, "unauthorized");
+  return sha256(authorization.slice(7));
+}
+
+async function requireDeviceCredential(db: Kysely<Database>, executorId: string, authorization: string | undefined): Promise<string> {
+  const credentialHash = deviceCredentialHash(authorization);
+  const credential = await db.selectFrom("worker_device_credentials").select("id")
+    .where("executor_id", "=", executorId).where("credential_hash", "=", credentialHash)
+    .where("revoked_at", "is", null).executeTakeFirst();
+  if (!credential) throw new AppError("invalid device credential", 401, "unauthorized");
+  return credentialHash;
 }
 
 export function registerRunnerRoutes(
@@ -140,51 +156,8 @@ export function registerRunnerRoutes(
         throw new AppError("注册指令无效、已使用或已过期", 401, "invalid_enrollment");
       }
       const registration = body.registration;
-      const previous = await trx.selectFrom("workers").select(["config_fingerprint"]).where("executor_id", "=", registration.executorId).executeTakeFirst();
-      await trx.insertInto("workers").values({
-        executor_id: registration.executorId,
-        display_name: registration.displayName,
-        home_ref: registration.homeRef,
-        codex_profile: registration.codexProfile,
-        config_fingerprint: registration.configFingerprint,
-        codex_version: registration.codexVersion,
-        capacity: registration.capacity,
-        workspace_aliases: JSON.stringify(registration.workspaceAliases),
-        capabilities: JSON.stringify(registration.capabilities),
-        runner_version: registration.runnerVersion,
-        architecture: registration.architecture,
-        registration_source: "quick_install",
-        status: "offline",
-        deleted_at: null,
-        last_seen_at: now,
-        updated_at: now
-      }).onConflict((conflict) => conflict.column("executor_id").doUpdateSet({
-        display_name: registration.displayName,
-        home_ref: registration.homeRef,
-        codex_profile: registration.codexProfile,
-        config_fingerprint: registration.configFingerprint,
-        codex_version: registration.codexVersion,
-        capacity: registration.capacity,
-        workspace_aliases: JSON.stringify(registration.workspaceAliases),
-        capabilities: JSON.stringify(registration.capabilities),
-        runner_version: registration.runnerVersion,
-        architecture: registration.architecture,
-        registration_source: "quick_install",
-        deleted_at: null,
-        updated_at: now
-      })).execute();
-      if (previous && previous.config_fingerprint !== registration.configFingerprint) {
-        await trx.updateTable("tasks").set({
-          state: "waiting_input",
-          revision: sql`revision + 1`,
-          summary: "执行器重新注册后的 CODEX_HOME/profile 配置指纹已变化，需要确认",
-          lease_token_hash: null,
-          lease_expires_at: null,
-          updated_at: now
-        }).where("executor_id", "=", registration.executorId)
-          .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
-          .execute();
-      }
+      await lockExecutorClaim(trx, registration.executorId);
+      await upsertWorkerRegistration(trx, registration, { statusOnInsert: "offline", restoreDeleted: true });
       await trx.updateTable("worker_device_credentials").set({ revoked_at: now })
         .where("executor_id", "=", registration.executorId).where("revoked_at", "is", null).execute();
       await trx.insertInto("worker_device_credentials").values({
@@ -199,18 +172,20 @@ export function registerRunnerRoutes(
 
   app.get<{ Params: { id: string } }>("/v1/runner/status/:id", async (request) => {
     const header = request.headers.authorization;
-    if (!header?.startsWith("Bearer ")) throw new AppError("missing device credential", 401, "unauthorized");
-    const credential = await db.selectFrom("worker_device_credentials").select("id")
-      .where("executor_id", "=", request.params.id).where("credential_hash", "=", sha256(header.slice(7)))
-      .where("revoked_at", "is", null).executeTakeFirst();
-    if (!credential) throw new AppError("invalid device credential", 401, "unauthorized");
-    const worker = await db.selectFrom("workers").select(["status", "last_seen_at", "runner_version", "operational_mode", "workspace_aliases"])
+    await requireDeviceCredential(db, request.params.id, header);
+    const worker = await db.selectFrom("workers").select(["status", "last_seen_at", "runner_version", "operational_mode", "workspace_aliases", "upgrade_drain_token_hash"])
       .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
     if (!worker) throw new AppError("执行器不存在", 404, "not_found");
-    const active = await db.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count"))
-      .where("executor_id", "=", request.params.id).where("state", "=", "running").executeTakeFirstOrThrow();
+    const [active, activeRuntimeSync] = await Promise.all([
+      db.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "in", [...executorActiveTaskStates]).executeTakeFirstOrThrow(),
+      db.selectFrom("skill_file_sync_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "=", "running")
+        .where("lease_expires_at", ">", new Date()).executeTakeFirstOrThrow()
+    ]);
     const age = Date.now() - new Date(worker.last_seen_at).getTime();
     const workspaceAliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
+    const presentedDrainToken = request.headers["x-upgrade-drain-token"];
     return {
       executorId: request.params.id,
       online: worker.status === "online" && age <= 45_000,
@@ -218,9 +193,71 @@ export function registerRunnerRoutes(
       runnerVersion: worker.runner_version,
       operationalMode: worker.operational_mode,
       activeTasks: active.count,
+      activeRuntimeSyncJobs: activeRuntimeSync.count,
+      upgradeDraining: worker.upgrade_drain_token_hash !== null,
+      upgradeDrainOwned: typeof presentedDrainToken === "string" && worker.upgrade_drain_token_hash === sha256(presentedDrainToken),
       workspaceAliases,
       workspaceAliasesText: workspaceAliases.join("、")
     };
+  });
+
+  app.post<{ Params: { id: string } }>("/v1/runner/upgrade-drain/:id", async (request) => {
+    const credentialHash = await requireDeviceCredential(db, request.params.id, request.headers.authorization);
+    const drainToken = randomToken(48);
+    const now = new Date();
+    const previousMode = await db.transaction().execute(async (trx) => {
+      await lockExecutorClaim(trx, request.params.id);
+      const credential = await trx.selectFrom("worker_device_credentials").select("id")
+        .where("executor_id", "=", request.params.id).where("credential_hash", "=", credentialHash)
+        .where("revoked_at", "is", null).executeTakeFirst();
+      if (!credential) throw new AppError("invalid device credential", 401, "unauthorized");
+      const worker = await trx.selectFrom("workers")
+        .select(["operational_mode", "upgrade_drain_token_hash"])
+        .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).forUpdate().executeTakeFirst();
+      if (!worker) throw new AppError("执行器不存在", 404, "not_found");
+      if (worker.upgrade_drain_token_hash) throw new AppError("执行器已经处于升级排空状态", 409, "upgrade_drain_active");
+      await trx.updateTable("workers").set({
+        operational_mode: "maintenance", upgrade_drain_token_hash: sha256(drainToken),
+        upgrade_drain_previous_mode: worker.operational_mode, updated_at: now
+      }).where("executor_id", "=", request.params.id).execute();
+      const active = await trx.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "in", [...executorActiveTaskStates]).executeTakeFirstOrThrow();
+      if (active.count > 0) throw new AppError("执行器仍有活跃任务，不能进入升级排空", 409, "worker_has_active_tasks");
+      const activeRuntimeSync = await trx.selectFrom("skill_file_sync_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "=", "running")
+        .where("lease_expires_at", ">", now).executeTakeFirstOrThrow();
+      if (activeRuntimeSync.count > 0) throw new AppError("执行器仍有活跃技能同步任务，不能进入升级排空", 409, "worker_has_active_runtime_sync");
+      return worker.operational_mode;
+    });
+    events?.publish("worker", request.params.id);
+    return { drainToken, operationalMode: "maintenance", previousOperationalMode: previousMode };
+  });
+
+  app.delete<{ Params: { id: string } }>("/v1/runner/upgrade-drain/:id", async (request) => {
+    const credentialHash = await requireDeviceCredential(db, request.params.id, request.headers.authorization);
+    const drainToken = request.headers["x-upgrade-drain-token"];
+    if (typeof drainToken !== "string" || !drainToken) throw new AppError("missing upgrade drain token", 401, "unauthorized");
+    const operationalMode = await db.transaction().execute(async (trx) => {
+      await lockExecutorClaim(trx, request.params.id);
+      const credential = await trx.selectFrom("worker_device_credentials").select("id")
+        .where("executor_id", "=", request.params.id).where("credential_hash", "=", credentialHash)
+        .where("revoked_at", "is", null).executeTakeFirst();
+      if (!credential) throw new AppError("invalid device credential", 401, "unauthorized");
+      const worker = await trx.selectFrom("workers")
+        .select(["operational_mode", "upgrade_drain_token_hash", "upgrade_drain_previous_mode"])
+        .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).forUpdate().executeTakeFirst();
+      if (!worker) throw new AppError("执行器不存在", 404, "not_found");
+      if (!worker.upgrade_drain_token_hash || worker.upgrade_drain_token_hash !== sha256(drainToken) || !worker.upgrade_drain_previous_mode) {
+        throw new AppError("升级排空凭据无效或已被管理员处置", 409, "upgrade_drain_invalid");
+      }
+      const restoredMode = worker.operational_mode === "maintenance" ? worker.upgrade_drain_previous_mode : worker.operational_mode;
+      await trx.updateTable("workers").set({
+        operational_mode: restoredMode, upgrade_drain_token_hash: null, upgrade_drain_previous_mode: null, updated_at: new Date()
+      }).where("executor_id", "=", request.params.id).execute();
+      return restoredMode;
+    });
+    events?.publish("worker", request.params.id);
+    return { ok: true, operationalMode };
   });
 
   app.delete("/v1/runner/credentials/current", async (request, reply) => {
@@ -228,15 +265,25 @@ export function registerRunnerRoutes(
     if (!header?.startsWith("Bearer ")) throw new AppError("missing device credential", 401, "unauthorized");
     const now = new Date();
     const executorId = await db.transaction().execute(async (trx) => {
-      const credential = await trx.selectFrom("worker_device_credentials").select(["id", "executor_id"])
+      const candidate = await trx.selectFrom("worker_device_credentials").select(["id", "executor_id"])
         .where("credential_hash", "=", sha256(header.slice(7))).where("revoked_at", "is", null)
-        .forUpdate().executeTakeFirst();
+        .executeTakeFirst();
+      if (!candidate) throw new AppError("invalid device credential", 401, "unauthorized");
+      await lockExecutorClaim(trx, candidate.executor_id);
+      const credential = await trx.selectFrom("worker_device_credentials").select(["id", "executor_id"])
+        .where("id", "=", candidate.id).where("revoked_at", "is", null).forUpdate().executeTakeFirst();
       if (!credential) throw new AppError("invalid device credential", 401, "unauthorized");
       const active = await trx.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count"))
-        .where("executor_id", "=", credential.executor_id).where("state", "=", "running").executeTakeFirstOrThrow();
+        .where("executor_id", "=", credential.executor_id).where("state", "in", [...executorActiveTaskStates]).executeTakeFirstOrThrow();
       if (active.count > 0) throw new AppError("执行器仍有活跃任务，不能卸载", 409, "worker_has_active_tasks");
+      const activeRuntimeSync = await trx.selectFrom("skill_file_sync_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", credential.executor_id).where("state", "=", "running")
+        .where("lease_expires_at", ">", now).executeTakeFirstOrThrow();
+      if (activeRuntimeSync.count > 0) throw new AppError("执行器仍有活跃技能同步任务，不能卸载", 409, "worker_has_active_runtime_sync");
       await trx.updateTable("worker_device_credentials").set({ revoked_at: now }).where("id", "=", credential.id).execute();
-      await trx.updateTable("workers").set({ operational_mode: "disabled", status: "offline", updated_at: now })
+      await trx.updateTable("workers").set({
+        operational_mode: "disabled", status: "offline", upgrade_drain_token_hash: null, upgrade_drain_previous_mode: null, updated_at: now
+      })
         .where("executor_id", "=", credential.executor_id).execute();
       return credential.executor_id;
     });

@@ -25,7 +25,12 @@ const envSchema = z.object({
   METRICS_BEARER_TOKEN: z.string().default(""),
   ALERTS_ENABLED: z.enum(["true", "false"]).default("true"),
   RUNNER_ARTIFACT_PUBLIC_BASE_URL: z.string().url(),
-  RUNNER_MANIFEST_REFRESH_SECONDS: z.coerce.number().int().min(30).default(300)
+  RUNNER_MANIFEST_REFRESH_SECONDS: z.coerce.number().int().min(30).default(300),
+  SKILLHUB_REGISTRY_URL: z.union([z.literal(""), z.string().url()]).default(""),
+  SKILLHUB_API_TOKEN: z.string().default(""),
+  SKILLHUB_CACHE_DIR: z.string().min(1).default("/home/agent/.lark-agent/skillhub-cache"),
+  SKILL_RUNTIME_ENCRYPTION_KEYS: z.string().default(""),
+  SKILL_RUNTIME_ACTIVE_KEY_ID: z.string().default("")
 });
 
 export interface ControlPlaneConfig {
@@ -54,6 +59,11 @@ export interface ControlPlaneConfig {
   alertsEnabled: boolean;
   runnerArtifactPublicBaseUrl: string;
   runnerManifestRefreshSeconds: number;
+  skillhubRegistryUrl?: string;
+  skillhubApiToken?: string;
+  skillhubCacheDir?: string;
+  skillRuntimeEncryptionKeys?: string;
+  skillRuntimeActiveKeyId?: string;
 }
 
 export function loadControlPlaneConfig(env: NodeJS.ProcessEnv = process.env): ControlPlaneConfig {
@@ -83,6 +93,11 @@ export function loadControlPlaneConfig(env: NodeJS.ProcessEnv = process.env): Co
     metricsBearerToken: parsed.METRICS_BEARER_TOKEN,
     alertsEnabled: parsed.ALERTS_ENABLED === "true",
     runnerArtifactPublicBaseUrl: parsed.RUNNER_ARTIFACT_PUBLIC_BASE_URL.replace(/\/$/, ""),
-    runnerManifestRefreshSeconds: parsed.RUNNER_MANIFEST_REFRESH_SECONDS
+    runnerManifestRefreshSeconds: parsed.RUNNER_MANIFEST_REFRESH_SECONDS,
+    skillhubRegistryUrl: parsed.SKILLHUB_REGISTRY_URL.replace(/\/$/, ""),
+    skillhubApiToken: parsed.SKILLHUB_API_TOKEN,
+    skillhubCacheDir: parsed.SKILLHUB_CACHE_DIR,
+    skillRuntimeEncryptionKeys: parsed.SKILL_RUNTIME_ENCRYPTION_KEYS,
+    skillRuntimeActiveKeyId: parsed.SKILL_RUNTIME_ACTIVE_KEY_ID
   };
 }

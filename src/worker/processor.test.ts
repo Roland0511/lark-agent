@@ -2,7 +2,7 @@ import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises"
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import type { ClaimedTask, Signal } from "../shared/contracts.js";
+import type { ClaimedTask, Signal, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, type ControlPlaneClient } from "./control-plane-client.js";
 import { buildTaskPrompt, codexCompactionFromActivity, TaskProcessor } from "./processor.js";
@@ -42,6 +42,22 @@ const task = {
 } as ClaimedTask;
 
 describe("TaskProcessor attachments", () => {
+  it("redacts active runtime credentials from user-visible and audit payload strings", () => {
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }]
+    } as ResolvedWorkerConfig, {} as ControlPlaneClient);
+    const internal = processor as unknown as {
+      activeSecretValues: string[];
+      redactSecrets(value: string): string;
+      redactUnknown(value: unknown): unknown;
+    };
+    internal.activeSecretValues = ["runtime-secret"];
+    expect(internal.redactSecrets("token=runtime-secret")).toBe("token=[REDACTED]");
+    expect(internal.redactSecrets("-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----"))
+      .toBe("[REDACTED PRIVATE KEY]");
+    expect(internal.redactUnknown({ command: ["echo", "runtime-secret"] })).toEqual({ command: ["echo", "[REDACTED]"] });
+  });
+
   it("keeps file paths internal in the prompt and sends images by localImage instead of text paths", () => {
     const current = signal("11111111-1111-4111-8111-111111111111", []);
     const prompt = buildTaskPrompt(task, [current], false, [
@@ -92,6 +108,58 @@ describe("TaskProcessor attachments", () => {
     expect(limits).toEqual([5, 3]);
     expect(events.map((item) => item.type)).toEqual(["attachment.downloaded", "attachment.failed"]);
     expect(events[1]?.payload.reason).toBe("task_limit");
+  });
+});
+
+describe("TaskProcessor workspace runtime sync", () => {
+  it("validates the lease before touching the workspace and clears busy state after heartbeat failure", async () => {
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }]
+    } as ResolvedWorkerConfig, {
+      heartbeatWorkspaceRuntimeSync: async () => { throw new Error("lease rejected"); }
+    } as unknown as ControlPlaneClient);
+    const job = {
+      id: "11111111-1111-4111-8111-111111111111",
+      botAppId: "cli_test",
+      chatContextId: "22222222-2222-4222-8222-222222222222",
+      workspaceKey: "22222222-2222-4222-8222-222222222222",
+      resolvedWorkspaceAlias: "repo",
+      leaseToken: "lease",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      desiredFingerprint: "a".repeat(64),
+      skills: [],
+      skillSetFingerprint: "b".repeat(64),
+      runtimeConfig: { fingerprint: "c".repeat(64), files: [] }
+    } as WorkspaceRuntimeSyncJob;
+    await expect(processor.processWorkspaceRuntimeSync(job)).rejects.toThrow("lease rejected");
+    expect(processor.isBusy()).toBe(false);
+  });
+
+  it("reports a failed result immediately when the workspace cannot be resolved", async () => {
+    const results: Array<{ status: string; summary: string }> = [];
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }]
+    } as ResolvedWorkerConfig, {
+      heartbeatWorkspaceRuntimeSync: async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() }),
+      completeWorkspaceRuntimeSync: async (_job: WorkspaceRuntimeSyncJob, result: { status: string; summary: string }) => { results.push(result); }
+    } as unknown as ControlPlaneClient);
+    const job = {
+      id: "11111111-1111-4111-8111-111111111121",
+      botAppId: "cli_test",
+      chatContextId: "22222222-2222-4222-8222-222222222222",
+      workspaceKey: "22222222-2222-4222-8222-222222222222",
+      resolvedWorkspaceAlias: "missing",
+      leaseToken: "lease",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      desiredFingerprint: "a".repeat(64),
+      skills: [],
+      skillSetFingerprint: "b".repeat(64),
+      runtimeConfig: { fingerprint: "c".repeat(64), files: [] }
+    } as WorkspaceRuntimeSyncJob;
+    await expect(processor.processWorkspaceRuntimeSync(job)).rejects.toThrow(/workspace alias/i);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ status: "failed", summary: "工作区无法准备，技能与运行配置未同步。" });
+    expect(processor.isBusy()).toBe(false);
   });
 });
 
