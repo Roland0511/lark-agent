@@ -20,7 +20,7 @@ rl.on('line', (line) => {
   if (msg.method === 'initialize') return send({ id: msg.id, result: { userAgent: 'fake' } });
   if (msg.method === 'initialized') return;
   if (msg.method === 'thread/start') return send({ id: msg.id, result: { thread: { id: 'thr_' + nextThread++ } } });
-  if (msg.method === 'thread/resume') return send({ id: msg.id, result: { thread: { id: msg.params.threadId } } });
+  if (msg.method === 'thread/resume') return send({ id: msg.id, result: { thread: { id: msg.params.threadId === 'thr_conflict' ? 'thr_unexpected' : msg.params.threadId } } });
   if (msg.method === 'model/list') return send({ id: msg.id, result: { data: [{ id: 'exec-model', model: 'exec-model', displayName: 'Execution Model', isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }] }], nextCursor: null } });
   if (msg.method === 'turn/start') {
     const turnId = 'turn_' + nextTurn++;
@@ -103,6 +103,7 @@ describe("CodexAdapter", () => {
     await expect(adapter.listModels()).resolves.toEqual([{ id: "exec-model", displayName: "Execution Model", isDefault: true, defaultReasoningEffort: "high", supportedReasoningEfforts: ["medium", "high"] }]);
     const threadId = await adapter.startOrResumeThread(config.codexHome, null);
     expect(threadId).toBe("thr_1");
+    await expect(adapter.startOrResumeThread(config.codexHome, "thr_conflict")).rejects.toThrow(/unexpected thread id/);
     await expect(adapter.runTurn(threadId, "work")).resolves.toEqual({ turnId: "turn_1", text: "done" });
     await expect(adapter.runTurn(threadId, "with-image", { localImages: ["/tmp/screen.png"] })).resolves.toEqual({ turnId: "turn_2", text: "image accepted" });
     await expect(adapter.runTurn(threadId, "structured", {

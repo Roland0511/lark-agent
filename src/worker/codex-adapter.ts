@@ -60,7 +60,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.2.5" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.3.0" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -85,6 +85,9 @@ export class CodexAdapter {
     };
     const id = result.thread?.id;
     if (!id) throw new Error("Codex did not return a thread id");
+    if (threadId && id !== threadId) {
+      throw new Error(`Codex resumed an unexpected thread id (expected ${threadId}, received ${id})`);
+    }
     return id;
   }
 

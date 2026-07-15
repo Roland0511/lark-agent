@@ -52,23 +52,34 @@ export class MessageRouter {
     }
 
     return this.db.transaction().execute(async (trx) => {
-      if (message.chatType === "group") {
-        await sql`select pg_advisory_xact_lock(hashtext(${`${bot.id}:${message.chatId}`}))`.execute(trx);
-      }
+      await sql`select pg_advisory_xact_lock(hashtext(${`${bot.id}:${message.chatId}`}))`.execute(trx);
       const duplicateSignal = await trx.selectFrom("signals").select(["id", "task_id"])
         .where("bot_id", "=", bot.id).where("message_id", "=", message.messageId).executeTakeFirst();
       if (duplicateSignal) return { taskId: duplicateSignal.task_id, signalId: duplicateSignal.id, status: "duplicate" };
 
-      let conversation = message.chatType === "group"
-        ? await trx.selectFrom("conversations").selectAll().where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId)
-            .where("chat_type", "=", "group").where("active", "=", true).orderBy("created_at", "desc").forUpdate().executeTakeFirst()
-        : await trx.selectFrom("conversations").selectAll().where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId)
-            .where("root_message_id", "=", message.rootMessageId).forUpdate().executeTakeFirst();
+      let chatContext = await trx.selectFrom("chat_contexts").selectAll()
+        .where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId).forUpdate().executeTakeFirst();
+
+      let task = chatContext
+        ? await trx.selectFrom("tasks")
+            .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+            .selectAll("tasks")
+            .where("conversations.chat_context_id", "=", chatContext.id)
+            .where("tasks.state", "in", [...activeTaskStates])
+            .orderBy("tasks.created_at", "desc")
+            .forUpdate()
+            .executeTakeFirst()
+        : undefined;
+      let conversation = task
+        ? await trx.selectFrom("conversations").selectAll().where("id", "=", task.conversation_id).forUpdate().executeTakeFirstOrThrow()
+        : message.chatType === "group"
+          ? await trx.selectFrom("conversations").selectAll().where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId)
+              .where("chat_type", "=", "group").where("active", "=", true).orderBy("created_at", "desc").forUpdate().executeTakeFirst()
+          : await trx.selectFrom("conversations").selectAll().where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId)
+              .where("root_message_id", "=", message.rootMessageId).forUpdate().executeTakeFirst();
 
       if (conversation?.followup_expires_at && new Date(conversation.followup_expires_at).getTime() <= Date.now()) {
-        const activeTask = await trx.selectFrom("tasks").select("id").where("conversation_id", "=", conversation.id)
-          .where("state", "in", [...activeTaskStates]).executeTakeFirst();
-        if (!activeTask) {
+        if (!task) {
           await trx.updateTable("conversations").set({ active: false, followup_expires_at: null, updated_at: new Date() }).where("id", "=", conversation.id).execute();
           conversation = undefined;
         }
@@ -84,9 +95,36 @@ export class MessageRouter {
       }).onConflict((conflict) => conflict.columns(["bot_id", "event_id"]).doNothing()).returning("event_id").executeTakeFirst();
       if (!marker) return { taskId: null, signalId: null, status: "duplicate" };
 
+      const now = new Date();
+      if (!chatContext) {
+        chatContext = await trx.insertInto("chat_contexts").values({
+          bot_id: bot.id,
+          chat_id: message.chatId,
+          chat_type: message.chatType,
+          codex_thread_id: null,
+          executor_id: null,
+          executor_home_ref: null,
+          executor_profile: null,
+          executor_config_fingerprint: null,
+          codex_version: null,
+          workspace_root_alias: null,
+          state: "uninitialized",
+          blocked_reason: null,
+          last_activity_at: now,
+          last_compacted_at: null,
+          updated_at: now
+        }).onConflict((conflict) => conflict.columns(["bot_id", "chat_id"]).doUpdateSet({
+          last_activity_at: now,
+          updated_at: now
+        })).returningAll().executeTakeFirstOrThrow();
+      } else {
+        await trx.updateTable("chat_contexts").set({ last_activity_at: now, updated_at: now }).where("id", "=", chatContext.id).execute();
+      }
+
       if (!conversation) {
         conversation = await trx.insertInto("conversations").values({
           bot_id: bot.id,
+          chat_context_id: chatContext.id,
           bot_config_revision: bot.config_revision,
           role_instructions_snapshot: bot.role_instructions,
           attention_model_snapshot: bot.attention_model,
@@ -101,26 +139,58 @@ export class MessageRouter {
           active: true,
           response_message_id: null,
           followup_expires_at: null,
-          updated_at: new Date()
+          updated_at: now
         }).returningAll().executeTakeFirstOrThrow();
       }
 
-      let task = await trx.selectFrom("tasks").selectAll().where("conversation_id", "=", conversation.id)
-        .where("state", "in", [...activeTaskStates]).orderBy("created_at", "desc").executeTakeFirst();
+      task ??= await trx.selectFrom("tasks").selectAll().where("conversation_id", "=", conversation.id)
+        .where("state", "in", [...activeTaskStates]).orderBy("created_at", "desc").forUpdate().executeTakeFirst();
       let createdTask = false;
       if (!task) {
         const policy = await trx.selectFrom("bot_chat_bindings").selectAll().where("bot_id", "=", bot.id).where("chat_id", "=", message.chatId).executeTakeFirst();
         const previous = await trx.selectFrom("tasks").selectAll().where("conversation_id", "=", conversation.id).orderBy("turn_index", "desc").executeTakeFirst();
         if (previous && !conversation.active) return { taskId: null, signalId: null, status: "inactive" };
-        const requestedWorkspaceAlias = previous?.requested_workspace_alias ?? policy?.workspace_alias ?? bot.default_workspace_alias;
-        let preferredExecutorId = previous?.executor_id ?? previous?.preferred_executor_id ?? policy?.preferred_executor_id ?? bot.default_executor_id;
+        const requestedWorkspaceAlias = chatContext.workspace_root_alias ?? policy?.workspace_alias ?? bot.default_workspace_alias;
+        let preferredExecutorId = chatContext.executor_id ?? policy?.preferred_executor_id ?? bot.default_executor_id;
         let routeAmbiguous = false;
-        if (!preferredExecutorId) {
-          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases"])
+        let routeBlocked = chatContext.state === "blocked";
+        let routeBlockedReason = chatContext.blocked_reason;
+        if (chatContext.codex_thread_id && chatContext.executor_id) {
+          const fixedWorker = await trx.selectFrom("workers").selectAll().where("executor_id", "=", chatContext.executor_id).executeTakeFirst();
+          const aliases = Array.isArray(fixedWorker?.workspace_aliases) ? fixedWorker.workspace_aliases.map(String) : [];
+          const capabilities = Array.isArray(fixedWorker?.capabilities) ? fixedWorker.capabilities.map(String) : [];
+          const environmentMatches = Boolean(
+            fixedWorker && !fixedWorker.deleted_at && fixedWorker.operational_mode === "enabled" &&
+            capabilities.includes("chat_context_v1") &&
+            fixedWorker.home_ref === chatContext.executor_home_ref &&
+            fixedWorker.codex_profile === chatContext.executor_profile &&
+            fixedWorker.config_fingerprint === chatContext.executor_config_fingerprint &&
+            chatContext.workspace_root_alias && aliases.includes(chatContext.workspace_root_alias)
+          );
+          if (!environmentMatches) {
+            routeBlocked = true;
+            routeBlockedReason = "聊天绑定的执行器、CODEX_HOME、Profile、配置指纹或工作区别名已不匹配";
+            await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: routeBlockedReason, updated_at: now }).where("id", "=", chatContext.id).execute();
+          }
+        } else if (chatContext.codex_thread_id) {
+          routeBlocked = true;
+          routeBlockedReason = "历史 Thread 缺少完整的固定执行环境，无法安全恢复";
+          await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: routeBlockedReason, updated_at: now }).where("id", "=", chatContext.id).execute();
+        } else if (preferredExecutorId) {
+          const preferredWorker = await trx.selectFrom("workers").select(["capabilities"])
+            .where("executor_id", "=", preferredExecutorId).where("deleted_at", "is", null).executeTakeFirst();
+          const capabilities = Array.isArray(preferredWorker?.capabilities) ? preferredWorker.capabilities.map(String) : [];
+          if (!capabilities.includes("chat_context_v1")) {
+            routeBlocked = true;
+            routeBlockedReason = "指定执行器尚未升级，不支持永久聊天记忆";
+          }
+        } else if (!preferredExecutorId) {
+          const workers = await trx.selectFrom("workers").select(["executor_id", "workspace_aliases", "capabilities"])
             .where("deleted_at", "is", null).where("operational_mode", "=", "enabled").execute();
           const eligible = workers.filter((worker) => {
             const aliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
-            return requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1;
+            const capabilities = Array.isArray(worker.capabilities) ? worker.capabilities.map(String) : [];
+            return capabilities.includes("chat_context_v1") && (requestedWorkspaceAlias ? aliases.includes(requestedWorkspaceAlias) : aliases.length === 1);
           });
           if (eligible.length === 1) preferredExecutorId = eligible[0]!.executor_id;
           else if (eligible.length > 1) routeAmbiguous = true;
@@ -128,7 +198,7 @@ export class MessageRouter {
         task = await trx.insertInto("tasks").values({
           bot_id: bot.id,
           conversation_id: conversation.id,
-          state: routeAmbiguous ? "waiting_input" : previous ? "waiting_worker" : "queued",
+          state: routeBlocked || routeAmbiguous ? "waiting_input" : chatContext.executor_id || previous ? "waiting_worker" : "queued",
           turn_index: (previous?.turn_index ?? 0) + 1,
           trigger_message_id: message.messageId,
           conversation_disposition: null,
@@ -137,17 +207,17 @@ export class MessageRouter {
           requester_role: message.senderRole,
           authorization_grant: JSON.stringify(authorizationFromMessage(message.content, message.senderRole === "owner")),
           requested_workspace_alias: requestedWorkspaceAlias,
-          resolved_workspace_alias: previous?.resolved_workspace_alias ?? null,
+          resolved_workspace_alias: chatContext.workspace_root_alias,
           preferred_executor_id: preferredExecutorId,
-          executor_id: previous?.executor_id ?? null,
-          codex_thread_id: previous?.codex_thread_id ?? null,
-          executor_home_ref: previous?.executor_home_ref ?? null,
-          executor_profile: previous?.executor_profile ?? null,
-          executor_config_fingerprint: previous?.executor_config_fingerprint ?? null,
-          codex_version: previous?.codex_version ?? null,
+          executor_id: chatContext.executor_id,
+          codex_thread_id: chatContext.codex_thread_id,
+          executor_home_ref: chatContext.executor_home_ref,
+          executor_profile: chatContext.executor_profile,
+          executor_config_fingerprint: chatContext.executor_config_fingerprint,
+          codex_version: chatContext.codex_version,
           lease_token_hash: null,
           lease_expires_at: null,
-          summary: routeAmbiguous ? "存在多个可用执行器，请先为机器人或群绑定默认执行器" : null,
+          summary: routeBlocked ? routeBlockedReason : routeAmbiguous ? "存在多个可用执行器，请先为机器人或群绑定默认执行器" : null,
           completed_at: null,
           updated_at: new Date()
         }).returningAll().executeTakeFirstOrThrow();
@@ -155,13 +225,13 @@ export class MessageRouter {
         await trx.insertInto("task_events").values({
           task_id: task.id,
           event_type: "task.created",
-          summary: routeAmbiguous ? "任务已创建，但执行器路由不明确" : "任务已创建",
-          payload: JSON.stringify({ preferredExecutorId, requestedWorkspaceAlias, routeAmbiguous })
+          summary: routeBlocked ? "任务已创建，但聊天上下文已阻塞" : routeAmbiguous ? "任务已创建，但执行器路由不明确" : "任务已创建",
+          payload: JSON.stringify({ chatContextId: chatContext.id, preferredExecutorId, requestedWorkspaceAlias, routeAmbiguous, routeBlocked })
         }).execute();
       }
 
       const nextSeq = conversation.room_seq + 1;
-      await trx.updateTable("conversations").set({ room_seq: nextSeq, active: true, thread_id: null, updated_at: new Date() }).where("id", "=", conversation.id).execute();
+      await trx.updateTable("conversations").set({ room_seq: nextSeq, active: true, thread_id: null, updated_at: now }).where("id", "=", conversation.id).execute();
       const signal = await trx.insertInto("signals").values({
         bot_id: bot.id,
         conversation_id: conversation.id,

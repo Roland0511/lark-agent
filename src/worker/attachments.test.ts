@@ -2,7 +2,7 @@ import { chmod, lstat, mkdir, mkdtemp, realpath, stat, symlink, utimes, writeFil
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
-import { attachmentTarget, cleanupExpiredAttachments, existingAttachment } from "./attachments.js";
+import { attachmentTarget, cleanupAllAttachmentRoots, cleanupExpiredAttachments, existingAttachment } from "./attachments.js";
 
 describe("worker attachment storage", () => {
   it("creates isolated targets with private directories and files", async () => {
@@ -57,6 +57,24 @@ describe("worker attachment storage", () => {
     await cleanupExpiredAttachments(workspace, 7, now);
     await expect(stat(old)).rejects.toThrow();
     await expect(stat(fresh)).resolves.toBeTruthy();
+  });
+
+  it("discovers both legacy and chat-context attachment roots", async () => {
+    const root = await mkdtemp(join(tmpdir(), "lark-agent-attachment-roots-"));
+    const legacyWorkspace = join(root, "cli_testbot");
+    const chatWorkspace = join(legacyWorkspace, "chats", "11111111-1111-4111-8111-111111111111");
+    const legacyOld = join(legacyWorkspace, ".lark-agent", "attachments", "om_legacy");
+    const chatOld = join(chatWorkspace, ".lark-agent", "attachments", "om_chat");
+    await mkdir(legacyOld, { recursive: true, mode: 0o700 });
+    await mkdir(chatOld, { recursive: true, mode: 0o700 });
+    const now = Date.now();
+    const old = new Date(now - 8 * 86_400_000);
+    await utimes(legacyOld, old, old);
+    await utimes(chatOld, old, old);
+
+    await cleanupAllAttachmentRoots([{ path: root }], 7);
+    await expect(stat(legacyOld)).rejects.toThrow();
+    await expect(stat(chatOld)).rejects.toThrow();
   });
 
   it("rejects a symbolic-link attachment root before creating files outside the workspace", async () => {

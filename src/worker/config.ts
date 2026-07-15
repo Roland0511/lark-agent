@@ -28,7 +28,7 @@ const configSchema = z.object({
     capacity: z.literal(1).default(1),
     app_launcher: z.string().optional(),
     workspace_roots: z.array(workspaceRootSchema).min(1),
-    capabilities: z.array(z.string()).default(["codex", "app_handoff"]),
+    capabilities: z.array(z.string()).default(["codex", "app_handoff", "chat_context_v1"]),
     runner_version: z.string().min(1).max(128).default("development")
   })
 });
@@ -189,7 +189,8 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     appLauncher = await realpath(raw.executor.app_launcher);
     await access(appLauncher, constants.X_OK);
   }
-  const capabilities = raw.executor.capabilities.filter((value) => value !== "app_handoff" || appLauncher !== null);
+  const capabilities = [...new Set([...raw.executor.capabilities, "chat_context_v1"])]
+    .filter((value) => value !== "app_handoff" || appLauncher !== null);
   const codexVersion = await commandVersion(raw.executor.codex_binary, codexHome);
   const protocolHash = await protocolFingerprint(raw.executor.codex_binary, codexHome);
   const overrides = profileOverrides(profileConfig);

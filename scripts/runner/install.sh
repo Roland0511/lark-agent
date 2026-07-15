@@ -260,6 +260,7 @@ ln -sfn "versions/$VERSION" "$INSTALL_DIR/current"
   print "  capacity: 1"
   print "  capabilities:"
   print "    - codex"
+  print "    - chat_context_v1"
   print "  workspace_roots:"
   typeset -A used_aliases
   for workspace in "${CANONICAL_WORKSPACES[@]}"; do
@@ -280,7 +281,7 @@ print -- "执行器：$EXECUTOR_ID"
 print -- "Codex Home：$CODEX_HOME_VALUE"
 print -- "Profile：$PROFILE"
 print -- "总工作区：${(j:, :)CANONICAL_WORKSPACES}"
-print -- "机器人专属工作区：每个机器人首次执行任务时自动使用 <总工作区>/<App ID>/"
+print -- "聊天专属工作区：每个聊天首次执行任务时自动使用 <总工作区>/<App ID>/chats/<Chat Context UUID>/"
 print -- "控制面：$SERVER"
 if [[ "$ASSUME_YES" != true && -r /dev/tty ]]; then
   print -n -- "确认注册并安装？[Y/n] " > /dev/tty

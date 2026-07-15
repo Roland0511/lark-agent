@@ -118,9 +118,10 @@ function flowHealth(task: Task, signalDecisions: string[], draftState?: string, 
   return "normal";
 }
 
-function currentStage(task: Task, signalDecisions: string[], draftState?: string, approvalState?: string, outputState?: string, outboxState?: string): FlowStage {
+function currentStage(task: Task, signalDecisions: string[], draftState?: string, approvalState?: string, outputState?: string, outboxState?: string, chatContextState?: string | null): FlowStage {
   if (["unknown", "failed", "pending"].includes(outboxState ?? "") || ["pending", "streaming", "held", "unknown", "failed"].includes(outputState ?? "")) return "outbox";
   if (["drafted", "held"].includes(draftState ?? "") || approvalState === "pending") return "draft";
+  if (chatContextState === "blocked") return "routing";
   if (["running", "waiting_input", "waiting_approval", "human_owned"].includes(task.state)) return "codex";
   if (["queued", "waiting_worker"].includes(task.state)) return "routing";
   if (signalDecisions.includes("pending") || signalDecisions.includes("defer") || (signalDecisions.length > 0 && signalDecisions.every((value) => value === "dismiss"))) return "attention";
@@ -209,8 +210,9 @@ export function registerAdminFlowRoutes(
       return { items: rows.slice(0, limit).map((row) => ({ ...row, created_at: iso(row.created_at), updated_at: iso(row.updated_at), sent_at: iso(row.sent_at), deliverySeconds: elapsed(row.created_at, row.sent_at) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
 
-    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
-      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at"])
+    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
+      .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id").selectAll("tasks")
+      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at", "chat_contexts.state as chat_context_state"])
       .orderBy(sql`CASE WHEN tasks.state IN ('completed','cancelled') THEN 1 ELSE 0 END`).orderBy("tasks.created_at", "desc").limit(limit + 1);
     if (start) query = query.where("tasks.created_at", ">=", start);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
@@ -247,7 +249,7 @@ export function registerAdminFlowRoutes(
       const taskOutput = outputs.find((x) => x.task_id === task.id);
       const taskOutbox = outbox.filter((x) => x.task_id === task.id).at(-1);
       const decisions = taskSignals.map((x) => x.decision);
-      const stage = currentStage(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state);
+      const stage = currentStage(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state, task.chat_context_state);
       const latency = buildStageTimings(taskEvents);
       const codexEvent = taskEvents.find((event) => event.event_type === "codex.thread.ready" || event.event_type === "codex.thread");
       return {

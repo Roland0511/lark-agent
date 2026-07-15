@@ -5,6 +5,11 @@ import { randomToken, sha256 } from "../shared/crypto.js";
 import { AppError } from "../shared/errors.js";
 import { authorizationFromMessage } from "./policy.js";
 
+export interface TaskLeaseGuard {
+  executorId: string;
+  leaseToken: string;
+}
+
 export class ControlPlaneRepository {
   constructor(private readonly db: Kysely<Database>, private readonly leaseSeconds: number) {}
 
@@ -56,6 +61,21 @@ export class ControlPlaneRepository {
       .where("executor_config_fingerprint", "!=", registration.configFingerprint)
       .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
       .execute();
+    await this.db
+      .updateTable("chat_contexts")
+      .set({
+        state: "blocked",
+        blocked_reason: "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认",
+        updated_at: now
+      })
+      .where("executor_id", "=", registration.executorId)
+      .where("codex_thread_id", "is not", null)
+      .where((eb) => eb.or([
+        eb("executor_home_ref", "is distinct from", registration.homeRef),
+        eb("executor_profile", "is distinct from", registration.codexProfile),
+        eb("executor_config_fingerprint", "is distinct from", registration.configFingerprint)
+      ]))
+      .execute();
   }
 
   async claimTask(principal: {
@@ -67,6 +87,8 @@ export class ControlPlaneRepository {
     const worker = await this.db.selectFrom("workers").selectAll().where("executor_id", "=", principal.executorId).where("deleted_at", "is", null).executeTakeFirst();
     if (!worker) throw new AppError("worker is not registered", 401, "unknown_executor");
     if (worker.operational_mode !== "enabled") return null;
+    const capabilities = Array.isArray(worker.capabilities) ? worker.capabilities.map(String) : [];
+    if (!capabilities.includes("chat_context_v1")) return null;
     if (
       worker.home_ref !== principal.homeRef ||
       worker.codex_profile !== principal.codexProfile ||
@@ -80,19 +102,41 @@ export class ControlPlaneRepository {
     const leaseExpiresAt = new Date(Date.now() + this.leaseSeconds * 1000);
     const result = await sql<Task>`
       WITH candidate AS (
-        SELECT id
+        SELECT tasks.id, tasks.revision
         FROM tasks
-        WHERE state IN ('queued', 'waiting_worker')
-          AND (executor_id IS NULL OR executor_id = ${principal.executorId})
-          AND (executor_config_fingerprint IS NULL OR executor_config_fingerprint = ${principal.configFingerprint})
-          AND (preferred_executor_id IS NULL OR preferred_executor_id = ${principal.executorId})
+        JOIN conversations ON conversations.id = tasks.conversation_id
+        JOIN chat_contexts ON chat_contexts.id = conversations.chat_context_id
+        WHERE tasks.state IN ('queued', 'waiting_worker')
+          AND chat_contexts.state <> 'blocked'
+          AND (tasks.executor_id IS NULL OR tasks.executor_id = ${principal.executorId})
+          AND (tasks.executor_config_fingerprint IS NULL OR tasks.executor_config_fingerprint = ${principal.configFingerprint})
+          AND (tasks.preferred_executor_id IS NULL OR tasks.preferred_executor_id = ${principal.executorId})
           AND (
-            preferred_executor_id IS NOT NULL
+            chat_contexts.codex_thread_id IS NULL
+            OR (
+              chat_contexts.executor_id = ${principal.executorId}
+              AND chat_contexts.executor_home_ref = ${principal.homeRef}
+              AND chat_contexts.executor_profile = ${principal.codexProfile}
+              AND chat_contexts.executor_config_fingerprint = ${principal.configFingerprint}
+              AND chat_contexts.workspace_root_alias = ANY(${sql.val(aliases)}::text[])
+            )
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM tasks other_task
+            JOIN conversations other_conversation ON other_conversation.id = other_task.conversation_id
+            WHERE other_conversation.chat_context_id = conversations.chat_context_id
+              AND other_task.id <> tasks.id
+              AND other_task.state IN ('running', 'waiting_approval', 'held_draft', 'human_owned')
+          )
+          AND (
+            tasks.preferred_executor_id IS NOT NULL
             OR 1 = (
               SELECT count(*)
               FROM workers eligible_worker
               WHERE eligible_worker.deleted_at IS NULL
                 AND eligible_worker.operational_mode = 'enabled'
+                AND eligible_worker.capabilities ? 'chat_context_v1'
                 AND (tasks.executor_id IS NULL OR tasks.executor_id = eligible_worker.executor_id)
                 AND (tasks.executor_config_fingerprint IS NULL OR tasks.executor_config_fingerprint = eligible_worker.config_fingerprint)
                 AND (
@@ -113,8 +157,10 @@ export class ControlPlaneRepository {
               AND ${singleWorkspaceAlias}::text IS NOT NULL
             )
           )
-        ORDER BY created_at ASC
-        FOR UPDATE SKIP LOCKED
+        ORDER BY tasks.created_at ASC
+        -- Lock the durable context first. The outer UPDATE then locks the task
+        -- and rechecks state+revision, matching every other context -> task path.
+        FOR UPDATE OF chat_contexts SKIP LOCKED
         LIMIT 1
       )
       UPDATE tasks t
@@ -128,10 +174,12 @@ export class ControlPlaneRepository {
           lease_token_hash = ${sha256(leaseToken)},
           lease_expires_at = ${leaseExpiresAt},
           attempt = attempt + 1,
-          revision = revision + 1,
+          revision = t.revision + 1,
           updated_at = now()
       FROM candidate
       WHERE t.id = candidate.id
+        AND t.state IN ('queued', 'waiting_worker')
+        AND t.revision = candidate.revision
       RETURNING t.*
     `.execute(this.db);
     const task = result.rows[0];
@@ -257,20 +305,200 @@ export class ControlPlaneRepository {
     await this.db.insertInto("task_events").values({ task_id: taskId, event_type: eventType, summary, payload: JSON.stringify(payload) }).execute();
   }
 
+  async bindTaskThread(taskId: string, codexThreadId: string, lease?: TaskLeaseGuard): Promise<{ status: "bound" | "unchanged" | "blocked"; chatContextId: string }> {
+    return this.db.transaction().execute(async (trx) => {
+      const now = new Date();
+      const identity = await trx.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"]).where("tasks.id", "=", taskId).executeTakeFirst();
+      if (!identity) throw new AppError("task not found", 404, "not_found");
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").selectAll().where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirstOrThrow();
+      const task = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirstOrThrow();
+      this.assertLockedLease(task, lease);
+
+      const environmentComplete = Boolean(
+        task.executor_id && task.executor_home_ref && task.executor_profile &&
+        task.executor_config_fingerprint && task.resolved_workspace_alias
+      );
+      const environmentMatches = !context.executor_id || (
+        context.executor_id === task.executor_id &&
+        context.executor_home_ref === task.executor_home_ref &&
+        context.executor_profile === task.executor_profile &&
+        context.executor_config_fingerprint === task.executor_config_fingerprint &&
+        context.workspace_root_alias === task.resolved_workspace_alias
+      );
+      const threadMatches = !context.codex_thread_id || context.codex_thread_id === codexThreadId;
+      if (context.state === "blocked" || !environmentComplete || !environmentMatches || !threadMatches) {
+        const reason = context.state === "blocked"
+          ? context.blocked_reason ?? "聊天上下文已阻塞"
+          : !environmentComplete
+            ? "任务缺少完整执行环境，无法固定聊天 Thread"
+            : !environmentMatches
+              ? "任务执行环境与聊天固定环境不一致"
+              : `Codex 返回了不同 Thread：当前 ${context.codex_thread_id}，实际 ${codexThreadId}`;
+        await trx.updateTable("tasks").set({
+          codex_thread_id: codexThreadId,
+          state: "waiting_input",
+          summary: reason,
+          lease_token_hash: null,
+          lease_expires_at: null,
+          revision: sql`revision + 1`,
+          updated_at: now
+        }).where("id", "=", task.id).execute();
+        await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: reason, updated_at: now }).where("id", "=", context.id).execute();
+        await trx.insertInto("task_events").values({
+          task_id: task.id,
+          event_type: "chat_context.blocked",
+          summary: "聊天记忆绑定冲突，任务已安全暂停",
+          payload: JSON.stringify({ chatContextId: context.id, expectedThreadId: context.codex_thread_id, actualThreadId: codexThreadId, reason })
+        }).execute();
+        return { status: "blocked", chatContextId: context.id };
+      }
+
+      const status = context.codex_thread_id ? "unchanged" : "bound";
+      await trx.updateTable("tasks").set({ codex_thread_id: codexThreadId, updated_at: now }).where("id", "=", task.id).execute();
+      await trx.updateTable("chat_contexts").set({
+        codex_thread_id: codexThreadId,
+        executor_id: task.executor_id,
+        executor_home_ref: task.executor_home_ref,
+        executor_profile: task.executor_profile,
+        executor_config_fingerprint: task.executor_config_fingerprint,
+        codex_version: task.codex_version,
+        workspace_root_alias: task.resolved_workspace_alias,
+        state: "ready",
+        blocked_reason: null,
+        last_activity_at: now,
+        updated_at: now
+      }).where("id", "=", context.id).execute();
+      return { status, chatContextId: context.id };
+    });
+  }
+
+  /** @deprecated Use bindTaskThread so the durable chat context is updated atomically. */
   async updateTaskThread(taskId: string, codexThreadId: string): Promise<void> {
-    await this.db.updateTable("tasks").set({ codex_thread_id: codexThreadId, updated_at: new Date() }).where("id", "=", taskId).execute();
+    await this.bindTaskThread(taskId, codexThreadId);
+  }
+
+  async blockTaskContext(taskId: string, reason: string, lease?: TaskLeaseGuard): Promise<{ chatContextId: string }> {
+    return this.db.transaction().execute(async (trx) => {
+      const now = new Date();
+      const identity = await trx.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"]).where("tasks.id", "=", taskId).executeTakeFirst();
+      if (!identity) throw new AppError("task not found", 404, "not_found");
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").selectAll().where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirstOrThrow();
+      const task = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirstOrThrow();
+      this.assertLockedLease(task, lease);
+      const summary = reason.trim().slice(0, 5_000) || "聊天 Thread 无法在固定执行环境中恢复";
+      await trx.updateTable("tasks").set({
+        state: "waiting_input",
+        summary,
+        lease_token_hash: null,
+        lease_expires_at: null,
+        revision: sql`revision + 1`,
+        updated_at: now
+      }).where("id", "=", task.id).execute();
+      await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: summary, updated_at: now }).where("id", "=", context.id).execute();
+      await trx.insertInto("task_events").values({
+        task_id: task.id,
+        event_type: "chat_context.blocked",
+        summary: "聊天记忆无法安全恢复，任务已暂停",
+        payload: JSON.stringify({ chatContextId: context.id, expectedThreadId: context.codex_thread_id, reason: summary })
+      }).execute();
+      return { chatContextId: context.id };
+    });
+  }
+
+  async recordContextCompaction(taskId: string, payload: {
+    threadId: string;
+    turnId: string;
+    itemId?: string | null;
+    source: string;
+    occurredAt?: Date;
+  }, lease?: TaskLeaseGuard): Promise<{ recorded: boolean; blocked: boolean; chatContextId: string }> {
+    return this.db.transaction().execute(async (trx) => {
+      const identity = await trx.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["tasks.id", "conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"]).where("tasks.id", "=", taskId).executeTakeFirst();
+      if (!identity) throw new AppError("task not found", 404, "not_found");
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").selectAll().where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirstOrThrow();
+      const task = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirstOrThrow();
+      this.assertLockedLease(task, lease);
+      if (!context.codex_thread_id || context.codex_thread_id !== payload.threadId) {
+        const reason = `自动压缩通知的 Thread 与聊天绑定不一致：当前 ${context.codex_thread_id ?? "未建立"}，通知 ${payload.threadId}`;
+        await trx.updateTable("tasks").set({ state: "waiting_input", summary: reason, lease_token_hash: null, lease_expires_at: null, revision: sql`revision + 1`, updated_at: new Date() }).where("id", "=", identity.id).execute();
+        await trx.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: reason, updated_at: new Date() }).where("id", "=", context.id).execute();
+        return { recorded: false, blocked: true, chatContextId: context.id };
+      }
+      const occurredAt = payload.occurredAt ?? new Date();
+      const existing = payload.itemId
+        ? await trx.selectFrom("chat_context_compactions").select(["id"])
+            .where("chat_context_id", "=", context.id)
+            .where("codex_item_id", "=", payload.itemId)
+            .executeTakeFirst()
+        : await trx.selectFrom("chat_context_compactions").select(["id"])
+            .where("chat_context_id", "=", context.id)
+            .where("codex_turn_id", "=", payload.turnId)
+            .executeTakeFirst();
+      if (existing) return { recorded: false, blocked: false, chatContextId: context.id };
+
+      if (payload.itemId) {
+        const legacy = await trx.selectFrom("chat_context_compactions").select("id")
+          .where("chat_context_id", "=", context.id)
+          .where("codex_turn_id", "=", payload.turnId)
+          .where("codex_item_id", "is", null)
+          .executeTakeFirst();
+        if (legacy) {
+          await trx.updateTable("chat_context_compactions").set({
+            task_id: identity.id,
+            codex_item_id: payload.itemId,
+            notification_type: payload.source,
+            occurred_at: occurredAt
+          }).where("id", "=", legacy.id).execute();
+          await trx.updateTable("chat_contexts").set({
+            last_compacted_at: sql`GREATEST(COALESCE(last_compacted_at, ${occurredAt}), ${occurredAt})`,
+            last_activity_at: sql`GREATEST(last_activity_at, ${occurredAt})`,
+            updated_at: new Date()
+          }).where("id", "=", context.id).execute();
+          return { recorded: false, blocked: false, chatContextId: context.id };
+        }
+      }
+
+      const inserted = await trx.insertInto("chat_context_compactions").values({
+        chat_context_id: context.id,
+        task_id: identity.id,
+        codex_thread_id: payload.threadId,
+        codex_turn_id: payload.turnId,
+        codex_item_id: payload.itemId ?? null,
+        notification_type: payload.source,
+        occurred_at: occurredAt
+      }).returning("id").executeTakeFirstOrThrow();
+      await trx.updateTable("chat_contexts").set({
+        auto_compaction_count: sql`auto_compaction_count + 1`,
+        last_compacted_at: occurredAt,
+        last_activity_at: occurredAt,
+        updated_at: new Date()
+      }).where("id", "=", context.id).execute();
+      return { recorded: Boolean(inserted), blocked: false, chatContextId: context.id };
+    });
   }
 
   async finishTask(
     taskId: string,
     state: "completed" | "failed" | "waiting_input" | "human_owned",
     summary: string,
-    lifecycle?: { disposition: "complete" | "awaiting_followup" | "unchanged"; processedRoomSeq: number; reason: string }
+    lifecycle?: { disposition: "complete" | "awaiting_followup" | "unchanged"; processedRoomSeq: number; reason: string },
+    lease?: TaskLeaseGuard
   ): Promise<{ nextTaskId: string | null }> {
     return this.db.transaction().execute(async (trx) => {
       const now = new Date();
-      const current = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirst();
-      if (!current) return { nextTaskId: null };
+      const identity = await trx.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"]).where("tasks.id", "=", taskId).executeTakeFirst();
+      if (!identity) return { nextTaskId: null };
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").selectAll().where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirstOrThrow();
+      const current = await trx.selectFrom("tasks").selectAll().where("id", "=", taskId).forUpdate().executeTakeFirstOrThrow();
+      this.assertLockedLease(current, lease);
       const conversation = await trx.selectFrom("conversations").selectAll().where("id", "=", current.conversation_id).forUpdate().executeTakeFirstOrThrow();
       const storedDisposition = lifecycle?.disposition === "unchanged" ? null : lifecycle?.disposition ?? null;
       await trx.updateTable("tasks").set({
@@ -284,6 +512,7 @@ export class ControlPlaneRepository {
         updated_at: now,
         completed_at: state === "completed" || state === "failed" ? now : null
       }).where("id", "=", taskId).execute();
+      await trx.updateTable("chat_contexts").set({ last_activity_at: now, updated_at: now }).where("id", "=", context.id).execute();
       if (state === "completed") await trx.insertInto("task_events").values({
         task_id: taskId,
         event_type: "task.completed",
@@ -299,12 +528,13 @@ export class ControlPlaneRepository {
       const pending = lifecycle
         ? await trx.selectFrom("signals").selectAll().where("task_id", "=", taskId).where("seq", ">", lifecycle.processedRoomSeq).orderBy("seq").execute()
         : [];
-      if (conversation.chat_type === "group" && pending.length) {
+      if (pending.length) {
         const first = pending[0] as (typeof pending)[number];
+        const blocked = context.state === "blocked";
         const next = await trx.insertInto("tasks").values({
           bot_id: current.bot_id,
           conversation_id: conversation.id,
-          state: current.executor_id ? "waiting_worker" : "queued",
+          state: blocked ? "waiting_input" : context.executor_id ? "waiting_worker" : "queued",
           turn_index: current.turn_index + 1,
           trigger_message_id: first.message_id,
           conversation_disposition: null,
@@ -312,25 +542,25 @@ export class ControlPlaneRepository {
           requester_id: first.sender_id,
           requester_role: first.sender_role,
           authorization_grant: JSON.stringify(authorizationFromMessage(first.content, first.sender_role === "owner")),
-          requested_workspace_alias: current.requested_workspace_alias,
-          resolved_workspace_alias: current.resolved_workspace_alias,
-          preferred_executor_id: current.executor_id ?? current.preferred_executor_id,
-          executor_id: current.executor_id,
-          codex_thread_id: current.codex_thread_id,
-          executor_home_ref: current.executor_home_ref,
-          executor_profile: current.executor_profile,
-          executor_config_fingerprint: current.executor_config_fingerprint,
-          codex_version: current.codex_version,
+          requested_workspace_alias: context.workspace_root_alias ?? current.requested_workspace_alias,
+          resolved_workspace_alias: context.workspace_root_alias,
+          preferred_executor_id: context.executor_id ?? current.preferred_executor_id,
+          executor_id: context.executor_id,
+          codex_thread_id: context.codex_thread_id,
+          executor_home_ref: context.executor_home_ref,
+          executor_profile: context.executor_profile,
+          executor_config_fingerprint: context.executor_config_fingerprint,
+          codex_version: context.codex_version,
           lease_token_hash: null,
           lease_expires_at: null,
-          summary: null,
+          summary: blocked ? context.blocked_reason : null,
           completed_at: null,
           updated_at: now
         }).returning("id").executeTakeFirstOrThrow();
         await trx.updateTable("signals").set({ task_id: next.id }).where("task_id", "=", taskId).where("seq", ">", lifecycle?.processedRoomSeq ?? 0).execute();
-        const pendingDeadline = lifecycle?.disposition === "awaiting_followup"
+        const pendingDeadline = conversation.chat_type === "group" && lifecycle?.disposition === "awaiting_followup"
           ? new Date(now.getTime() + 24 * 60 * 60_000)
-          : conversation.followup_expires_at;
+          : conversation.chat_type === "group" ? conversation.followup_expires_at : null;
         await trx.updateTable("conversations").set({ active: true, followup_expires_at: pendingDeadline, updated_at: now }).where("id", "=", conversation.id).execute();
         await trx.insertInto("task_events").values({ task_id: next.id, event_type: "conversation.turn_queued", summary: `会话第 ${current.turn_index + 1} 回合已排队`, payload: JSON.stringify({ previousTaskId: taskId }) }).execute();
         return { nextTaskId: next.id };
@@ -348,6 +578,20 @@ export class ControlPlaneRepository {
       }
       return { nextTaskId: null };
     });
+  }
+
+  private assertLockedLease(task: Task, lease?: TaskLeaseGuard): void {
+    if (!lease) return;
+    const leaseExpiresAt = task.lease_expires_at ? new Date(task.lease_expires_at).getTime() : 0;
+    const mutableStates = new Set<Task["state"]>(["running", "waiting_approval", "held_draft"]);
+    if (
+      task.executor_id !== lease.executorId ||
+      task.lease_token_hash !== sha256(lease.leaseToken) ||
+      leaseExpiresAt <= Date.now() ||
+      !mutableStates.has(task.state)
+    ) {
+      throw new AppError("task lease is missing, expired, or no longer mutable", 409, "invalid_lease");
+    }
   }
 
   async expireFollowupConversations(): Promise<number> {

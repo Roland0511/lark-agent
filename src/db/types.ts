@@ -18,6 +18,7 @@ export interface ProcessedEventsTable {
 export interface ConversationsTable {
   id: Generated<string>;
   bot_id: string;
+  chat_context_id: ColumnType<string, string | undefined, string>;
   bot_config_revision: number;
   role_instructions_snapshot: string;
   attention_model_snapshot: string | null;
@@ -34,6 +35,50 @@ export interface ConversationsTable {
   followup_expires_at: NullableTimestamp;
   created_at: Timestamp;
   updated_at: Timestamp;
+}
+
+export interface ChatContextsTable {
+  id: Generated<string>;
+  bot_id: string;
+  chat_id: string;
+  chat_type: "p2p" | "group";
+  codex_thread_id: string | null;
+  executor_id: string | null;
+  executor_home_ref: string | null;
+  executor_profile: string | null;
+  executor_config_fingerprint: string | null;
+  codex_version: string | null;
+  workspace_root_alias: string | null;
+  state: Generated<"uninitialized" | "ready" | "blocked">;
+  blocked_reason: string | null;
+  last_activity_at: Timestamp;
+  last_compacted_at: NullableTimestamp;
+  auto_compaction_count: Generated<number>;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface ChatContextCompactionsTable {
+  id: Generated<string>;
+  chat_context_id: string;
+  task_id: string;
+  codex_thread_id: string;
+  codex_turn_id: string;
+  codex_item_id: string | null;
+  notification_type: string;
+  occurred_at: Timestamp;
+  created_at: Timestamp;
+}
+
+export interface ChatContextRecoveryAttemptsTable {
+  id: Generated<string>;
+  chat_context_id: string;
+  actor_open_id: string;
+  state_before: "uninitialized" | "ready" | "blocked";
+  state_after: "uninitialized" | "ready" | "blocked";
+  result: "recovered" | "already_ready" | "check_failed" | "uninitialized";
+  failed_check_keys: Json;
+  checked_at: Timestamp;
 }
 
 export interface TasksTable {
@@ -355,6 +400,9 @@ export interface Database {
   bots: BotsTable;
   bot_chat_bindings: BotChatBindingsTable;
   bot_owner_binding_tokens: BotOwnerBindingTokensTable;
+  chat_contexts: ChatContextsTable;
+  chat_context_compactions: ChatContextCompactionsTable;
+  chat_context_recovery_attempts: ChatContextRecoveryAttemptsTable;
   processed_events: ProcessedEventsTable;
   conversations: ConversationsTable;
   tasks: TasksTable;
@@ -381,6 +429,7 @@ export type Task = Selectable<TasksTable>;
 export type NewTask = Insertable<TasksTable>;
 export type TaskUpdate = Updateable<TasksTable>;
 export type Conversation = Selectable<ConversationsTable>;
+export type ChatContext = Selectable<ChatContextsTable>;
 export type SignalRow = Selectable<SignalsTable>;
 export type WorkerRow = Selectable<WorkersTable>;
 

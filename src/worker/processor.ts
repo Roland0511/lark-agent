@@ -6,7 +6,7 @@ import { sha256 } from "../shared/crypto.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-client.js";
 import { CodexAdapter } from "./codex-adapter.js";
-import { resolveBotWorkspace } from "./workspace.js";
+import { resolveBotWorkspace, resolveChatWorkspace, type BotWorkspace } from "./workspace.js";
 import { attachmentTarget, cleanupAllAttachmentRoots, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
 
 export class TaskProcessor {
@@ -20,6 +20,11 @@ export class TaskProcessor {
   private models: Awaited<ReturnType<CodexAdapter["listModels"]>> = [];
   private lastCodexActivityAt = 0;
   private currentCodexStage: "attention" | "execution" | null = null;
+  private currentCodexThreadId: string | null = null;
+  private readonly reportedCompactions = new Set<string>();
+  private readonly preferredCompactionTurns = new Set<string>();
+  private readonly compactionFailures = new Map<string, Error>();
+  private compactionChain: Promise<void> = Promise.resolve();
   private latestTokenUsage: Record<string, number> | null = null;
   private codex: CodexAdapter;
 
@@ -56,12 +61,17 @@ export class TaskProcessor {
     let heartbeatTimer: NodeJS.Timeout | null = null;
     let controlState: "human_owned" | "cancelled" | null = null;
     try {
-      const policyError = this.validateModelPolicy(task);
-      if (policyError) {
-        await this.client.result(task, "waiting_input", policyError);
+      const contextError = validateChatContextClaim(task);
+      if (contextError) {
+        await this.blockChatContext(task, "claim_mismatch", contextError);
         return;
       }
-      const workspace = await resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
+      const policyError = this.validateModelPolicy(task);
+      if (policyError) {
+        await this.finishTask(task, "waiting_input", policyError);
+        return;
+      }
+      const workspace = await this.resolveTaskWorkspace(task);
       await cleanupExpiredAttachments(workspace.path, task.attachmentPolicy.retentionDays);
       let stoppedByControl = false;
       heartbeatTimer = setInterval(() => {
@@ -77,8 +87,37 @@ export class TaskProcessor {
         }).catch(() => undefined);
       }, 20_000);
 
-      const threadId = await this.codex.startOrResumeThread(workspace.path, task.codexThreadId, task.executionModel);
-      await this.client.event(task.id, task.leaseToken, "codex.thread.ready", "Codex 线程已就绪", { threadId, executorId: this.config.executorId, homeRef: this.config.homeRef, profile: this.config.codexProfile, workspaceAlias: workspace.alias, ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort) });
+      const requestedThreadId = task.chatContextThreadId !== undefined ? task.chatContextThreadId : task.codexThreadId;
+      let threadId: string;
+      try {
+        threadId = await this.codex.startOrResumeThread(workspace.path, requestedThreadId, task.executionModel);
+      } catch (error) {
+        if (requestedThreadId && task.chatContextId) {
+          await this.reportResumeFailure(task, requestedThreadId, error);
+          return;
+        }
+        throw error;
+      }
+      this.currentCodexThreadId = threadId;
+      try {
+        await this.client.event(task.id, task.leaseToken, "codex.thread.ready", "Codex 线程已就绪", {
+          threadId,
+          executorId: this.config.executorId,
+          homeRef: this.config.homeRef,
+          profile: this.config.codexProfile,
+          configFingerprint: this.config.configFingerprint,
+          codexVersion: this.config.codexVersion,
+          workspaceAlias: workspace.rootAlias,
+          workspaceKey: task.workspaceKey ?? null,
+          chatContextId: task.chatContextId ?? null,
+          ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort)
+        });
+      } catch (error) {
+        if (/control plane 409:/i.test(errorMessage(error)) && task.chatContextId) {
+          return;
+        }
+        throw error;
+      }
       let baseRoomSeq = task.roomSeq;
       this.currentBaseRoomSeq = baseRoomSeq;
       let signals = task.signals;
@@ -124,8 +163,8 @@ export class TaskProcessor {
         }
 
         if (!consumed.length) {
-          if (hasDeferred) await this.client.result(task, "waiting_input", "信号已延迟，等待后续判断。");
-          else await this.client.result(task, "completed", "Agent 判断当前无需回复，已保持沉默。", {
+          if (hasDeferred) await this.finishTask(task, "waiting_input", "信号已延迟，等待后续判断。");
+          else await this.finishTask(task, "completed", "Agent 判断当前无需回复，已保持沉默。", {
             disposition: task.chatType === "group" && task.turnIndex > 1 ? "unchanged" : "complete",
             processedRoomSeq: baseRoomSeq,
             dispositionReason: "本轮信号被忽略，不改变既有续聊窗口"
@@ -142,24 +181,25 @@ export class TaskProcessor {
           turn = await this.runExecutionTurn(task, threadId, prompt, resolvedAttachments.available.filter((item) => item.type === "image").map((item) => item.path));
         } catch (error) {
           if (error instanceof CodexStallError) {
-            await this.client.result(task, "waiting_input", "正式 Codex 回合连续 10 分钟没有任何事件，已中断并等待人工检查。" );
+            await this.finishTask(task, "waiting_input", "正式 Codex 回合连续 10 分钟没有任何事件，已中断并等待人工检查。" );
             return;
           }
           throw error;
         }
+        await this.flushCompactions();
         await this.client.event(task.id, task.leaseToken, "execution.completed", "正式 Codex 回合完成", { ...this.observedModelPolicy(task.executionModel, task.executionReasoningEffort), tokenUsage: this.latestTokenUsage });
         this.currentCodexStage = null;
         try {
           turnResult = taskTurnResultSchema.parse(parseStructuredResult(turn.text));
         } catch (error) {
-          await this.client.result(task, "waiting_input", `Codex 生命周期结果无效：${errorMessage(error).slice(0, 500)}`);
+          await this.finishTask(task, "waiting_input", `Codex 生命周期结果无效：${errorMessage(error).slice(0, 500)}`);
           return;
         }
         finalText = turnResult.reply;
         await this.flushCommentary();
         const draft = await this.client.submitDraft(task, finalText, baseRoomSeq, threadId);
         if (!draft.held) {
-          await this.client.result(task, "completed", "已完成本轮并回复。", {
+          await this.finishTask(task, "completed", "已完成本轮并回复。", {
             disposition: task.chatType === "p2p" ? "complete" : turnResult.disposition,
             processedRoomSeq: baseRoomSeq,
             dispositionReason: turnResult.rationale
@@ -170,22 +210,23 @@ export class TaskProcessor {
         if (!signals.length) break;
         await this.client.event(task.id, task.leaseToken, "draft.held", "草稿基于旧线程状态，正在结合新增消息改写");
       }
-      await this.client.result(task, "waiting_input", "草稿连续两次因线程变化被搁置，需要主人决定后续处理。" );
+      await this.finishTask(task, "waiting_input", "草稿连续两次因线程变化被搁置，需要主人决定后续处理。" );
     } catch (error) {
       if (controlState === "human_owned" || controlState === "cancelled") return;
       const summary = errorMessage(error);
       if (/model|reasoning effort|reasoning_effort|推理强度/i.test(summary)) {
-        await this.client.result(task, "waiting_input", `所选模型或推理强度不可用：${summary.slice(0, 4_500)}`).catch(() => undefined);
+        await this.finishTask(task, "waiting_input", `所选模型或推理强度不可用：${summary.slice(0, 4_500)}`).catch(() => undefined);
         return;
       }
       try {
-        await this.client.result(task, "failed", summary.slice(0, 5_000));
+        await this.finishTask(task, "failed", summary.slice(0, 5_000));
       } catch {
         // The lease may already be gone; the control plane will requeue or surface it.
       }
       throw error;
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
+      await this.flushCompactions().catch(() => undefined);
       await this.flushCommentary().catch(() => undefined);
       this.currentTask = null;
       this.currentBaseRoomSeq = 0;
@@ -194,6 +235,11 @@ export class TaskProcessor {
       this.firstCommentaryRecorded = false;
       this.commentaryChain = Promise.resolve();
       this.currentCodexStage = null;
+      this.currentCodexThreadId = null;
+      this.reportedCompactions.clear();
+      this.preferredCompactionTurns.clear();
+      this.compactionFailures.clear();
+      this.compactionChain = Promise.resolve();
       this.latestTokenUsage = null;
     }
   }
@@ -212,6 +258,98 @@ export class TaskProcessor {
       }
     }
     return null;
+  }
+
+  private async resolveTaskWorkspace(task: ClaimedTask): Promise<BotWorkspace> {
+    if (!task.chatContextId && !task.workspaceKey) {
+      return resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
+    }
+    if (!task.chatContextId || !task.workspaceKey) throw new Error("chat-context task is missing its workspace identity");
+    return resolveChatWorkspace(
+      this.config.workspaceRoots,
+      task.resolvedWorkspaceAlias,
+      task.botAppId,
+      task.chatContextId,
+      task.workspaceKey
+    );
+  }
+
+  private async blockChatContext(task: ClaimedTask, reason: string, summary: string, threadId: string | null = null): Promise<void> {
+    await this.client.event(task.id, task.leaseToken, "codex.context.blocked", summary, {
+      chatContextId: task.chatContextId ?? null,
+      reason,
+      threadId
+    }).catch(() => undefined);
+    await this.finishTask(task, "waiting_input", summary).catch(() => undefined);
+  }
+
+  private async reportResumeFailure(task: ClaimedTask, expectedThreadId: string, error: unknown): Promise<void> {
+    const summary = "固定 Codex Thread 无法恢复，已暂停并等待人工检查。";
+    try {
+      await this.client.event(task.id, task.leaseToken, "codex.thread.resume_failed", summary, {
+        chatContextId: task.chatContextId ?? null,
+        expectedThreadId,
+        error: this.safeErrorSummary(error)
+      });
+    } catch {
+      await this.finishTask(task, "waiting_input", summary).catch(() => undefined);
+    }
+  }
+
+  private async finishTask(
+    task: ClaimedTask,
+    status: "completed" | "failed" | "waiting_input" | "human_owned",
+    summary: string,
+    lifecycle?: { disposition: "complete" | "awaiting_followup" | "unchanged"; processedRoomSeq: number; dispositionReason: string }
+  ): Promise<void> {
+    await this.flushCompactions();
+    await this.client.result(task, status, summary, lifecycle);
+  }
+
+  private async flushCompactions(): Promise<void> {
+    while (true) {
+      const pending = this.compactionChain;
+      await pending;
+      if (pending === this.compactionChain) break;
+    }
+    if (this.compactionFailures.size) {
+      const detail = [...this.compactionFailures.values()].map((error) => error.message).join("; ");
+      throw new Error(`Codex compaction audit failed: ${detail}`);
+    }
+  }
+
+  private async reportCompaction(task: ClaimedTask, compaction: CodexCompactionAudit): Promise<void> {
+    let lastError: unknown = new Error("unknown compaction audit error");
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      try {
+        await this.client.event(
+          task.id,
+          task.leaseToken,
+          "codex.context.compacted",
+          "Codex 已自动压缩聊天上下文",
+          {
+            chatContextId: task.chatContextId,
+            threadId: compaction.threadId,
+            turnId: compaction.turnId,
+            itemId: compaction.itemId,
+            source: compaction.source
+          }
+        );
+        return;
+      } catch (error) {
+        lastError = error;
+        if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 25));
+      }
+    }
+    throw new Error(errorMessage(lastError));
+  }
+
+  private safeErrorSummary(error: unknown): string {
+    let summary = errorMessage(error);
+    for (const localPath of [this.config.codexHome, ...this.config.workspaceRoots.map((root) => root.path)]) {
+      summary = summary.split(localPath).join("[local path]");
+    }
+    return summary.slice(0, 1_000);
   }
 
   private observedModelPolicy(configuredModel: string | null, configuredEffort: string | null) {
@@ -281,6 +419,42 @@ export class TaskProcessor {
 
   private handleCodexActivity(method: string, params: Record<string, unknown>): void {
     this.lastCodexActivityAt = Date.now();
+    const compaction = codexCompactionFromActivity(method, params);
+    const task = this.currentTask;
+    if (compaction && task?.chatContextId && this.currentCodexThreadId === compaction.threadId) {
+      const turnKey = `${compaction.threadId}:${compaction.turnId}`;
+      if (compaction.itemId) {
+        this.preferredCompactionTurns.add(turnKey);
+        this.compactionFailures.delete(`turn:${turnKey}`);
+      }
+      else if (this.preferredCompactionTurns.has(turnKey)) return;
+      const auditKey = compaction.itemId
+        ? `item:${compaction.threadId}:${compaction.itemId}`
+        : `turn:${turnKey}`;
+      if (this.reportedCompactions.has(auditKey)) return;
+      this.reportedCompactions.add(auditKey);
+      this.compactionChain = this.compactionChain.then(async () => {
+        // Legacy and preferred notifications may arrive back-to-back. Defer the
+        // fallback just enough for a preferred item notification to supersede it.
+        if (!compaction.itemId && this.preferredCompactionTurns.has(turnKey)) {
+          this.reportedCompactions.delete(auditKey);
+          return;
+        }
+        try {
+          await this.reportCompaction(task, compaction);
+          this.compactionFailures.delete(auditKey);
+        } catch (error) {
+          if (!compaction.itemId && this.preferredCompactionTurns.has(turnKey)) {
+            this.compactionFailures.delete(auditKey);
+            this.reportedCompactions.delete(auditKey);
+            return;
+          }
+          const failure = error instanceof Error ? error : new Error(String(error));
+          this.compactionFailures.set(auditKey, failure);
+          this.reportedCompactions.delete(auditKey);
+        }
+      });
+    }
     if (method !== "thread/tokenUsage/updated" || !this.currentCodexStage) return;
     const tokenUsage = params.tokenUsage as Record<string, unknown> | undefined;
     const last = tokenUsage?.last as Record<string, unknown> | undefined;
@@ -322,7 +496,7 @@ export class TaskProcessor {
 
   async openHandoff(task: ClaimedTask): Promise<void> {
     if (!this.config.appLauncher) throw new Error("this executor has no app_launcher capability");
-    const workspace = await resolveBotWorkspace(this.config.workspaceRoots, task.resolvedWorkspaceAlias, task.botAppId);
+    const workspace = await this.resolveTaskWorkspace(task);
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: this.config.codexHome };
     delete env.CODEX_SQLITE_HOME;
     const child = spawn(this.config.appLauncher, [workspace.path], { env, detached: true, stdio: "ignore" });
@@ -447,4 +621,42 @@ function parseStructuredResult(text: string): unknown {
   const trimmed = text.trim();
   const unfenced = trimmed.startsWith("```") ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "") : trimmed;
   return JSON.parse(unfenced);
+}
+
+interface CodexCompactionAudit {
+  threadId: string;
+  turnId: string;
+  itemId: string | null;
+  source: "item/completed" | "thread/compacted";
+}
+
+export function codexCompactionFromActivity(method: string, params: Record<string, unknown>): CodexCompactionAudit | null {
+  if (method !== "item/completed" && method !== "thread/compacted") return null;
+  const threadId = typeof params.threadId === "string" ? params.threadId : null;
+  const turnId = typeof params.turnId === "string" ? params.turnId : null;
+  if (!threadId || !turnId) return null;
+  if (method === "thread/compacted") {
+    return { threadId, turnId, itemId: null, source: "thread/compacted" };
+  }
+  const item = params.item && typeof params.item === "object" ? params.item as Record<string, unknown> : null;
+  if (item?.type !== "contextCompaction") return null;
+  return {
+    threadId,
+    turnId,
+    itemId: typeof item.id === "string" ? item.id : null,
+    source: "item/completed"
+  };
+}
+
+function validateChatContextClaim(task: ClaimedTask): string | null {
+  if (Boolean(task.chatContextId) !== Boolean(task.workspaceKey)) {
+    return "聊天上下文任务缺少完整的工作区标识，已暂停并等待控制面修复。";
+  }
+  if (task.chatContextId && task.workspaceKey !== task.chatContextId) {
+    return "聊天工作区标识与 Chat Context ID 不一致，已暂停并等待控制面修复。";
+  }
+  if (task.chatContextThreadId !== undefined && task.chatContextThreadId !== task.codexThreadId) {
+    return "任务 Thread 与聊天当前 Thread 不一致，已暂停并等待人工检查。";
+  }
+  return null;
 }

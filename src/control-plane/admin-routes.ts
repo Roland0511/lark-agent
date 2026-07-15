@@ -43,8 +43,16 @@ function availability(lastSeen: Date | string): "online" | "stale" | "offline" {
   return age <= 45_000 ? "online" : age <= 90_000 ? "stale" : "offline";
 }
 
-function assertTaskCommand(task: Task, command: z.infer<typeof commandSchema>["command"], capabilities: string[]): void {
+function assertTaskCommand(
+  task: Task,
+  command: z.infer<typeof commandSchema>["command"],
+  capabilities: string[],
+  chatContextState: "uninitialized" | "ready" | "blocked"
+): void {
   if (command === "retry" && !["failed", "waiting_input"].includes(task.state)) throw new AppError("当前状态不能重试", 409, "invalid_task_state");
+  if (command === "retry" && chatContextState === "blocked") {
+    throw new AppError("聊天记忆已阻塞；请先恢复固定执行环境，普通重试不会解除长期绑定", 409, "chat_context_blocked");
+  }
   if (command === "cancel" && ["completed", "failed", "cancelled"].includes(task.state)) throw new AppError("任务已经结束", 409, "invalid_task_state");
   if (command === "handoff" && (task.state !== "running" || !capabilities.includes("app_handoff"))) throw new AppError("当前任务不能由本机接手", 409, "handoff_unavailable");
   if (command === "return_agent" && task.state !== "human_owned") throw new AppError("任务当前不由人工接管", 409, "invalid_task_state");
@@ -95,9 +103,12 @@ export function registerAdminRoutes(
     await requireAdmin(db, config, request);
     const hours = request.query.window === "7d" ? 168 : 24;
     const since = new Date(Date.now() - hours * 3_600_000);
-    const [taskStates, workers, pendingApprovals, outboxUnknown, outputUnknown, heldDrafts, duration, incidents, throughput, awaitingFollowup, bots] = await Promise.all([
+    const [taskStates, workers, workerCredentials, pendingApprovals, outboxUnknown, outputUnknown, heldDrafts, duration, incidents, throughput, awaitingFollowup, bots] = await Promise.all([
       db.selectFrom("tasks").select(["state", sql<number>`count(*)::int`.as("count")]).groupBy("state").execute(),
       db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy("display_name").execute(),
+      db.selectFrom("worker_device_credentials")
+        .select(["executor_id", sql<number>`count(*) filter (where revoked_at is null)::int`.as("active_count")])
+        .groupBy("executor_id").execute(),
       db.selectFrom("approvals").select(sql<number>`count(*)::int`.as("count")).where("state", "=", "pending").executeTakeFirstOrThrow(),
       db.selectFrom("outbox_messages").select(sql<number>`count(*)::int`.as("count")).where("state", "=", "unknown").executeTakeFirstOrThrow(),
       db.selectFrom("task_outputs").select(sql<number>`count(*)::int`.as("count")).where("state", "=", "unknown").executeTakeFirstOrThrow(),
@@ -108,7 +119,7 @@ export function registerAdminRoutes(
       db.selectFrom("tasks").select([sql<string>`date_trunc('hour', created_at)::text`.as("bucket"), sql<number>`count(*)::int`.as("count")])
         .where("created_at", ">", since).groupBy(sql`date_trunc('hour', created_at)`).orderBy(sql`date_trunc('hour', created_at)`).execute(),
       db.selectFrom("conversations").select(sql<number>`count(*)::int`.as("count")).where("active", "=", true).where("followup_expires_at", "is not", null).executeTakeFirstOrThrow(),
-      db.selectFrom("bots").select(["id", "display_name", "enabled", "is_system", "credential_state"]).where("deleted_at", "is", null).orderBy("display_name").execute()
+      db.selectFrom("bots").select(["id", "display_name", "enabled", "is_system", "credential_state", "permission_state"]).where("deleted_at", "is", null).orderBy("display_name").execute()
     ]);
     const completed = taskStates.find((item) => item.state === "completed")?.count ?? 0;
     const failed = taskStates.find((item) => item.state === "failed")?.count ?? 0;
@@ -122,26 +133,34 @@ export function registerAdminRoutes(
       averageDurationSeconds: duration.avg_seconds === null ? null : Number(duration.avg_seconds),
       workers: workers.map((worker) => ({
         executorId: worker.executor_id, displayName: worker.display_name, availability: availability(worker.last_seen_at),
-        operationalMode: worker.operational_mode, lastSeenAt: iso(worker.last_seen_at), profile: worker.codex_profile
+        operationalMode: worker.operational_mode, lastSeenAt: iso(worker.last_seen_at), profile: worker.codex_profile,
+        credentialActive: (workerCredentials.find((item) => item.executor_id === worker.executor_id)?.active_count ?? 0) > 0
       })),
       consumers: runtime.snapshot(),
-      bots: bots.map((bot) => ({ id: bot.id, displayName: bot.display_name, enabled: bot.enabled, isSystem: bot.is_system, credentialState: bot.credential_state, message: runtime.snapshot([`${bot.id}:message`])[`${bot.id}:message`] })),
+      bots: bots.map((bot) => ({ id: bot.id, displayName: bot.display_name, enabled: bot.enabled, isSystem: bot.is_system, credentialState: bot.credential_state, permissionState: bot.permission_state, message: runtime.snapshot([`${bot.id}:message`])[`${bot.id}:message`] })),
       incidents: incidents.map((item) => ({ ...item, first_seen_at: iso(item.first_seen_at), last_seen_at: iso(item.last_seen_at) })),
       throughput
     };
   });
 
-  app.get<{ Querystring: { state?: string; bot?: string; executor?: string; workspace?: string; q?: string; limit?: string; before?: string } }>("/v1/admin/tasks", async (request) => {
+  app.get<{ Querystring: { state?: string; bot?: string; executor?: string; workspace?: string; chatContextId?: string; q?: string; limit?: string; before?: string } }>("/v1/admin/tasks", async (request) => {
     await requireAdmin(db, config, request);
     const limit = Math.min(Math.max(Number(request.query.limit ?? 30), 1), 100);
     let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").select([
       "tasks.id", "tasks.state", "tasks.revision", "tasks.executor_id", "tasks.requested_workspace_alias", "tasks.resolved_workspace_alias", "tasks.requester_id",
-      "tasks.requester_role", "tasks.attempt", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
-      "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_type", "conversations.room_seq"
+      "tasks.requester_role", "tasks.attempt", "tasks.summary", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
+      "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name",
+      "conversations.chat_context_id", "conversations.chat_type", "conversations.room_seq",
+      sql<string | null>`(select signals.content from signals where signals.task_id = tasks.id order by signals.seq desc limit 1)`.as("latest_signal_content")
     ]).orderBy("tasks.created_at", "desc").orderBy("tasks.id", "desc").limit(limit + 1);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
     if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
     if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
+    if (request.query.chatContextId) {
+      const chatContextId = z.string().uuid().safeParse(request.query.chatContextId);
+      if (!chatContextId.success) throw new AppError("聊天记忆筛选条件格式无效", 400, "invalid_chat_context_filter");
+      query = query.where("conversations.chat_context_id", "=", chatContextId.data);
+    }
     if (request.query.workspace) query = query.where((eb) => eb.or([
       eb("tasks.resolved_workspace_alias", "=", request.query.workspace as string),
       eb.and([eb("tasks.resolved_workspace_alias", "is", null), eb("tasks.requested_workspace_alias", "=", request.query.workspace as string)])
@@ -162,8 +181,19 @@ export function registerAdminRoutes(
 
   app.get<{ Params: { id: string } }>("/v1/admin/tasks/:id", async (request) => {
     await requireAdmin(db, config, request);
-    const task = await db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").selectAll("tasks")
-      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "bots.default_executor_id as bot_default_executor_id", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id", "conversations.followup_expires_at", "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot", "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot"]).where("tasks.id", "=", request.params.id).executeTakeFirst();
+    const task = await db.selectFrom("tasks")
+      .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+      .innerJoin("bots", "bots.id", "tasks.bot_id")
+      .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+      .selectAll("tasks")
+      .select([
+        "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "bots.default_executor_id as bot_default_executor_id",
+        "conversations.chat_context_id", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id",
+        "conversations.followup_expires_at", "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot",
+        "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot",
+        "chat_contexts.codex_thread_id as chat_context_thread_id", "chat_contexts.state as chat_context_state"
+      ])
+      .where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
     const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;
@@ -205,26 +235,45 @@ export function registerAdminRoutes(
     const principal = await requireAdmin(db, config, request);
     requireCsrf(request, principal);
     const body = commandSchema.parse(request.body);
-    const task = await db.selectFrom("tasks").selectAll().where("id", "=", request.params.id).executeTakeFirst();
-    if (!task) throw new AppError("任务不存在", 404, "not_found");
-    const capabilities = task.executor_id ? parseJsonArray((await db.selectFrom("workers").select("capabilities").where("executor_id", "=", task.executor_id).executeTakeFirst())?.capabilities) : [];
-    assertTaskCommand(task, body.command, capabilities);
-    const now = new Date();
-    const nextState = body.command === "retry" ? "waiting_worker" : body.command === "cancel" ? "cancelled" : body.command === "handoff" ? "human_owned" : body.command === "return_agent" ? "waiting_worker" : "completed";
-    const updated = await db.updateTable("tasks").set({
-      state: nextState, revision: task.revision + 1, summary: `后台操作：${body.command}`,
-      preferred_executor_id: body.command === "retry" || body.command === "return_agent" ? task.executor_id : task.preferred_executor_id,
-      lease_token_hash: body.command === "retry" || body.command === "return_agent" || body.command === "cancel" ? null : task.lease_token_hash,
-      lease_expires_at: body.command === "retry" || body.command === "return_agent" || body.command === "cancel" ? null : task.lease_expires_at,
-      completed_at: body.command === "cancel" || body.command === "mark_completed" ? now : null, updated_at: now
-    }).where("id", "=", task.id).where("revision", "=", body.expectedRevision).returningAll().executeTakeFirst();
-    if (!updated) throw new AppError("任务状态已变化，请刷新后重试", 409, "revision_conflict");
-    await db.updateTable("conversations").set({
-      active: nextState !== "completed" && nextState !== "cancelled",
-      updated_at: now
-    }).where("id", "=", task.conversation_id).execute();
-    events.publish("task", task.id);
-    return { ok: true, state: nextState, revision: updated.revision };
+    const result = await db.transaction().execute(async (trx) => {
+      const identity = await trx.selectFrom("tasks")
+        .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["tasks.id", "tasks.conversation_id", "conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"])
+        .where("tasks.id", "=", request.params.id)
+        .executeTakeFirst();
+      if (!identity) throw new AppError("任务不存在", 404, "not_found");
+
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").select(["id", "state"])
+        .where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirst();
+      if (!context) throw new AppError("聊天记忆不存在", 409, "chat_context_not_found");
+      const task = await trx.selectFrom("tasks").selectAll().where("id", "=", identity.id).forUpdate().executeTakeFirst();
+      if (!task) throw new AppError("任务不存在", 404, "not_found");
+      await trx.selectFrom("conversations").select("id").where("id", "=", identity.conversation_id).forUpdate().executeTakeFirstOrThrow();
+      if (task.revision !== body.expectedRevision) throw new AppError("任务状态已变化，请刷新后重试", 409, "revision_conflict");
+
+      const capabilities = task.executor_id
+        ? parseJsonArray((await trx.selectFrom("workers").select("capabilities").where("executor_id", "=", task.executor_id).executeTakeFirst())?.capabilities)
+        : [];
+      assertTaskCommand(task, body.command, capabilities, context.state);
+      const now = new Date();
+      const nextState = body.command === "retry" ? "waiting_worker" : body.command === "cancel" ? "cancelled" : body.command === "handoff" ? "human_owned" : body.command === "return_agent" ? "waiting_worker" : "completed";
+      const updated = await trx.updateTable("tasks").set({
+        state: nextState, revision: task.revision + 1, summary: `后台操作：${body.command}`,
+        preferred_executor_id: body.command === "retry" || body.command === "return_agent" ? task.executor_id : task.preferred_executor_id,
+        lease_token_hash: body.command === "retry" || body.command === "return_agent" || body.command === "cancel" || body.command === "mark_completed" ? null : task.lease_token_hash,
+        lease_expires_at: body.command === "retry" || body.command === "return_agent" || body.command === "cancel" || body.command === "mark_completed" ? null : task.lease_expires_at,
+        completed_at: body.command === "cancel" || body.command === "mark_completed" ? now : null, updated_at: now
+      }).where("id", "=", task.id).where("revision", "=", body.expectedRevision).returningAll().executeTakeFirst();
+      if (!updated) throw new AppError("任务状态已变化，请刷新后重试", 409, "revision_conflict");
+      await trx.updateTable("conversations").set({
+        active: nextState !== "completed" && nextState !== "cancelled",
+        updated_at: now
+      }).where("id", "=", task.conversation_id).execute();
+      return { taskId: task.id, state: nextState, revision: updated.revision };
+    });
+    events.publish("task", result.taskId);
+    return { ok: true, state: result.state, revision: result.revision };
   });
 
   app.get("/v1/admin/workers", async (request) => {

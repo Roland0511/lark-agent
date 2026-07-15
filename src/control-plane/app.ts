@@ -28,6 +28,7 @@ import { approvalPolicyDecision } from "./policy.js";
 import { AppError, errorMessage } from "../shared/errors.js";
 import { registerAdminAuth } from "./admin-auth.js";
 import { registerAdminRoutes } from "./admin-routes.js";
+import { registerChatContextAdminRoutes } from "./chat-context-admin-routes.js";
 import { registerMetrics } from "./metrics.js";
 import { AdminEventBus } from "./admin-events.js";
 import { RuntimeStatus } from "./runtime-status.js";
@@ -165,12 +166,14 @@ export function buildControlPlane(
     do {
       const claimed = await repository.claimTask(principal);
       if (claimed) {
-        const conversation = await db.selectFrom("conversations").innerJoin("bots", "bots.id", "conversations.bot_id")
+        const conversation = await db.selectFrom("conversations")
+          .innerJoin("bots", "bots.id", "conversations.bot_id")
+          .innerJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
           .select([
-            "conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot",
+            "conversations.chat_context_id", "conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot",
             "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot",
             "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot",
-            "bots.app_id", "bots.display_name"
+            "bots.app_id", "bots.display_name", "chat_contexts.codex_thread_id as chat_context_thread_id"
           ])
           .where("conversations.id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
         const signals = await repository.taskSignals(claimed.task.id);
@@ -202,6 +205,8 @@ export function buildControlPlane(
           executionModel: conversation.execution_model_snapshot,
           executionReasoningEffort: conversation.execution_reasoning_effort_snapshot,
           conversationId: claimed.task.conversation_id,
+          chatContextId: conversation.chat_context_id,
+          workspaceKey: conversation.chat_context_id,
           state: claimed.task.state,
           leaseToken: claimed.leaseToken,
           leaseExpiresAt: claimed.leaseExpiresAt.toISOString(),
@@ -210,7 +215,8 @@ export function buildControlPlane(
           requesterId: claimed.task.requester_id,
           requesterRole: claimed.task.requester_role,
           authorization: claimed.task.authorization_grant,
-          codexThreadId: claimed.task.codex_thread_id,
+          codexThreadId: conversation.chat_context_thread_id,
+          chatContextThreadId: conversation.chat_context_thread_id,
           chatType: conversation.chat_type,
           turnIndex: claimed.task.turn_index,
           triggerMessageId: claimed.task.trigger_message_id,
@@ -294,13 +300,37 @@ export function buildControlPlane(
 
   app.post<{ Params: { id: string } }>("/v1/tasks/:id/events", async (request) => {
     const principal = await requireWorkerSession(db, config, request);
-    await repository.assertLease(request.params.id, principal.executorId, leaseToken(request));
+    const currentLeaseToken = leaseToken(request);
+    await repository.assertLease(request.params.id, principal.executorId, currentLeaseToken);
+    const lease = { executorId: principal.executorId, leaseToken: currentLeaseToken };
     const event = taskEventSchema.parse(request.body);
-    await repository.recordTaskEvent(request.params.id, event.type, event.summary, event.payload);
-    if (event.type === "codex.thread" && typeof event.payload.threadId === "string") {
-      await repository.updateTaskThread(request.params.id, event.payload.threadId);
+    let chatContextId: string | null = null;
+    let bindingBlocked = false;
+    let compactionBlocked = false;
+    if (event.type === "codex.thread" || event.type === "codex.thread.ready") {
+      const threadId = typeof event.payload.threadId === "string" ? event.payload.threadId.trim() : "";
+      if (!threadId) throw new AppError("missing Codex thread id", 400, "invalid_thread_event");
+      const binding = await repository.bindTaskThread(request.params.id, threadId, lease);
+      chatContextId = binding.chatContextId;
+      bindingBlocked = binding.status === "blocked";
+    } else if (event.type === "codex.thread.resume_failed" || event.type === "codex.context.blocked") {
+      const blocked = await repository.blockTaskContext(request.params.id, event.summary || "固定 Codex Thread 无法安全恢复", lease);
+      chatContextId = blocked.chatContextId;
+    } else if (event.type === "codex.context.compacted") {
+      const threadId = typeof event.payload.threadId === "string" ? event.payload.threadId.trim() : "";
+      const turnId = typeof event.payload.turnId === "string" ? event.payload.turnId.trim() : "";
+      const itemId = typeof event.payload.itemId === "string" ? event.payload.itemId.trim() || null : null;
+      const source = typeof event.payload.source === "string" ? event.payload.source.slice(0, 128) : "item/completed";
+      if (!threadId || !turnId) throw new AppError("invalid Codex compaction event", 400, "invalid_compaction_event");
+      const compaction = await repository.recordContextCompaction(request.params.id, { threadId, turnId, itemId, source }, lease);
+      chatContextId = compaction.chatContextId;
+      compactionBlocked = compaction.blocked;
     }
+    await repository.recordTaskEvent(request.params.id, event.type, event.summary, event.payload);
     adminEvents.publish("task", request.params.id);
+    if (chatContextId) adminEvents.publish("chat_context", chatContextId);
+    if (bindingBlocked) throw new AppError("Codex Thread 与聊天固定绑定冲突，任务已暂停", 409, "chat_context_conflict");
+    if (compactionBlocked) throw new AppError("Codex 压缩通知与聊天固定 Thread 不一致，任务已暂停", 409, "chat_context_conflict");
     return { ok: true };
   });
 
@@ -315,9 +345,14 @@ export function buildControlPlane(
 
   app.post<{ Params: { id: string } }>("/v1/tasks/:id/drafts", async (request) => {
     const principal = await requireWorkerSession(db, config, request);
-    await repository.assertLease(request.params.id, principal.executorId, leaseToken(request));
+    const currentLeaseToken = leaseToken(request);
+    await repository.assertLease(request.params.id, principal.executorId, currentLeaseToken);
     const draft = draftSubmissionSchema.parse(request.body);
-    if (draft.codexThreadId) await repository.updateTaskThread(request.params.id, draft.codexThreadId);
+    if (draft.codexThreadId) {
+      const binding = await repository.bindTaskThread(request.params.id, draft.codexThreadId, { executorId: principal.executorId, leaseToken: currentLeaseToken });
+      adminEvents.publish("chat_context", binding.chatContextId);
+      if (binding.status === "blocked") throw new AppError("Codex Thread 与聊天固定绑定冲突，任务已暂停", 409, "chat_context_conflict");
+    }
     const result = await drafts.submit(request.params.id, draft.content, draft.baseRoomSeq, draft.force);
     adminEvents.publish("task", request.params.id);
     return result;
@@ -355,12 +390,16 @@ export function buildControlPlane(
 
   app.post<{ Params: { id: string } }>("/v1/tasks/:id/result", async (request) => {
     const principal = await requireWorkerSession(db, config, request);
-    await repository.assertLease(request.params.id, principal.executorId, leaseToken(request));
+    const currentLeaseToken = leaseToken(request);
+    await repository.assertLease(request.params.id, principal.executorId, currentLeaseToken);
     const result = resultSubmissionSchema.parse(request.body);
     const lifecycle = result.status === "completed"
       ? { disposition: result.disposition, processedRoomSeq: result.processedRoomSeq, reason: result.dispositionReason }
       : undefined;
-    const completed = await repository.finishTask(request.params.id, result.status, result.summary, lifecycle);
+    const completed = await repository.finishTask(request.params.id, result.status, result.summary, lifecycle, {
+      executorId: principal.executorId,
+      leaseToken: currentLeaseToken
+    });
     if (result.status === "failed") await outputs.showStatus(request.params.id, `处理失败：${result.summary}`);
     if (result.status === "human_owned") await outputs.showStatus(request.params.id, "已暂停自动执行，等待本机 Codex App 接手。");
     adminEvents.publish("task", request.params.id);
@@ -371,6 +410,7 @@ export function buildControlPlane(
   registerAdminAuth(app, db, config);
   registerRunnerRoutes(app, db, config, runnerReleases, adminEvents);
   registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
+  registerChatContextAdminRoutes(app, db, config, adminEvents);
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);
 

@@ -157,20 +157,56 @@ export class EventRouter {
       await this.repository.decideApproval(action.approvalId, event.operator_id, action.action === "approve");
       return;
     }
-    const task = await this.db.selectFrom("tasks").selectAll().where("id", "=", action.taskId).executeTakeFirstOrThrow();
-    if (action.action === "handoff") {
-      await this.db.updateTable("tasks").set({ state: "human_owned", revision: sql`revision + 1`, summary: "主人请求本机接手", updated_at: new Date() }).where("id", "=", task.id).execute();
-      await this.db.updateTable("conversations").set({ active: true, updated_at: new Date() }).where("id", "=", task.conversation_id).execute();
-    } else if (action.action === "return_agent") {
-      await this.db.updateTable("tasks").set({ state: "waiting_worker", revision: sql`revision + 1`, preferred_executor_id: task.executor_id, lease_token_hash: null, lease_expires_at: null, updated_at: new Date() }).where("id", "=", task.id).execute();
-      await this.db.updateTable("conversations").set({ active: true, updated_at: new Date() }).where("id", "=", task.conversation_id).execute();
-    } else if (action.action === "complete") {
-      await this.db.updateTable("tasks").set({ state: "completed", revision: sql`revision + 1`, completed_at: new Date(), updated_at: new Date() }).where("id", "=", task.id).execute();
-      await this.db.updateTable("conversations").set({ active: false, updated_at: new Date() }).where("id", "=", task.conversation_id).execute();
-    } else if (action.action === "cancel") {
-      await this.db.updateTable("tasks").set({ state: "cancelled", revision: sql`revision + 1`, completed_at: new Date(), lease_token_hash: null, lease_expires_at: null, updated_at: new Date() }).where("id", "=", task.id).execute();
-      await this.db.updateTable("conversations").set({ active: false, updated_at: new Date() }).where("id", "=", task.conversation_id).execute();
+    if (!["handoff", "return_agent", "complete", "cancel"].includes(action.action)) {
+      throw new AppError("unsupported card task action", 400, "invalid_card_action");
     }
+    await this.db.transaction().execute(async (trx) => {
+      const identity = await trx.selectFrom("tasks")
+        .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
+        .select(["tasks.id", "tasks.conversation_id", "conversations.bot_id", "conversations.chat_id", "conversations.chat_context_id"])
+        .where("tasks.id", "=", action.taskId as string)
+        .executeTakeFirst();
+      if (!identity) throw new AppError("task not found", 404, "not_found");
+
+      await sql`select pg_advisory_xact_lock(hashtext(${`${identity.bot_id}:${identity.chat_id}`}))`.execute(trx);
+      const context = await trx.selectFrom("chat_contexts").select("id").where("id", "=", identity.chat_context_id).forUpdate().executeTakeFirst();
+      if (!context) throw new AppError("chat context not found", 409, "chat_context_not_found");
+      const task = await trx.selectFrom("tasks").selectAll().where("id", "=", identity.id).forUpdate().executeTakeFirst();
+      if (!task) throw new AppError("task not found", 404, "not_found");
+      await trx.selectFrom("conversations").select("id").where("id", "=", identity.conversation_id).forUpdate().executeTakeFirstOrThrow();
+
+      const capabilities = task.executor_id
+        ? (await trx.selectFrom("workers").select("capabilities").where("executor_id", "=", task.executor_id).executeTakeFirst())?.capabilities
+        : [];
+      const workerCapabilities = Array.isArray(capabilities) ? capabilities.map(String) : [];
+      if (action.action === "handoff" && (task.state !== "running" || !workerCapabilities.includes("app_handoff"))) {
+        throw new AppError("task is no longer available for handoff", 409, "handoff_unavailable");
+      }
+      if (action.action === "return_agent" && task.state !== "human_owned") {
+        throw new AppError("task is no longer owned by a human", 409, "invalid_task_state");
+      }
+      if (action.action === "complete" && task.state !== "human_owned") {
+        throw new AppError("only a human-owned task may be completed from this card", 409, "invalid_task_state");
+      }
+      if (action.action === "cancel" && ["completed", "failed", "cancelled"].includes(task.state)) {
+        throw new AppError("task is already finished", 409, "invalid_task_state");
+      }
+
+      const now = new Date();
+      if (action.action === "handoff") {
+        await trx.updateTable("tasks").set({ state: "human_owned", revision: sql`revision + 1`, summary: "主人请求本机接手", updated_at: now }).where("id", "=", task.id).execute();
+        await trx.updateTable("conversations").set({ active: true, updated_at: now }).where("id", "=", task.conversation_id).execute();
+      } else if (action.action === "return_agent") {
+        await trx.updateTable("tasks").set({ state: "waiting_worker", revision: sql`revision + 1`, preferred_executor_id: task.executor_id, lease_token_hash: null, lease_expires_at: null, updated_at: now }).where("id", "=", task.id).execute();
+        await trx.updateTable("conversations").set({ active: true, updated_at: now }).where("id", "=", task.conversation_id).execute();
+      } else if (action.action === "complete") {
+        await trx.updateTable("tasks").set({ state: "completed", revision: sql`revision + 1`, completed_at: now, lease_token_hash: null, lease_expires_at: null, updated_at: now }).where("id", "=", task.id).execute();
+        await trx.updateTable("conversations").set({ active: false, updated_at: now }).where("id", "=", task.conversation_id).execute();
+      } else {
+        await trx.updateTable("tasks").set({ state: "cancelled", revision: sql`revision + 1`, completed_at: now, lease_token_hash: null, lease_expires_at: null, updated_at: now }).where("id", "=", task.id).execute();
+        await trx.updateTable("conversations").set({ active: false, updated_at: now }).where("id", "=", task.conversation_id).execute();
+      }
+    });
   }
 
   private async markDiscarded(eventId: string, eventType: string): Promise<void> {

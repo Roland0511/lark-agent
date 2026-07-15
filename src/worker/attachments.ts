@@ -46,7 +46,16 @@ export async function cleanupAllAttachmentRoots(roots: Array<{ path: string }>, 
     const botDirectories = await readdir(root.path, { withFileTypes: true }).catch(() => []);
     for (const entry of botDirectories) {
       if (entry.isDirectory() && !entry.isSymbolicLink() && /^cli_[A-Za-z0-9]+$/.test(entry.name)) {
-        await cleanupExpiredAttachments(join(root.path, entry.name), retentionDays).catch(() => undefined);
+        const botPath = join(root.path, entry.name);
+        // Keep cleaning legacy bot-level attachment caches during the staged rollout.
+        await cleanupExpiredAttachments(botPath, retentionDays).catch(() => undefined);
+        const chatsPath = join(botPath, "chats");
+        const chatDirectories = await readdir(chatsPath, { withFileTypes: true }).catch(() => []);
+        for (const chat of chatDirectories) {
+          if (chat.isDirectory() && !chat.isSymbolicLink() && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(chat.name)) {
+            await cleanupExpiredAttachments(join(chatsPath, chat.name), retentionDays).catch(() => undefined);
+          }
+        }
       }
     }
   }

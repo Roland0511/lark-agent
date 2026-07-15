@@ -77,6 +77,11 @@ const canonicalUuidSchema = z.string().regex(
   "Invalid canonical UUID"
 );
 
+const lowercaseCanonicalUuidSchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+  "Invalid lowercase canonical UUID"
+);
+
 export const workerSessionResponseSchema = z.object({
   sessionToken: z.string(),
   expiresAt: z.string().datetime()
@@ -145,6 +150,10 @@ export const claimedTaskSchema = z.object({
   executionModel: z.string().max(256).nullable(),
   executionReasoningEffort: z.string().max(32).nullable(),
   conversationId: z.string().uuid(),
+  // Optional while new runners are rolled out ahead of the chat-context control plane.
+  // New-mode tasks always provide both UUIDs and keep them identical.
+  chatContextId: lowercaseCanonicalUuidSchema.optional(),
+  workspaceKey: lowercaseCanonicalUuidSchema.optional(),
   state: z.enum(taskStates),
   leaseToken: z.string(),
   leaseExpiresAt: z.string(),
@@ -154,6 +163,7 @@ export const claimedTaskSchema = z.object({
   requesterRole: z.enum(["owner", "member"]),
   authorization: authorizationGrantSchema,
   codexThreadId: z.string().nullable(),
+  chatContextThreadId: z.string().nullable().optional(),
   chatType: z.enum(["p2p", "group"]),
   turnIndex: z.number().int().positive(),
   triggerMessageId: z.string().min(1),

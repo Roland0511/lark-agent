@@ -76,7 +76,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   const insertWorker = async () => db.insertInto("workers").values({
     executor_id: "worker-a", display_name: "Worker A", home_ref: "worker-a:home", codex_profile: "lark-agent",
     config_fingerprint: "a".repeat(64), codex_version: "test", capacity: 1,
-    workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+    workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "chat_context_v1"]), last_seen_at: new Date(), updated_at: new Date()
   }).execute();
 
   beforeAll(async () => {
@@ -95,6 +95,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const botDialogueSql = await readFile(fileURLToPath(new URL("../db/migrations/013_bot_dialogue.sql", import.meta.url)), "utf8");
     const botPermissionsSql = await readFile(fileURLToPath(new URL("../db/migrations/014_bot_permissions.sql", import.meta.url)), "utf8");
     const signalAttachmentsSql = await readFile(fileURLToPath(new URL("../db/migrations/015_signal_attachments.sql", import.meta.url)), "utf8");
+    const chatContextsSql = await readFile(fileURLToPath(new URL("../db/migrations/016_chat_contexts.sql", import.meta.url)), "utf8");
+    const chatContextRecoveryAttemptsSql = await readFile(fileURLToPath(new URL("../db/migrations/017_chat_context_recovery_attempts.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -117,6 +119,10 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (botPermissionsApplied.rowCount === 0) await client.query(botPermissionsSql);
     const signalAttachmentsApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'signals' AND column_name = 'attachments'");
     if (signalAttachmentsApplied.rowCount === 0) await client.query(signalAttachmentsSql);
+    const chatContextsApplied = await client.query("SELECT to_regclass('public.chat_contexts') AS table_name");
+    if (!chatContextsApplied.rows[0]?.table_name) await client.query(chatContextsSql);
+    const chatContextRecoveryAttemptsApplied = await client.query("SELECT to_regclass('public.chat_context_recovery_attempts') AS table_name");
+    if (!chatContextRecoveryAttemptsApplied.rows[0]?.table_name) await client.query(chatContextRecoveryAttemptsSql);
     await client.end();
   });
 
@@ -137,9 +143,12 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("drafts").execute();
     await db.deleteFrom("approvals").execute();
     await db.deleteFrom("task_events").execute();
+    await db.deleteFrom("chat_context_recovery_attempts").execute();
+    await db.deleteFrom("chat_context_compactions").execute();
     await db.deleteFrom("signals").execute();
     await db.deleteFrom("tasks").execute();
     await db.deleteFrom("conversations").execute();
+    await db.deleteFrom("chat_contexts").execute();
     await db.deleteFrom("processed_events").execute();
     await db.deleteFrom("bot_owner_binding_tokens").execute();
     await db.deleteFrom("bot_chat_bindings").execute();
@@ -164,6 +173,64 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const admin = await app.inject({ method: "GET", url: "/admin" });
     expect(admin.statusCode).toBe(302);
     expect(admin.headers.location).toBe("/admin/");
+  });
+
+  it("backfills the active historical Thread and its matching execution environment", async () => {
+    const schema = "chat_context_migration_test";
+    const client = new pg.Client({ connectionString: databaseUrl });
+    await client.connect();
+    try {
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(`SET search_path TO ${schema}, public`);
+      const migrationNames = [
+        "001_initial.sql", "002_ops_admin.sql", "003_lark_command_login.sql", "004_streaming_outputs.sql",
+        "005_output_item_cursor.sql", "006_multi_turn_conversations.sql", "007_resolved_workspaces.sql",
+        "008_single_user_flow.sql", "009_runner_enrollment.sql", "010_worker_soft_delete.sql", "011_multi_bot.sql",
+        "012_latency_and_model_policy.sql", "013_bot_dialogue.sql", "014_bot_permissions.sql", "015_signal_attachments.sql"
+      ];
+      for (const name of migrationNames) {
+        await client.query(await readFile(fileURLToPath(new URL(`../db/migrations/${name}`, import.meta.url)), "utf8"));
+      }
+      await client.query(`
+        INSERT INTO workers(executor_id, display_name, home_ref, codex_profile, config_fingerprint, codex_version, capacity, workspace_aliases, capabilities, last_seen_at)
+        VALUES ('worker-history', 'History Worker', 'history:home', 'history-profile', '${"f".repeat(64)}', 'test', 1, '["repo"]', '["codex","chat_context_v1"]', now());
+        INSERT INTO conversations(id, chat_id, chat_type, root_message_id, active, updated_at)
+        VALUES
+          ('10000000-0000-4000-8000-000000000001', 'oc_history', 'group', 'om_active', false, now() - interval '2 days'),
+          ('10000000-0000-4000-8000-000000000002', 'oc_history', 'group', 'om_recent', true, now());
+        INSERT INTO tasks(conversation_id, state, trigger_message_id, requester_id, requester_role, authorization_grant,
+          requested_workspace_alias, resolved_workspace_alias, preferred_executor_id, executor_id, codex_thread_id,
+          executor_home_ref, executor_profile, executor_config_fingerprint, codex_version, turn_index, updated_at)
+        VALUES
+          ('10000000-0000-4000-8000-000000000001', 'waiting_input', 'om_active', 'ou_owner', 'owner', '{}',
+            'repo', 'repo', 'worker-history', 'worker-history', 'thread-active', 'history:home', 'history-profile', '${"f".repeat(64)}', 'test', 1, now() - interval '2 days'),
+          ('10000000-0000-4000-8000-000000000002', 'completed', 'om_recent', 'ou_owner', 'owner', '{}',
+            'repo', 'repo', 'worker-history', 'worker-history', 'thread-recent', 'history:home', 'history-profile', '${"f".repeat(64)}', 'test', 1, now()),
+          ('10000000-0000-4000-8000-000000000002', 'waiting_worker', 'om_stale', 'ou_owner', 'owner', '{}',
+            'stale', 'stale', 'worker-history', 'worker-history', 'thread-stale', 'stale:home', 'stale-profile', '${"e".repeat(64)}', 'stale', 2, now() - interval '3 days');
+      `);
+      await client.query(await readFile(fileURLToPath(new URL("../db/migrations/016_chat_contexts.sql", import.meta.url)), "utf8"));
+      const context = (await client.query(`SELECT * FROM chat_contexts WHERE chat_id = 'oc_history'`)).rows[0];
+      expect(context).toMatchObject({
+        codex_thread_id: "thread-active", executor_id: "worker-history", executor_home_ref: "history:home",
+        executor_profile: "history-profile", executor_config_fingerprint: "f".repeat(64), workspace_root_alias: "repo", state: "ready"
+      });
+      expect((await client.query("SELECT count(DISTINCT chat_context_id)::int AS count FROM conversations")).rows[0]?.count).toBe(1);
+      expect((await client.query("SELECT codex_thread_id, executor_id, executor_home_ref, executor_profile, executor_config_fingerprint, requested_workspace_alias, resolved_workspace_alias, revision FROM tasks WHERE trigger_message_id = 'om_stale'")).rows[0]).toMatchObject({
+        codex_thread_id: "thread-active", executor_id: "worker-history", executor_home_ref: "history:home",
+        executor_profile: "history-profile", executor_config_fingerprint: "f".repeat(64),
+        requested_workspace_alias: "repo", resolved_workspace_alias: "repo", revision: 1
+      });
+      expect((await client.query("SELECT count(*)::int AS count FROM pg_constraint WHERE conname = 'conversations_chat_context_id_fkey' AND conrelid = 'conversations'::regclass")).rows[0]?.count).toBe(1);
+      expect((await client.query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'chat_context_compactions' AND indexname IN ('chat_context_compactions_context_item_idx', 'chat_context_compactions_context_legacy_turn_idx') ORDER BY indexname")).rows.map((row) => row.indexname)).toEqual([
+        "chat_context_compactions_context_item_idx", "chat_context_compactions_context_legacy_turn_idx"
+      ]);
+    } finally {
+      await client.query("SET search_path TO public");
+      await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await client.end();
+    }
   });
 
   it("does not require bootstrap identity after a bot has been imported", async () => {
@@ -331,7 +398,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       payload: {
         executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
         configFingerprint: "a".repeat(64), codexVersion: "codex-cli test", capacity: 1,
-        workspaceAliases: ["repo"], capabilities: ["codex"], runnerVersion: "0.1.1", architecture: "arm64", registrationSource: "quick_install"
+        workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"], runnerVersion: "0.1.1", architecture: "arm64", registrationSource: "quick_install"
       }
     });
     expect(staticSession.statusCode).toBe(401);
@@ -347,7 +414,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
         registration: {
           executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
           configFingerprint: "a".repeat(64), codexVersion: "codex-cli test", capacity: 1,
-          workspaceAliases: ["repo"], capabilities: ["codex"], runnerVersion: "0.1.0", architecture: "arm64", registrationSource: "quick_install"
+          workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"], runnerVersion: "0.1.0", architecture: "arm64", registrationSource: "quick_install"
         }
       }
     });
@@ -359,7 +426,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
         registration: {
           executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
           configFingerprint: "a".repeat(64), codexVersion: "codex-cli test", capacity: 1,
-          workspaceAliases: ["repo"], capabilities: ["codex"], runnerVersion: "0.1.0", architecture: "arm64", registrationSource: "quick_install"
+          workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"], runnerVersion: "0.1.0", architecture: "arm64", registrationSource: "quick_install"
         }
       }
     });
@@ -377,7 +444,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
         codexVersion: "codex-cli test",
         capacity: 1,
         workspaceAliases: ["repo"],
-        capabilities: ["codex"],
+        capabilities: ["codex", "chat_context_v1"],
         runnerVersion: "0.1.0",
         architecture: "arm64",
         registrationSource: "quick_install"
@@ -524,7 +591,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.insertInto("workers").values({
       executor_id: "worker-a", display_name: "Worker A", home_ref: "worker-a:home", codex_profile: "lark-agent",
       config_fingerprint: "a".repeat(64), codex_version: "test", capacity: 1,
-      workspace_aliases: JSON.stringify(["repo", "docs"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+      workspace_aliases: JSON.stringify(["repo", "docs"]), capabilities: JSON.stringify(["codex", "chat_context_v1"]), last_seen_at: new Date(), updated_at: new Date()
     }).execute();
     const conversation = await db.insertInto("conversations").values({
       chat_id: "oc_ambiguous_workspace", chat_type: "group", root_message_id: "om_ambiguous", thread_id: null,
@@ -552,7 +619,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.insertInto("workers").values({
       executor_id: "worker-b", display_name: "Worker B", home_ref: "worker-b:home", codex_profile: "lark-agent",
       config_fingerprint: "b".repeat(64), codex_version: "test", capacity: 1,
-      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "chat_context_v1"]), last_seen_at: new Date(), updated_at: new Date()
     }).execute();
     const conversation = await db.insertInto("conversations").values({
       chat_id: "oc_ambiguous_executor", chat_type: "group", root_message_id: "om_ambiguous_executor", thread_id: null,
@@ -804,7 +871,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.insertInto("workers").values({
       executor_id: "worker-b", display_name: "Worker B", home_ref: "worker-b:home", codex_profile: "lark-agent",
       config_fingerprint: "b".repeat(64), codex_version: "test", capacity: 1,
-      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex"]), last_seen_at: new Date(), updated_at: new Date()
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "chat_context_v1"]), last_seen_at: new Date(), updated_at: new Date()
     }).execute();
     const details: LarkMessageDetails = {
       messageId: "om_route_ambiguous", rootId: null, parentId: null, threadId: null, chatId: "oc_test",
@@ -846,8 +913,9 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const first = await db.selectFrom("tasks").selectAll().executeTakeFirstOrThrow();
     await db.updateTable("tasks").set({
       state: "running", executor_id: "worker-a", preferred_executor_id: "worker-a", codex_thread_id: "thread-count",
-      executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64), codex_version: "test"
+      resolved_workspace_alias: "repo", executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64), codex_version: "test"
     }).where("id", "=", first.id).execute();
+    await repository.bindTaskThread(first.id, "thread-count");
     await repository.finishTask(first.id, "completed", "replied 2", {
       disposition: "awaiting_followup", processedRoomSeq: 1, reason: "counting has not reached 10"
     });
@@ -883,10 +951,11 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const task = await db.insertInto("tasks").values({
       conversation_id: conversation.id, trigger_message_id: "om_start", state: "running", requester_id: "ou_owner", requester_role: "owner",
       authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
-      requested_workspace_alias: null, preferred_executor_id: "worker-a", executor_id: "worker-a", codex_thread_id: "thread-race",
+      requested_workspace_alias: null, resolved_workspace_alias: "repo", preferred_executor_id: "worker-a", executor_id: "worker-a", codex_thread_id: "thread-race",
       executor_home_ref: "worker-a:home", executor_profile: "lark-agent", executor_config_fingerprint: "a".repeat(64), codex_version: "test",
       lease_token_hash: null, lease_expires_at: null, summary: null, completed_at: null, updated_at: new Date()
     }).returningAll().executeTakeFirstOrThrow();
+    await new ControlPlaneRepository(db, 60).bindTaskThread(task.id, "thread-race");
     await db.insertInto("processed_events").values({ event_id: "ev_late", event_type: "message", status: "processed", processed_at: new Date() }).execute();
     await db.insertInto("signals").values({
       conversation_id: conversation.id, task_id: task.id, event_id: "ev_late", seq: 2, message_id: "om_late", origin_message_id: "om_late",
@@ -961,6 +1030,242 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
     expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(2);
     expect((await db.selectFrom("conversations").select("thread_id").executeTakeFirstOrThrow()).thread_id).toBeNull();
+  });
+
+  it("serializes concurrent private top-level messages and keeps one durable chat context", async () => {
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const router = new MessageRouter(db);
+    const message = (suffix: string) => ({
+      eventId: `ev_private_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_private_${suffix}`,
+      chatId: "oc_private_serial", chatType: "p2p" as const, rootMessageId: `om_private_${suffix}`,
+      senderId: "ou_owner", senderRole: "owner" as const, senderType: "user" as const, senderBotId: null,
+      senderDisplayName: "主人", ingressSource: "lark" as const, originMessageId: `om_private_${suffix}`,
+      botDialogueDepth: 0, messageType: "text", content: suffix, explicitlyActivated: true
+    });
+
+    await Promise.all([router.route(bot, message("one")), router.route(bot, message("two"))]);
+
+    expect(await db.selectFrom("chat_contexts").selectAll().execute()).toHaveLength(1);
+    expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(1);
+    expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
+    expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(2);
+  });
+
+  it("reuses one private chat Thread across separate top-level conversations", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const router = new MessageRouter(db);
+    const repository = new ControlPlaneRepository(db, 60);
+    const message = (suffix: string) => ({
+      eventId: `ev_private_reuse_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_private_reuse_${suffix}`,
+      chatId: "oc_private_reuse", chatType: "p2p" as const, rootMessageId: `om_private_reuse_${suffix}`,
+      senderId: "ou_owner", senderRole: "owner" as const, senderType: "user" as const, senderBotId: null,
+      senderDisplayName: "主人", ingressSource: "lark" as const, originMessageId: `om_private_reuse_${suffix}`,
+      botDialogueDepth: 0, messageType: "text", content: suffix, explicitlyActivated: true
+    });
+
+    const firstRoute = await router.route(bot, message("one"));
+    const firstClaim = await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
+    expect(firstClaim?.task.id).toBe(firstRoute.taskId);
+    expect((await repository.bindTaskThread(firstRoute.taskId as string, "thread-private-stable")).status).toBe("bound");
+    await repository.finishTask(firstRoute.taskId as string, "completed", "done", { disposition: "complete", processedRoomSeq: 1, reason: "done" });
+
+    const secondRoute = await router.route(bot, message("two"));
+    const tasks = await db.selectFrom("tasks").selectAll().orderBy("created_at").execute();
+    const conversations = await db.selectFrom("conversations").selectAll().orderBy("created_at").execute();
+    expect(secondRoute.taskId).not.toBe(firstRoute.taskId);
+    expect(conversations).toHaveLength(2);
+    expect(new Set(conversations.map((item) => item.chat_context_id))).toEqual(new Set([conversations[0]?.chat_context_id]));
+    expect(tasks[1]).toMatchObject({ state: "waiting_worker", executor_id: "worker-a", codex_thread_id: "thread-private-stable" });
+    expect((await db.selectFrom("chat_contexts").selectAll().executeTakeFirstOrThrow()).codex_thread_id).toBe("thread-private-stable");
+  });
+
+  it("keeps a group Thread after follow-up expiry and a new explicit activation", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const router = new MessageRouter(db);
+    const repository = new ControlPlaneRepository(db, 60);
+    const message = (suffix: string) => ({
+      eventId: `ev_group_reuse_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_group_reuse_${suffix}`,
+      chatId: "oc_test", chatType: "group" as const, rootMessageId: `om_group_reuse_${suffix}`,
+      senderId: "ou_owner", senderRole: "owner" as const, senderType: "user" as const, senderBotId: null,
+      senderDisplayName: "主人", ingressSource: "lark" as const, originMessageId: `om_group_reuse_${suffix}`,
+      botDialogueDepth: 0, messageType: "text", content: `@Lark Agent ${suffix}`, explicitlyActivated: true
+    });
+
+    const first = await router.route(bot, message("one"));
+    await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
+    await repository.bindTaskThread(first.taskId as string, "thread-group-stable");
+    await repository.finishTask(first.taskId as string, "completed", "waiting", { disposition: "awaiting_followup", processedRoomSeq: 1, reason: "waiting" });
+    await db.updateTable("conversations").set({ followup_expires_at: new Date(Date.now() - 1_000) }).where("id", "=", (await db.selectFrom("tasks").select("conversation_id").where("id", "=", first.taskId as string).executeTakeFirstOrThrow()).conversation_id).execute();
+    expect(await repository.expireFollowupConversations()).toBe(1);
+
+    const second = await router.route(bot, message("two"));
+    expect(second.taskId).not.toBe(first.taskId);
+    expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(2);
+    expect(await db.selectFrom("chat_contexts").selectAll().execute()).toHaveLength(1);
+    expect(await db.selectFrom("tasks").select(["codex_thread_id", "executor_id"]).where("id", "=", second.taskId as string).executeTakeFirstOrThrow())
+      .toEqual({ codex_thread_id: "thread-group-stable", executor_id: "worker-a" });
+  });
+
+  it("isolates chat contexts for two bots in the same group", async () => {
+    const secondBot = await db.insertInto("bots").values({
+      app_id: "cli_bot_second", profile_name: null, bot_open_id: "ou_bot_second", display_name: "Second Agent",
+      role_instructions: "", owner_open_id: "ou_owner", default_executor_id: null, default_workspace_alias: null,
+      enabled: true, is_system: false, credential_state: "verified", credential_error: null,
+      permission_state: "valid", permission_check: JSON.stringify({ ok: true }), permission_checked_at: new Date(), deleted_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    await db.insertInto("bot_chat_bindings").values({ bot_id: secondBot.id, chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
+    const firstBot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const route = (bot: typeof firstBot, suffix: string) => new MessageRouter(db).route(bot, {
+      eventId: `ev_two_bots_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_two_bots_${suffix}`,
+      chatId: "oc_test", chatType: "group", rootMessageId: `om_two_bots_${suffix}`,
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: `om_two_bots_${suffix}`, botDialogueDepth: 0,
+      messageType: "text", content: suffix, explicitlyActivated: true
+    });
+    await route(firstBot, "first");
+    await route(secondBot, "second");
+
+    const contexts = await db.selectFrom("chat_contexts").select(["id", "bot_id", "chat_id"]).orderBy("bot_id").execute();
+    expect(contexts).toHaveLength(2);
+    expect(new Set(contexts.map((item) => item.bot_id))).toEqual(new Set([firstBot.id, secondBot.id]));
+    expect(new Set(contexts.map((item) => item.id)).size).toBe(2);
+  });
+
+  it("binds a Thread idempotently, blocks conflicts, and deduplicates native compaction", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_bind_context", eventType: "im.message.receive_v1", messageId: "om_bind_context",
+      chatId: "oc_bind_context", chatType: "p2p", rootMessageId: "om_bind_context",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_bind_context", botDialogueDepth: 0,
+      messageType: "text", content: "bind", explicitlyActivated: true
+    });
+    await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
+
+    expect((await repository.bindTaskThread(routed.taskId as string, "thread-a")).status).toBe("bound");
+    expect((await repository.bindTaskThread(routed.taskId as string, "thread-a")).status).toBe("unchanged");
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-compact", itemId: "item-compact", source: "item/completed" })).recorded).toBe(true);
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-compact", itemId: "item-compact", source: "item/completed" })).recorded).toBe(false);
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-compact", itemId: "item-compact-second", source: "item/completed" })).recorded).toBe(true);
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-compact", itemId: null, source: "thread/compacted" })).recorded).toBe(false);
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-legacy", itemId: null, source: "thread/compacted" })).recorded).toBe(true);
+    expect((await repository.recordContextCompaction(routed.taskId as string, { threadId: "thread-a", turnId: "turn-legacy", itemId: "item-legacy-upgraded", source: "item/completed" })).recorded).toBe(false);
+    const compactions = await db.selectFrom("chat_context_compactions").selectAll().orderBy("codex_turn_id").orderBy("codex_item_id").execute();
+    expect(compactions).toHaveLength(3);
+    expect(compactions.find((item) => item.codex_turn_id === "turn-legacy")?.codex_item_id).toBe("item-legacy-upgraded");
+    expect(await db.selectFrom("chat_contexts").select(["codex_thread_id", "auto_compaction_count"]).executeTakeFirstOrThrow())
+      .toEqual({ codex_thread_id: "thread-a", auto_compaction_count: 3 });
+
+    expect((await repository.bindTaskThread(routed.taskId as string, "thread-b")).status).toBe("blocked");
+    expect(await db.selectFrom("chat_contexts").select(["codex_thread_id", "state"]).executeTakeFirstOrThrow())
+      .toEqual({ codex_thread_id: "thread-a", state: "blocked" });
+    expect(await db.selectFrom("tasks").select(["codex_thread_id", "state", "lease_token_hash"]).where("id", "=", routed.taskId as string).executeTakeFirstOrThrow())
+      .toEqual({ codex_thread_id: "thread-b", state: "waiting_input", lease_token_hash: null });
+  });
+
+  it("does not let an old runner claim chat-context tasks", async () => {
+    await insertWorker();
+    await db.updateTable("workers").set({ capabilities: JSON.stringify(["codex"]) }).where("executor_id", "=", "worker-a").execute();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    await new MessageRouter(db).route(bot, {
+      eventId: "ev_old_runner", eventType: "im.message.receive_v1", messageId: "om_old_runner",
+      chatId: "oc_old_runner", chatType: "p2p", rootMessageId: "om_old_runner",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_old_runner", botDialogueDepth: 0,
+      messageType: "text", content: "old", explicitlyActivated: true
+    });
+    await expect(new ControlPlaneRepository(db, 60).claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) })).resolves.toBeNull();
+    expect(await db.selectFrom("tasks").select(["state", "preferred_executor_id"]).where("trigger_message_id", "=", "om_old_runner").executeTakeFirstOrThrow())
+      .toEqual({ state: "queued", preferred_executor_id: null });
+
+    await new MessageRouter(db).route({ ...bot, default_executor_id: "worker-a" }, {
+      eventId: "ev_old_runner_preferred", eventType: "im.message.receive_v1", messageId: "om_old_runner_preferred",
+      chatId: "oc_old_runner_preferred", chatType: "p2p", rootMessageId: "om_old_runner_preferred",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_old_runner_preferred", botDialogueDepth: 0,
+      messageType: "text", content: "old preferred", explicitlyActivated: true
+    });
+    expect(await db.selectFrom("tasks").select(["state", "preferred_executor_id", "summary"]).where("trigger_message_id", "=", "om_old_runner_preferred").executeTakeFirstOrThrow())
+      .toMatchObject({ state: "waiting_input", preferred_executor_id: "worker-a", summary: "指定执行器尚未升级，不支持永久聊天记忆" });
+  });
+
+  it("blocks a fixed chat context when its runner loses chat_context_v1", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+    const first = await new MessageRouter(db).route(bot, {
+      eventId: "ev_capability_fixed_1", eventType: "im.message.receive_v1", messageId: "om_capability_fixed_1",
+      chatId: "oc_capability_fixed", chatType: "p2p", rootMessageId: "om_capability_fixed_1",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_capability_fixed_1", botDialogueDepth: 0,
+      messageType: "text", content: "first", explicitlyActivated: true
+    });
+    await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
+    await repository.bindTaskThread(first.taskId as string, "thread-capability-fixed");
+    await repository.finishTask(first.taskId as string, "completed", "done", { disposition: "complete", processedRoomSeq: 1, reason: "done" });
+    await db.updateTable("workers").set({ capabilities: JSON.stringify(["codex"]) }).where("executor_id", "=", "worker-a").execute();
+
+    const second = await new MessageRouter(db).route(bot, {
+      eventId: "ev_capability_fixed_2", eventType: "im.message.receive_v1", messageId: "om_capability_fixed_2",
+      chatId: "oc_capability_fixed", chatType: "p2p", rootMessageId: "om_capability_fixed_2",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_capability_fixed_2", botDialogueDepth: 0,
+      messageType: "text", content: "second", explicitlyActivated: true
+    });
+    expect(await db.selectFrom("chat_contexts").select(["state", "codex_thread_id"]).where("chat_id", "=", "oc_capability_fixed").executeTakeFirstOrThrow())
+      .toEqual({ state: "blocked", codex_thread_id: "thread-capability-fixed" });
+    expect(await db.selectFrom("tasks").select(["state", "codex_thread_id"]).where("id", "=", second.taskId as string).executeTakeFirstOrThrow())
+      .toEqual({ state: "waiting_input", codex_thread_id: "thread-capability-fixed" });
+  });
+
+  it("allows only one concurrent claim to lock a task and its chat context", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_claim_lock", eventType: "im.message.receive_v1", messageId: "om_claim_lock",
+      chatId: "oc_claim_lock", chatType: "p2p", rootMessageId: "om_claim_lock",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_claim_lock", botDialogueDepth: 0,
+      messageType: "text", content: "claim", explicitlyActivated: true
+    });
+    const principal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) };
+    const claims = await Promise.all([new ControlPlaneRepository(db, 60).claimTask(principal), new ControlPlaneRepository(db, 60).claimTask(principal)]);
+    expect(claims.filter(Boolean)).toHaveLength(1);
+    expect(claims.find(Boolean)?.task.id).toBe(routed.taskId);
+    expect(await db.selectFrom("tasks").select(["state", "attempt", "revision"]).where("id", "=", routed.taskId as string).executeTakeFirstOrThrow())
+      .toMatchObject({ state: "running", attempt: 1, revision: 1 });
+    expect(await db.selectFrom("task_events").selectAll().where("task_id", "=", routed.taskId as string).where("event_type", "=", "task.claimed").execute()).toHaveLength(1);
+  });
+
+  it("rejects late Thread and result writes after the worker lease is cancelled", async () => {
+    await insertWorker();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_late_lease", eventType: "im.message.receive_v1", messageId: "om_late_lease",
+      chatId: "oc_late_lease", chatType: "p2p", rootMessageId: "om_late_lease",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null, senderDisplayName: "主人",
+      ingressSource: "lark", originMessageId: "om_late_lease", botDialogueDepth: 0,
+      messageType: "text", content: "late", explicitlyActivated: true
+    });
+    const claimed = await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
+    expect(claimed?.task.id).toBe(routed.taskId);
+    await db.updateTable("tasks").set({ state: "cancelled", lease_token_hash: null, lease_expires_at: null, revision: sql`revision + 1`, updated_at: new Date() })
+      .where("id", "=", routed.taskId as string).execute();
+    const lease = { executorId: "worker-a", leaseToken: claimed?.leaseToken as string };
+
+    await expect(repository.bindTaskThread(routed.taskId as string, "thread-too-late", lease))
+      .rejects.toMatchObject({ code: "invalid_lease" });
+    await expect(repository.finishTask(routed.taskId as string, "completed", "too late", undefined, lease))
+      .rejects.toMatchObject({ code: "invalid_lease" });
+    expect(await db.selectFrom("chat_contexts").select(["codex_thread_id", "state"]).where("chat_id", "=", "oc_late_lease").executeTakeFirstOrThrow())
+      .toEqual({ codex_thread_id: null, state: "uninitialized" });
+    expect(await db.selectFrom("tasks").select(["state", "codex_thread_id"]).where("id", "=", routed.taskId as string).executeTakeFirstOrThrow())
+      .toEqual({ state: "cancelled", codex_thread_id: null });
   });
 
   it("reconciles unseen group main-stream messages before sending a draft", async () => {
@@ -1046,6 +1351,287 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(updated.executor_profile).toBe("lark-agent");
     expect(updated.codex_thread_id).toBe("thread-1");
     expect(updated.summary).toBe("后台操作：retry");
+  });
+
+  it("rejects retry for a task whose durable chat context is blocked", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("blocked-owner-token"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "blocked-owner-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_blocked_retry", chat_type: "p2p", root_message_id: "om_blocked_retry", thread_id: null, room_seq: 1,
+      active: true, response_message_id: null, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+    await db.updateTable("chat_contexts").set({ state: "blocked", blocked_reason: "固定环境已变化", updated_at: now })
+      .where("id", "=", conversation.chat_context_id).execute();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_blocked_retry", state: "waiting_input", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: null, executor_id: null, codex_thread_id: "thread-blocked",
+      executor_home_ref: null, executor_profile: null, executor_config_fingerprint: null, codex_version: null,
+      lease_token_hash: null, lease_expires_at: null, summary: "固定环境已变化", completed_at: null, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/v1/admin/tasks/${task.id}/commands`,
+      headers: { cookie: "lark_agent_admin_session=blocked-owner-token", "x-csrf-token": "blocked-owner-csrf" },
+      payload: { command: "retry", expectedRevision: task.revision }
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json<{ error: { code: string; message: string } }>().error).toMatchObject({
+      code: "chat_context_blocked",
+      message: expect.stringContaining("普通重试不会解除长期绑定")
+    });
+    expect(await db.selectFrom("tasks").select(["state", "revision"]).where("id", "=", task.id).executeTakeFirstOrThrow())
+      .toEqual({ state: "waiting_input", revision: task.revision });
+
+    const invalidId = await app.inject({
+      method: "GET",
+      url: "/v1/admin/chat-contexts/not-a-uuid",
+      headers: { cookie: "lark_agent_admin_session=blocked-owner-token" }
+    });
+    expect(invalidId.statusCode).toBe(400);
+    expect(invalidId.json<{ error: { code: string } }>().error.code).toBe("invalid_chat_context_id");
+
+    const relatedTasks = await app.inject({
+      method: "GET",
+      url: `/v1/admin/tasks?chatContextId=${conversation.chat_context_id}`,
+      headers: { cookie: "lark_agent_admin_session=blocked-owner-token" }
+    });
+    expect(relatedTasks.statusCode).toBe(200);
+    expect(relatedTasks.json<{ items: Array<{ id: string; chat_context_id: string }> }>().items)
+      .toEqual([expect.objectContaining({ id: task.id, chat_context_id: conversation.chat_context_id })]);
+
+    const invalidRelatedTasks = await app.inject({
+      method: "GET",
+      url: "/v1/admin/tasks?chatContextId=not-a-uuid",
+      headers: { cookie: "lark_agent_admin_session=blocked-owner-token" }
+    });
+    expect(invalidRelatedTasks.statusCode).toBe(400);
+    expect(invalidRelatedTasks.json<{ error: { code: string } }>().error.code).toBe("invalid_chat_context_filter");
+  });
+
+  it("filters chat contexts before calculating a summary that is independent of the item limit", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("context-summary-owner"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "context-summary-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const createContext = async (chatId: string, chatType: "group" | "p2p", state: "uninitialized" | "ready" | "blocked") => {
+      const conversation = await db.insertInto("conversations").values({
+        chat_id: chatId, chat_type: chatType, root_message_id: `om_${chatId}`, thread_id: null, room_seq: 1,
+        active: true, response_message_id: null, updated_at: now
+      }).returning("chat_context_id").executeTakeFirstOrThrow();
+      await db.updateTable("chat_contexts").set({ state, updated_at: now }).where("id", "=", conversation.chat_context_id).execute();
+    };
+    await createContext("oc_summary_blocked_group", "group", "blocked");
+    await createContext("oc_summary_blocked_p2p", "p2p", "blocked");
+    await createContext("oc_summary_ready_group", "group", "ready");
+    await createContext("oc_summary_uninitialized_group", "group", "uninitialized");
+    const headers = { cookie: "lark_agent_admin_session=context-summary-owner" };
+
+    const blocked = await app.inject({ method: "GET", url: "/v1/admin/chat-contexts?state=blocked&limit=1", headers });
+    expect(blocked.statusCode).toBe(200);
+    expect(blocked.json<{ items: Array<{ state: string }>; summary: Record<string, number | string | null> }>()).toMatchObject({
+      items: [{ state: "blocked" }],
+      summary: { total: 2, ready: 0, blocked: 2, uninitialized: 0 }
+    });
+
+    const filtered = await app.inject({
+      method: "GET",
+      url: "/v1/admin/chat-contexts?bot=00000000-0000-0000-0000-000000000001&chatType=group&q=summary&limit=1",
+      headers
+    });
+    expect(filtered.statusCode).toBe(200);
+    expect(filtered.json<{ items: unknown[]; summary: Record<string, number | string | null> }>()).toMatchObject({
+      items: [expect.any(Object)],
+      summary: { total: 3, ready: 1, blocked: 1, uninitialized: 1, lastActivityAt: expect.any(String) }
+    });
+  });
+
+  it("recovers a blocked chat context only after every fixed-environment check passes", async () => {
+    const now = new Date();
+    const fingerprint = "a".repeat(64);
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("context-recovery-owner"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "context-recovery-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    await insertWorker();
+    const createContext = async (chatId: string, expectedFingerprint: string | null) => {
+      const conversation = await db.insertInto("conversations").values({
+        chat_id: chatId, chat_type: "p2p", root_message_id: `om_${chatId}`, thread_id: null, room_seq: 1,
+        active: true, response_message_id: null, updated_at: now
+      }).returning("chat_context_id").executeTakeFirstOrThrow();
+      if (expectedFingerprint !== null) {
+        await db.updateTable("chat_contexts").set({
+          codex_thread_id: `thread-${chatId}`,
+          executor_id: "worker-a",
+          executor_home_ref: "worker-a:home",
+          executor_profile: "lark-agent",
+          executor_config_fingerprint: expectedFingerprint,
+          workspace_root_alias: "repo",
+          state: "blocked",
+          blocked_reason: "恢复前保持阻塞",
+          updated_at: now
+        }).where("id", "=", conversation.chat_context_id).execute();
+      }
+      return conversation.chat_context_id;
+    };
+    const recoverableId = await createContext("oc_recoverable", fingerprint);
+    const mismatchedId = await createContext("oc_recovery_mismatch", "b".repeat(64));
+    const uninitializedId = await createContext("oc_recovery_uninitialized", null);
+    const cookie = { cookie: "lark_agent_admin_session=context-recovery-owner" };
+    const headers = { ...cookie, "x-csrf-token": "context-recovery-csrf" };
+
+    const missingCsrf = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${mismatchedId}/recover`, headers: cookie });
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(missingCsrf.json<{ error: { code: string } }>().error.code).toBe("invalid_csrf");
+    expect((await db.selectFrom("chat_context_recovery_attempts").select(sql<number>`count(*)::int`.as("count")).executeTakeFirstOrThrow()).count).toBe(0);
+
+    const failed = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${mismatchedId}/recover`, headers });
+    expect(failed.statusCode).toBe(200);
+    const failedBody = failed.json<{ state: string; recovered: boolean; checks: Array<{ key: string; state: string }> }>();
+    expect(failedBody).toMatchObject({ state: "blocked", recovered: false });
+    expect(failedBody.checks).toEqual(expect.arrayContaining([expect.objectContaining({ key: "configFingerprint", state: "fail" })]));
+    expect(await db.selectFrom("chat_contexts").select(["state", "blocked_reason"]).where("id", "=", mismatchedId).executeTakeFirstOrThrow())
+      .toEqual({ state: "blocked", blocked_reason: "恢复前保持阻塞" });
+    expect(await db.selectFrom("chat_context_recovery_attempts").select(["actor_open_id", "result", "failed_check_keys"]).where("chat_context_id", "=", mismatchedId).executeTakeFirstOrThrow())
+      .toEqual({ actor_open_id: "ou_owner", result: "check_failed", failed_check_keys: ["configFingerprint"] });
+
+    const recoveryEvents: Array<{ type: string; id?: string }> = [];
+    const captureRecoveryEvent = (event: { type: string; id?: string }) => recoveryEvents.push(event);
+    services.adminEvents.on("change", captureRecoveryEvent);
+    const recovered = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${recoverableId}/recover`, headers });
+    services.adminEvents.off("change", captureRecoveryEvent);
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json<{ state: string; recovered: boolean; checkedAt: string; checks: Array<{ state: string }> }>()).toMatchObject({
+      state: "ready", recovered: true, checkedAt: expect.any(String), checks: expect.any(Array)
+    });
+    expect(recovered.json<{ checks: Array<{ state: string }> }>().checks.every((item) => item.state === "pass")).toBe(true);
+    expect(recovered.body).not.toContain(fingerprint);
+    expect(recovered.body).not.toContain("worker-a:home");
+    expect(await db.selectFrom("chat_contexts").select(["state", "blocked_reason"]).where("id", "=", recoverableId).executeTakeFirstOrThrow())
+      .toEqual({ state: "ready", blocked_reason: null });
+    expect(recoveryEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "chat_context", id: recoverableId }),
+      expect.objectContaining({ type: "task" })
+    ]));
+    const detail = await app.inject({ method: "GET", url: `/v1/admin/chat-contexts/${recoverableId}`, headers: cookie });
+    expect(detail.statusCode).toBe(200);
+    expect(detail.json()).toMatchObject({ executorConfigFingerprint: "已记录（值已隐藏）" });
+    expect(detail.body).not.toContain(fingerprint);
+
+    const idempotent = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${recoverableId}/recover`, headers });
+    expect(idempotent.statusCode).toBe(200);
+    expect(idempotent.json()).toMatchObject({ state: "ready", recovered: false });
+    expect((await db.selectFrom("chat_context_recovery_attempts").select("result").where("chat_context_id", "=", recoverableId).orderBy("checked_at", "desc").execute()).map((item) => item.result))
+      .toEqual(["already_ready", "recovered"]);
+
+    const uninitialized = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${uninitializedId}/recover`, headers });
+    expect(uninitialized.statusCode).toBe(409);
+    expect(uninitialized.json<{ error: { code: string } }>().error.code).toBe("chat_context_uninitialized");
+    expect((await db.selectFrom("chat_context_recovery_attempts").select("result").where("chat_context_id", "=", uninitializedId).executeTakeFirstOrThrow()).result)
+      .toBe("uninitialized");
+  });
+
+  it("serializes admin task commands on the bot and chat advisory lock and rereads revision", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("lock-owner-token"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "lock-owner-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_admin_lock", chat_type: "p2p", root_message_id: "om_admin_lock", thread_id: null, room_seq: 1,
+      active: true, response_message_id: null, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_admin_lock", state: "failed", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: null, executor_id: null, codex_thread_id: null,
+      executor_home_ref: null, executor_profile: null, executor_config_fingerprint: null, codex_version: null,
+      lease_token_hash: null, lease_expires_at: null, summary: "failed", completed_at: now, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+    const client = new pg.Client({ connectionString: databaseUrl });
+    await client.connect();
+    let transactionOpen = false;
+    try {
+      await client.query("BEGIN");
+      transactionOpen = true;
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${conversation.bot_id}:${conversation.chat_id}`]);
+      let settled = false;
+      const command = app.inject({
+        method: "POST",
+        url: `/v1/admin/tasks/${task.id}/commands`,
+        headers: { cookie: "lark_agent_admin_session=lock-owner-token", "x-csrf-token": "lock-owner-csrf" },
+        payload: { command: "retry", expectedRevision: task.revision }
+      }).then((response) => { settled = true; return response; });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(settled).toBe(false);
+      await client.query("UPDATE tasks SET revision = revision + 1, updated_at = now() WHERE id = $1", [task.id]);
+      await client.query("COMMIT");
+      transactionOpen = false;
+      const response = await command;
+      expect(response.statusCode).toBe(409);
+      expect(response.json<{ error: { code: string } }>().error.code).toBe("revision_conflict");
+    } finally {
+      if (transactionOpen) await client.query("ROLLBACK");
+      await client.end();
+    }
+  });
+
+  it("serializes task card actions and rejects a stale handoff after the worker has completed", async () => {
+    const now = new Date();
+    await db.insertInto("workers").values({
+      executor_id: "worker-card-lock", display_name: "Worker Card Lock", home_ref: "worker-card-lock:home", codex_profile: "lark-agent",
+      config_fingerprint: "c".repeat(64), codex_version: "test", capacity: 1,
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "chat_context_v1", "app_handoff"]), last_seen_at: now, updated_at: now
+    }).execute();
+    const conversation = await db.insertInto("conversations").values({
+      chat_id: "oc_card_lock", chat_type: "p2p", root_message_id: "om_card_lock", thread_id: null, room_seq: 1,
+      active: true, response_message_id: null, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_card_lock", state: "running", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: "worker-card-lock", executor_id: "worker-card-lock", codex_thread_id: "thread-card-lock",
+      executor_home_ref: "worker-card-lock:home", executor_profile: "lark-agent", executor_config_fingerprint: "c".repeat(64), codex_version: "test",
+      lease_token_hash: sha256("card-lock-lease"), lease_expires_at: new Date(Date.now() + 60_000), summary: null, completed_at: null, updated_at: now
+    }).returningAll().executeTakeFirstOrThrow();
+    const client = new pg.Client({ connectionString: databaseUrl });
+    await client.connect();
+    let transactionOpen = false;
+    try {
+      await client.query("BEGIN");
+      transactionOpen = true;
+      await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [`${conversation.bot_id}:${conversation.chat_id}`]);
+      let settled = false;
+      const cardAction = services.router.handleCardAction({
+        type: "card.action.trigger",
+        event_id: "event-card-lock",
+        timestamp: String(Date.now()),
+        operator_id: "ou_owner",
+        message_id: "om_card_control",
+        chat_id: conversation.chat_id,
+        action_tag: "button",
+        action_value: JSON.stringify({ action: "handoff", taskId: task.id }),
+        token: "card-token"
+      }).then(() => null, (error: unknown) => error).finally(() => { settled = true; });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(settled).toBe(false);
+      await client.query("UPDATE tasks SET state = 'completed', revision = revision + 1, completed_at = now(), lease_token_hash = NULL, lease_expires_at = NULL, updated_at = now() WHERE id = $1", [task.id]);
+      await client.query("COMMIT");
+      transactionOpen = false;
+      const error = await cardAction;
+      expect(error).toBeInstanceOf(AppError);
+      expect((error as AppError).code).toBe("handoff_unavailable");
+      expect(await db.selectFrom("tasks").select(["state", "revision"]).where("id", "=", task.id).executeTakeFirstOrThrow())
+        .toEqual({ state: "completed", revision: task.revision + 1 });
+    } finally {
+      if (transactionOpen) await client.query("ROLLBACK");
+      await client.end();
+    }
   });
 
   it("aggregates inbox, task, draft and outbox data and diagnoses broken links", async () => {

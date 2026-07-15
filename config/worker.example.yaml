@@ -8,12 +8,13 @@ executor:
   codex_home: "/absolute/path/to/codex-home"
   codex_profile: "lark-agent"
   codex_binary: "codex"
-  runner_version: "0.2.5"
+  runner_version: "0.3.0"
   capacity: 1
   app_launcher: "/absolute/path/to/lark-agent/scripts/open-codex-app.sh"
   capabilities:
     - codex
     - app_handoff
+    - chat_context_v1
   workspace_roots:
     - alias: "artist-toolbox"
       path: "/absolute/path/to/workspace"

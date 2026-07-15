@@ -50,6 +50,7 @@ describe("worker config", () => {
     expect(config.homeRef).not.toContain(data.codexHome);
     expect(config.configFingerprint).toMatch(/^[a-f0-9]{64}$/);
     expect(config.capabilities).not.toContain("app_handoff");
+    expect(config.capabilities).toContain("chat_context_v1");
     expect(config.attachmentMaxBytes).toBe(104_857_600);
     expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
     expect(config.attachmentRetentionDays).toBe(7);
@@ -62,6 +63,14 @@ describe("worker config", () => {
     const config = await loadWorkerConfig(data.configFile, { TEST_DEVICE_TOKEN: ["test", "device", "token"].join("-") });
     expect(config.profileModel).toBe("profile-model");
     expect(config.profileReasoningEffort).toBe("high");
+  });
+
+  it("adds chat_context_v1 to existing explicit capability lists", async () => {
+    const data = await fixture();
+    const yaml = await import("node:fs/promises").then(({ readFile }) => readFile(data.configFile, "utf8"));
+    await writeFile(data.configFile, yaml.replace("  workspace_roots:", "  capabilities:\n    - codex\n  workspace_roots:"));
+    const config = await loadWorkerConfig(data.configFile, { TEST_DEVICE_TOKEN: ["test", "device", "token"].join("-") });
+    expect(config.capabilities).toEqual(["codex", "chat_context_v1"]);
   });
 
   it("rejects legacy embedded profiles", async () => {

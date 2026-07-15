@@ -41,6 +41,22 @@ describe("claimedTaskSchema", () => {
   it("拒绝非规范 UUID，避免无效任务进入 Worker", () => {
     expect(claimedTaskSchema.safeParse(claim("legacy-bot")).success).toBe(false);
   });
+
+  it("兼容旧 Claim，并校验聊天工作区只接受小写标准 UUID", () => {
+    expect(claimedTaskSchema.parse(claim("00000000-0000-0000-0000-000000000001")).chatContextId).toBeUndefined();
+    const modern = {
+      ...claim("00000000-0000-0000-0000-000000000001"),
+      chatContextId: "a3333333-3333-4333-8333-333333333333",
+      workspaceKey: "a3333333-3333-4333-8333-333333333333",
+      chatContextThreadId: null
+    };
+    expect(claimedTaskSchema.parse(modern)).toMatchObject({
+      chatContextId: modern.chatContextId,
+      workspaceKey: modern.workspaceKey,
+      chatContextThreadId: null
+    });
+    expect(claimedTaskSchema.safeParse({ ...modern, workspaceKey: modern.workspaceKey.toUpperCase() }).success).toBe(false);
+  });
 });
 
 describe("signalSchema attachment compatibility", () => {
