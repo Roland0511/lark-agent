@@ -100,6 +100,25 @@ function profileOverrides(source: string): string[] {
   return result;
 }
 
+function continuationConfigFingerprint(input: {
+  codexVersion: string;
+  protocolHash: string;
+  profileOverrides: string[];
+  effectiveModel: unknown;
+  effectiveModelProvider: unknown;
+  effectiveReasoningEffort: unknown;
+}): string {
+  return sha256(JSON.stringify({
+    version: 1,
+    codexVersion: input.codexVersion,
+    protocolHash: input.protocolHash,
+    model: typeof input.effectiveModel === "string" ? input.effectiveModel : null,
+    modelProvider: typeof input.effectiveModelProvider === "string" ? input.effectiveModelProvider : null,
+    reasoningEffort: typeof input.effectiveReasoningEffort === "string" ? input.effectiveReasoningEffort : null,
+    profileOverrides: [...input.profileOverrides].sort()
+  }));
+}
+
 async function commandVersion(command: string, codexHome: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome };
@@ -197,8 +216,19 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   const baseValues = baseConfig ? parseToml(baseConfig) as Record<string, unknown> : {};
   const profileValues = parseToml(profileConfig) as Record<string, unknown>;
   const effectiveModel = profileValues.model ?? baseValues.model;
+  const effectiveModelProvider = profileValues.model_provider ?? baseValues.model_provider;
   const effectiveReasoningEffort = profileValues.model_reasoning_effort ?? baseValues.model_reasoning_effort;
-  const configFingerprint = sha256([baseConfig, profileConfig, codexVersion, protocolHash].join("\n---\n"));
+  // Only pin values that affect App Server continuity. The complete base config
+  // also contains desktop preferences, trusted projects and plugin metadata;
+  // changing those must not invalidate an otherwise resumable Thread.
+  const configFingerprint = continuationConfigFingerprint({
+    codexVersion,
+    protocolHash,
+    profileOverrides: overrides,
+    effectiveModel,
+    effectiveModelProvider,
+    effectiveReasoningEffort
+  });
   return {
     controlPlaneUrl: raw.control_plane.url.replace(/\/$/, ""),
     deviceToken,

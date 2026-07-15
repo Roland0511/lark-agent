@@ -314,6 +314,10 @@ export function registerChatContextAdminRoutes(
             .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
             .select("tasks.id")
             .where("conversations.chat_context_id", "=", context.id)
+            // Migration 016 consolidated older conversations under one durable
+            // context. Their historical Threads predate this binding and are not
+            // evidence that the canonical Thread was replaced afterwards.
+            .where("tasks.created_at", ">=", context.created_at)
             .where("tasks.codex_thread_id", "is not", null)
             .where("tasks.codex_thread_id", "!=", context.codex_thread_id)
             .executeTakeFirst()

@@ -97,6 +97,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const signalAttachmentsSql = await readFile(fileURLToPath(new URL("../db/migrations/015_signal_attachments.sql", import.meta.url)), "utf8");
     const chatContextsSql = await readFile(fileURLToPath(new URL("../db/migrations/016_chat_contexts.sql", import.meta.url)), "utf8");
     const chatContextRecoveryAttemptsSql = await readFile(fileURLToPath(new URL("../db/migrations/017_chat_context_recovery_attempts.sql", import.meta.url)), "utf8");
+    const chatContextRebindSql = await readFile(fileURLToPath(new URL("../db/migrations/018_rebind_chat_context_fingerprints.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -123,6 +124,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (!chatContextsApplied.rows[0]?.table_name) await client.query(chatContextsSql);
     const chatContextRecoveryAttemptsApplied = await client.query("SELECT to_regclass('public.chat_context_recovery_attempts') AS table_name");
     if (!chatContextRecoveryAttemptsApplied.rows[0]?.table_name) await client.query(chatContextRecoveryAttemptsSql);
+    await client.query(chatContextRebindSql);
     await client.end();
   });
 
@@ -226,6 +228,22 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       expect((await client.query("SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND tablename = 'chat_context_compactions' AND indexname IN ('chat_context_compactions_context_item_idx', 'chat_context_compactions_context_legacy_turn_idx') ORDER BY indexname")).rows.map((row) => row.indexname)).toEqual([
         "chat_context_compactions_context_item_idx", "chat_context_compactions_context_legacy_turn_idx"
       ]);
+      await client.query(await readFile(fileURLToPath(new URL("../db/migrations/017_chat_context_recovery_attempts.sql", import.meta.url)), "utf8"));
+      await client.query(`
+        UPDATE workers
+        SET config_fingerprint = '${"a".repeat(64)}', codex_version = 'next', runner_version = '0.3.1', last_seen_at = now()
+        WHERE executor_id = 'worker-history';
+        UPDATE chat_contexts
+        SET state = 'blocked', blocked_reason = '旧版整份配置指纹已变化'
+        WHERE chat_id = 'oc_history';
+      `);
+      await client.query(await readFile(fileURLToPath(new URL("../db/migrations/018_rebind_chat_context_fingerprints.sql", import.meta.url)), "utf8"));
+      expect((await client.query("SELECT state, blocked_reason, executor_config_fingerprint, codex_version FROM chat_contexts WHERE chat_id = 'oc_history'")).rows[0]).toMatchObject({
+        state: "ready", blocked_reason: null, executor_config_fingerprint: "a".repeat(64), codex_version: "next"
+      });
+      expect((await client.query("SELECT actor_open_id, result, failed_check_keys FROM chat_context_recovery_attempts")).rows[0]).toMatchObject({
+        actor_open_id: "system:migration-018", result: "recovered", failed_check_keys: []
+      });
     } finally {
       await client.query("SET search_path TO public");
       await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
@@ -1463,7 +1481,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       const conversation = await db.insertInto("conversations").values({
         chat_id: chatId, chat_type: "p2p", root_message_id: `om_${chatId}`, thread_id: null, room_seq: 1,
         active: true, response_message_id: null, updated_at: now
-      }).returning("chat_context_id").executeTakeFirstOrThrow();
+      }).returning(["id", "chat_context_id"]).executeTakeFirstOrThrow();
       if (expectedFingerprint !== null) {
         await db.updateTable("chat_contexts").set({
           codex_thread_id: `thread-${chatId}`,
@@ -1477,11 +1495,43 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
           updated_at: now
         }).where("id", "=", conversation.chat_context_id).execute();
       }
-      return conversation.chat_context_id;
+      return { contextId: conversation.chat_context_id, conversationId: conversation.id };
     };
-    const recoverableId = await createContext("oc_recoverable", fingerprint);
-    const mismatchedId = await createContext("oc_recovery_mismatch", "b".repeat(64));
-    const uninitializedId = await createContext("oc_recovery_uninitialized", null);
+    const recoverable = await createContext("oc_recoverable", fingerprint);
+    const mismatched = await createContext("oc_recovery_mismatch", "b".repeat(64));
+    const replaced = await createContext("oc_recovery_replaced", fingerprint);
+    const uninitializedContext = await createContext("oc_recovery_uninitialized", null);
+    const recoverableId = recoverable.contextId;
+    const mismatchedId = mismatched.contextId;
+    const replacedId = replaced.contextId;
+    const uninitializedId = uninitializedContext.contextId;
+    const insertDifferentThreadTask = async (conversationId: string, triggerMessageId: string, createdAt: Date) => {
+      await db.insertInto("tasks").values({
+        conversation_id: conversationId,
+        state: "completed",
+        trigger_message_id: triggerMessageId,
+        requester_id: "ou_owner",
+        requester_role: "owner",
+        authorization_grant: JSON.stringify({}),
+        requested_workspace_alias: "repo",
+        resolved_workspace_alias: "repo",
+        preferred_executor_id: "worker-a",
+        executor_id: "worker-a",
+        codex_thread_id: `different-${triggerMessageId}`,
+        executor_home_ref: "worker-a:home",
+        executor_profile: "lark-agent",
+        executor_config_fingerprint: fingerprint,
+        codex_version: "test",
+        lease_token_hash: null,
+        lease_expires_at: null,
+        summary: "historical task",
+        created_at: createdAt,
+        updated_at: createdAt,
+        completed_at: createdAt
+      }).execute();
+    };
+    await insertDifferentThreadTask(recoverable.conversationId, "om_legacy_thread", new Date(now.getTime() - 60_000));
+    await insertDifferentThreadTask(replaced.conversationId, "om_replaced_thread", new Date(now.getTime() + 60_000));
     const cookie = { cookie: "lark_agent_admin_session=context-recovery-owner" };
     const headers = { ...cookie, "x-csrf-token": "context-recovery-csrf" };
 
@@ -1499,6 +1549,14 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       .toEqual({ state: "blocked", blocked_reason: "恢复前保持阻塞" });
     expect(await db.selectFrom("chat_context_recovery_attempts").select(["actor_open_id", "result", "failed_check_keys"]).where("chat_context_id", "=", mismatchedId).executeTakeFirstOrThrow())
       .toEqual({ actor_open_id: "ou_owner", result: "check_failed", failed_check_keys: ["configFingerprint"] });
+
+    const replacedThread = await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${replacedId}/recover`, headers });
+    expect(replacedThread.statusCode).toBe(200);
+    expect(replacedThread.json<{ state: string; recovered: boolean; checks: Array<{ key: string; state: string }> }>()).toMatchObject({
+      state: "blocked",
+      recovered: false,
+      checks: expect.arrayContaining([expect.objectContaining({ key: "thread", state: "fail" })])
+    });
 
     const recoveryEvents: Array<{ type: string; id?: string }> = [];
     const captureRecoveryEvent = (event: { type: string; id?: string }) => recoveryEvents.push(event);

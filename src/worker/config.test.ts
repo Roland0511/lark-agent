@@ -65,6 +65,31 @@ describe("worker config", () => {
     expect(config.profileReasoningEffort).toBe("high");
   });
 
+  it("keeps the continuity fingerprint stable across unrelated base and TUI changes", async () => {
+    const data = await fixture('model = "base-model"\nmodel_provider = "base-provider"\nmodel_reasoning_effort = "medium"\n');
+    const env = { TEST_DEVICE_TOKEN: ["test", "device", "token"].join("-") };
+    const initial = await loadWorkerConfig(data.configFile, env);
+
+    await writeFile(
+      join(data.codexHome, "config.toml"),
+      'model = "base-model"\nmodel_provider = "base-provider"\nmodel_reasoning_effort = "medium"\n' +
+      '[desktop]\ncodeFontSize = 15\n[projects."/tmp/example"]\ntrust_level = "trusted"\n'
+    );
+    await writeFile(
+      join(data.codexHome, "lark-agent.config.toml"),
+      'approval_policy = "on-request"\n[tui.model_availability_nux]\n"another.model" = 3\n'
+    );
+    const unrelatedChange = await loadWorkerConfig(data.configFile, env);
+    expect(unrelatedChange.configFingerprint).toBe(initial.configFingerprint);
+
+    await writeFile(
+      join(data.codexHome, "lark-agent.config.toml"),
+      'approval_policy = "never"\n[tui.model_availability_nux]\n"another.model" = 3\n'
+    );
+    const profileChange = await loadWorkerConfig(data.configFile, env);
+    expect(profileChange.configFingerprint).not.toBe(initial.configFingerprint);
+  });
+
   it("adds chat_context_v1 to existing explicit capability lists", async () => {
     const data = await fixture();
     const yaml = await import("node:fs/promises").then(({ readFile }) => readFile(data.configFile, "utf8"));
