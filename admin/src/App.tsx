@@ -595,12 +595,21 @@ function Workers({ user }: { user: AdminUser }) {
     setAdding(true);
   };
   const items = workers.data?.items ?? [];
-  const selected = items.find((worker: AnyRecord) => worker.executor_id === selectedId) ?? items[0];
+  const resolvedSelectedId = resolveSelectedWorkerId(items, selectedId);
+  useEffect(() => {
+    if (resolvedSelectedId !== selectedId) setSelectedId(resolvedSelectedId);
+  }, [resolvedSelectedId, selectedId]);
+  const selected = items.find((worker: AnyRecord) => worker.executor_id === resolvedSelectedId);
   return <><PageTitle eyebrow="本地能力" title="执行器" description="通过一次性注册指令挂载 Mac；每个实例固定绑定一组 Codex Home 与 Profile。" action={<button className="primary-button" disabled={release.data?.source === "unavailable"} onClick={openEnrollment}><Plus size={17} />添加执行器</button>} />
     {release.data?.source === "unavailable" && <div className="inline-alert"><AlertTriangle size={17} />Runner CDN manifest 当前不可用，暂时不能生成可靠的安装指令。</div>}
     {!workers.data ? <PageLoading /> : items.length ? <div className="master-detail-layout worker-master-detail"><aside className="master-list-panel" aria-label="执行器列表"><div className="master-list-search"><Search size={17} /><span>执行器</span><span>{items.length}</span></div><div className="master-list">{items.map((worker: AnyRecord) => { const state = worker.operational_mode !== "enabled" ? worker.operational_mode : worker.availability; return <button key={worker.executor_id} aria-pressed={selected?.executor_id === worker.executor_id} className={selected?.executor_id === worker.executor_id ? "master-list-item selected" : "master-list-item"} onClick={() => setSelectedId(worker.executor_id)}><span className="list-item-icon"><Server size={20} /></span><span><strong>{worker.display_name}</strong><small title={worker.reported_display_name}>设备：{worker.reported_display_name} · {worker.architecture}</small><small title={worker.executor_id}>ID {shortId(worker.executor_id)} · 心跳 {relativeTime(worker.last_seen_at)}</small></span><StateBadge state={state} /></button>; })}</div>{recentEnrollments.length > 0 && <details className="master-list-foot"><summary><KeyRound size={16} />最近注册指令<ChevronRight size={15} /></summary><div className="compact-enrollments">{recentEnrollments.map((item: AnyRecord) => <div key={item.id}><code>{shortId(item.id)}</code><StateBadge state={item.state} label={({ pending: "待使用", used: "已使用", expired: "已过期", revoked: "已撤销" } as AnyRecord)[item.state]} /></div>)}</div></details>}</aside>
       {selected && <WorkerMasterDetailPane worker={selected} recommendedVersion={recommendedVersion} upgradeCommand={upgradeCommand} onEditAlias={() => setEditingAlias(selected)} onCommand={(command) => setTarget({ worker: selected, command })} />}</div> : <article className="panel"><Empty icon={<Server />} title="还没有执行器" text="使用一次性注册指令挂载第一台 Mac。" /></article>}
     {target && <WorkerDialog {...target} user={user} onClose={() => { setTarget(null); void workers.refetch(); }} />}{editingAlias && <WorkerAliasDialog worker={editingAlias} user={user} onClose={() => setEditingAlias(null)} />}{adding && <EnrollmentDialog user={user} onClose={() => { setAdding(false); void enrollments.refetch(); void workers.refetch(); }} />}</>;
+}
+
+export function resolveSelectedWorkerId(items: AnyRecord[], selectedId: string): string {
+  if (selectedId && items.some((worker) => worker.executor_id === selectedId)) return selectedId;
+  return items[0]?.executor_id ?? "";
 }
 
 function WorkerMasterDetailPane({ worker, recommendedVersion, upgradeCommand, onEditAlias, onCommand }: { worker: AnyRecord; recommendedVersion: string | null | undefined; upgradeCommand: string | null; onEditAlias(): void; onCommand(command: string): void }) {

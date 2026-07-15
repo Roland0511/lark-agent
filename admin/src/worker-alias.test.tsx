@@ -3,7 +3,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WorkerAliasDialog } from "./App";
+import { resolveSelectedWorkerId, WorkerAliasDialog } from "./App";
 import type { AdminUser } from "./api";
 
 const user: AdminUser = { openId: "masked", displayName: "主人", role: "owner", csrfToken: "csrf", agentDisplayName: "阿朱" };
@@ -59,5 +59,23 @@ describe("执行器别名弹窗", () => {
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     expect((fetchMock.mock.calls[1]?.[1] as RequestInit).body).toBe(JSON.stringify({ displayAlias: null }));
+  });
+});
+
+describe("执行器选中态", () => {
+  it("列表因别名变化重排后仍按执行器 ID 保持当前详情", () => {
+    const before = [
+      { executor_id: "worker-a", display_name: "A" },
+      { executor_id: "worker-b", display_name: "B" }
+    ];
+    const selectedId = resolveSelectedWorkerId(before, "");
+
+    expect(selectedId).toBe("worker-a");
+    expect(resolveSelectedWorkerId([...before].reverse(), selectedId)).toBe("worker-a");
+  });
+
+  it("当前执行器不存在时回退到列表首项", () => {
+    expect(resolveSelectedWorkerId([{ executor_id: "worker-b" }], "worker-a")).toBe("worker-b");
+    expect(resolveSelectedWorkerId([], "worker-a")).toBe("");
   });
 });
