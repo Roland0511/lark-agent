@@ -27,7 +27,7 @@ afterEach(() => {
 });
 
 describe("技能数据分层", () => {
-  it("兼容全局和 Thread 分组返回并保留固定版本", () => {
+  it("兼容机器人与聊天分组返回并保留固定版本", () => {
     const result = normalizeSkillBindings({
       globalSkills: [{ id: "global-1", coordinate: "@sh01/git-commit", version: "20260605.221003", syncStatus: "applied" }],
       threadSkills: [{ chatContextId: "context-1", chatName: "项目群", skills: [{ id: "thread-1", coordinate: "@sh01/lark-doc", version: "7" }] }]
@@ -38,7 +38,7 @@ describe("技能数据分层", () => {
     expect(result[1]).toMatchObject({ scope: "chat_context", chatContextId: "context-1", chatName: "项目群" });
   });
 
-  it("聊天详情始终让 Thread 专属版本覆盖同坐标的全局版本", async () => {
+  it("聊天详情始终让聊天配置版本覆盖同坐标的机器人配置版本", async () => {
     vi.stubGlobal("fetch", vi.fn(() => ok({ items: [
       { id: "thread-1", coordinate: "@sh01/git-commit", version: "2", scope: "chat_context", chatContextId: "context-1", fileCount: 1 },
       { id: "global-1", coordinate: "@sh01/git-commit", version: "1", scope: "bot", fileCount: 2 }
@@ -80,7 +80,7 @@ describe("技能数据分层", () => {
 });
 
 describe("机器人技能管理", () => {
-  it("展示低密度摘要，并按指定 Thread 添加技能", async () => {
+  it("展示分层摘要，并按指定聊天添加技能", async () => {
     const calls: Array<[string, RequestInit | undefined]> = [];
     const fetchMock = vi.fn((path: string, init?: RequestInit) => {
       calls.push([path, init]);
@@ -96,15 +96,24 @@ describe("机器人技能管理", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     render(wrapper(<BotSkillsCard bot={{ id: "bot-1", displayName: "项目助理", defaultExecutorId: "runner-1" }} workers={[]} user={user} />));
-    expect(await screen.findByText("全局与 Thread 专属技能按需合并")).toBeTruthy();
+    expect(await screen.findByText("机器人配置与聊天配置按作用范围生效")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "管理技能" }));
 
     expect(await screen.findByRole("dialog", { name: "项目助理 · 技能管理" })).toBeTruthy();
-    expect(screen.getByText("技能声明依赖：command git")).toBeTruthy();
-    fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "@sh01/database-guide" } });
-    fireEvent.change(screen.getByLabelText("生效范围"), { target: { value: "chat_context" } });
-    fireEvent.change(await screen.findByLabelText("聊天 Thread"), { target: { value: "context-1" } });
+    expect(screen.getByText("环境继承")).toBeTruthy();
+    expect(screen.getAllByText("机器人配置").length).toBeGreaterThan(0);
+    fireEvent.click(await screen.findByRole("button", { name: "项目群" }));
+    expect(await screen.findByText("来源与范围")).toBeTruthy();
+    expect(screen.getByText("机器人配置 · 所有聊天")).toBeTruthy();
+    expect(screen.getByText("聊天配置 · 当前聊天")).toBeTruthy();
+    fireEvent.click(screen.getByRole("row", { name: /@sh01\/git-commit/ }));
+    expect(screen.getByRole("complementary", { name: "@sh01/git-commit 技能详情" })).toBeTruthy();
+    expect(screen.getByText("基本信息")).toBeTruthy();
+    expect(screen.getAllByText("运行依赖").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "添加技能" }));
+    fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "@sh01/database-guide" } });
+    const addButtons = screen.getAllByRole("button", { name: "添加技能" });
+    fireEvent.click(addButtons[addButtons.length - 1]!);
 
     await waitFor(() => expect(calls.some(([path, init]) => path === "/v1/admin/bots/bot-1/skills" && init?.method === "POST")).toBe(true));
     const addCall = calls.find(([path, init]) => path === "/v1/admin/bots/bot-1/skills" && init?.method === "POST");
@@ -122,9 +131,8 @@ describe("机器人技能管理", () => {
 
     render(wrapper(<BotSkillsCard bot={{ id: "bot-1", displayName: "项目助理" }} workers={[]} user={user} />));
     fireEvent.click(await screen.findByRole("button", { name: "管理技能" }));
-    expect(await screen.findByText("SkillHub 暂不可配置")).toBeTruthy();
-    fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "@sh01/git-commit" } });
-    expect((screen.getByRole("button", { name: "添加技能" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(await screen.findByText("SkillHub 不可用")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "添加全局技能" }) as HTMLButtonElement).disabled).toBe(true);
   });
 });
 
@@ -162,7 +170,7 @@ describe("技能运行依赖", () => {
     expect(await screen.findByText("LARK_API_TOKEN")).toBeTruthy();
     expect(screen.queryByText("must-not-render")).toBeNull();
     expect(screen.getByText("内容漂移")).toBeTruthy();
-    expect(screen.getByText("选择异常 Thread 后处理")).toBeTruthy();
+    expect(screen.getByText("选择异常聊天后处理")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "覆盖工作区版本" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "更新" }));
     expect((screen.getByLabelText("环境变量名") as HTMLInputElement).value).toBe("LARK_API_TOKEN");
@@ -190,7 +198,7 @@ describe("技能运行依赖", () => {
     await waitFor(() => expect(calls.some(([path, init]) => path.endsWith("/files/file-1") && init?.method === "DELETE")).toBe(true));
   });
 
-  it("仅在选择具体异常 Thread 后允许强制覆盖", async () => {
+  it("仅在选择具体异常聊天后允许强制覆盖", async () => {
     const contextId = "11111111-1111-4111-8111-111111111111";
     const calls: Array<[string, RequestInit | undefined]> = [];
     vi.stubGlobal("fetch", vi.fn((path: string, init?: RequestInit) => {
@@ -203,7 +211,7 @@ describe("技能运行依赖", () => {
     }));
 
     render(wrapper(<RuntimeConfigPanel botId="bot-1" binding={binding} contexts={[{ id: contextId, chatName: "异常项目群" }]} user={user} />));
-    expect(await screen.findByText("选择异常 Thread 后处理")).toBeTruthy();
+    expect(await screen.findByText("选择异常聊天后处理")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "覆盖工作区版本" })).toBeNull();
 
     fireEvent.change(screen.getByLabelText("运行依赖配置范围"), { target: { value: contextId } });
@@ -214,7 +222,7 @@ describe("技能运行依赖", () => {
     expect(forceCall?.[1]?.body).toBe(JSON.stringify({ chatContextId: contextId }));
   });
 
-  it("兼容控制面 scope 与 desiredState 字段并识别 Thread 覆盖", async () => {
+  it("兼容控制面 scope 与 desiredState 字段并识别聊天覆盖", async () => {
     vi.stubGlobal("fetch", vi.fn((path: string) => ok(path.includes("chatContextId=context-1") ? {
       environment: [{ id: "env-1", name: "THREAD_TOKEN", mode: "configured", scope: "chat_context" }],
       files: [{ id: "file-2", targetPath: ".env.thread", desiredState: "absent", scope: "chat_context", status: "pending_delete", revision: 2 }]
@@ -223,23 +231,23 @@ describe("技能运行依赖", () => {
     render(wrapper(<RuntimeConfigPanel botId="bot-1" binding={binding} contexts={[{ id: "context-1", chatName: "项目群" }]} user={user} />));
     fireEvent.change(screen.getByLabelText("运行依赖配置范围"), { target: { value: "context-1" } });
 
-    expect(await screen.findByText("Thread 覆盖 · 已设置")).toBeTruthy();
-    expect(screen.getAllByText("此 Thread 不提供").length).toBeGreaterThan(0);
+    expect(await screen.findByText("聊天覆盖 · 已设置")).toBeTruthy();
+    expect(screen.getAllByText("当前聊天不提供").length).toBeGreaterThan(0);
     expect(screen.getByText("等待删除")).toBeTruthy();
   });
 });
 
-describe("Runner 继承与任务快照", () => {
-  it("用户级技能只读展示，不提供修改操作", async () => {
+describe("环境继承与任务快照", () => {
+  it("环境继承技能只读展示，不提供修改操作", async () => {
     vi.stubGlobal("fetch", vi.fn(() => ok({ status: "ready", scannedAt: "2026-07-15T08:00:00Z", skills: [{ name: "git-commit", displayName: null, shortDescription: "提交规范", relativePath: "~/.agents/skills/git-commit", skillhub: { coordinate: "@sh01/git-commit", version: "1" } }] })));
     render(wrapper(<WorkerUserSkills worker={{ executor_id: "runner-1", display_name: "阿朱本机" }} expanded />));
 
     expect(await screen.findByText("git-commit")).toBeTruthy();
-    expect(screen.getByText(/只读 · 来自 Runner 执行用户/)).toBeTruthy();
+    expect(screen.getByText(/只读 · 来自执行环境/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: /安装|更新|删除/ })).toBeNull();
   });
 
-  it("兼容用户级技能扫描的 error 字段", async () => {
+  it("兼容环境继承技能扫描的 error 字段", async () => {
     vi.stubGlobal("fetch", vi.fn(() => ok({ status: "error", scannedAt: "2026-07-15T08:00:00Z", skills: [], error: "扫描失败" })));
     render(wrapper(<WorkerUserSkills worker={{ executor_id: "runner-1", display_name: "阿朱本机" }} expanded />));
 
@@ -258,7 +266,7 @@ describe("Runner 继承与任务快照", () => {
     }} />);
 
     expect(screen.getByText("@sh01/git-commit")).toBeTruthy();
-    expect(screen.getByText("Thread 专属")).toBeTruthy();
+    expect(screen.getByText("聊天配置")).toBeTruthy();
     expect(screen.getByText("SERVICE_TOKEN")).toBeTruthy();
     expect(screen.getByText(".env")).toBeTruthy();
     expect(screen.queryByText(/must-not-render/)).toBeNull();
