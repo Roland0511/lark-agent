@@ -10,7 +10,11 @@ import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-cli
 import { CodexAdapter } from "./codex-adapter.js";
 import { buildUserSkillsReport, isolatedCodexEnvironment, SkillRuntimeError, SkillRuntimeManager } from "./skills.js";
 import { resolveBotWorkspace, resolveChatWorkspace, type BotWorkspace } from "./workspace.js";
-import { attachmentTarget, cleanupAllAttachmentRoots, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
+import { attachmentTarget, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
+
+export interface TaskProcessorStartupOptions {
+  log?: (message: string) => void;
+}
 
 export class TaskProcessor {
   private currentTask: ClaimedTask | null = null;
@@ -39,7 +43,11 @@ export class TaskProcessor {
   private readonly attentionWorkspace: string;
   private activeSecretValues: string[] = [];
 
-  constructor(private readonly config: ResolvedWorkerConfig, private readonly client: ControlPlaneClient) {
+  constructor(
+    private readonly config: ResolvedWorkerConfig,
+    private readonly client: ControlPlaneClient,
+    private readonly startupOptions: TaskProcessorStartupOptions = {}
+  ) {
     // Programmatic/test callers created before runtime_state_dir existed may
     // still provide a partial ResolvedWorkerConfig. File-backed production
     // configs always resolve the explicit private state directory.
@@ -58,12 +66,27 @@ export class TaskProcessor {
   }
 
   async start(): Promise<void> {
-    await cleanupAllAttachmentRoots(this.config.workspaceRoots, this.config.attachmentRetentionDays);
+    // Global cleanup can race newly arriving attachments. Keep per-task cleanup
+    // scoped to the active workspace and defer global cleanup to maintenance.
+    this.startupLog("global attachment cleanup: skipped; deferred to maintenance");
     await mkdir(this.attentionWorkspace, { recursive: true, mode: 0o700 });
+    this.startupLog("attention workspace: ready");
+    this.startupLog("Codex App Server: starting");
     await this.codex.start();
-    await this.refreshUserSkills().catch((error) => process.stderr.write(`worker user skill inventory unavailable: ${this.safeErrorSummary(error)}\n`));
+    this.startupLog("Codex App Server: ready");
+    this.startupLog("user skill inventory: scanning");
+    let userSkillsReady = true;
+    await this.refreshUserSkills().catch((error) => {
+      userSkillsReady = false;
+      process.stderr.write(`worker user skill inventory unavailable: ${this.safeErrorSummary(error)}\n`);
+    });
+    this.startupLog(userSkillsReady ? "user skill inventory: ready" : "user skill inventory: unavailable; continuing");
     this.userSkillTimer = setInterval(() => this.scheduleUserSkillRefresh(), 5 * 60_000);
     this.userSkillTimer.unref();
+  }
+
+  private startupLog(message: string): void {
+    (this.startupOptions.log ?? ((value: string) => process.stdout.write(`[startup] ${value}\n`)))(message);
   }
 
   async modelCatalog() {

@@ -3,10 +3,18 @@ import { ControlPlaneClient } from "./control-plane-client.js";
 import { TaskProcessor } from "./processor.js";
 import { errorMessage } from "../shared/errors.js";
 
-const configFile = process.env.WORKER_CONFIG_FILE ?? "config/worker.local.yaml";
-const config = await loadWorkerConfig(configFile);
+const enrollmentJson = process.argv.includes("--enrollment-json");
 
-if (process.argv.includes("--enrollment-json")) {
+function startupLog(message: string): void {
+  if (!enrollmentJson) process.stdout.write(`[startup] ${message}\n`);
+}
+
+const configFile = process.env.WORKER_CONFIG_FILE ?? "config/worker.local.yaml";
+startupLog("configuration: loading");
+const config = await loadWorkerConfig(configFile);
+startupLog("configuration: ready");
+
+if (enrollmentJson) {
   const token = process.env.LARK_AGENT_ENROLLMENT_TOKEN;
   if (!token) throw new Error("LARK_AGENT_ENROLLMENT_TOKEN is required for enrollment payload generation");
   process.stdout.write(JSON.stringify({
@@ -35,13 +43,17 @@ const processor = new TaskProcessor(config, client);
 let stopping = false;
 let configChanged = false;
 
+startupLog("control-plane session: connecting");
 await client.createSession();
+startupLog("control-plane session: ready");
 await processor.start();
+startupLog("model catalog: loading");
 const catalog = await processor.modelCatalog().catch((error) => {
   process.stderr.write(`worker model catalog unavailable: ${errorMessage(error)}\n`);
   return [];
 });
 await client.reportModelCatalog(catalog);
+startupLog("model catalog: reported");
 process.stdout.write(`worker ${config.executorId} ready home_ref=${config.homeRef} profile=${config.codexProfile}\n`);
 
 const configTimer = setInterval(() => {

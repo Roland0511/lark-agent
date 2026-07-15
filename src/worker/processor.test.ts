@@ -1,11 +1,63 @@
 import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { ClaimedTask, Signal, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, type ControlPlaneClient } from "./control-plane-client.js";
 import { buildTaskPrompt, codexCompactionFromActivity, TaskProcessor } from "./processor.js";
+
+function startupProcessor(listSkills: () => Promise<never[]> = async () => []) {
+  const logs: string[] = [];
+  const client = { reportUserSkills: vi.fn(async () => undefined) } as unknown as ControlPlaneClient;
+  const processor = new TaskProcessor({
+    workspaceRoots: [{ alias: "repo", path: tmpdir() }],
+    runtimeStateDir: tmpdir(),
+    attachmentRetentionDays: 7
+  } as ResolvedWorkerConfig, client, {
+    log: (message) => logs.push(message)
+  });
+  const codex = {
+    start: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined),
+    listSkills: vi.fn(listSkills)
+  };
+  (processor as unknown as { codex: typeof codex }).codex = codex;
+  return { processor, codex, logs };
+}
+
+describe("TaskProcessor startup", () => {
+  it("skips global attachment cleanup and continues to Codex startup", async () => {
+    const { processor, codex, logs } = startupProcessor();
+    await processor.start();
+    expect(codex.start).toHaveBeenCalledOnce();
+    expect(logs).toContain("global attachment cleanup: skipped; deferred to maintenance");
+    await processor.stop();
+  });
+
+  it("logs successful startup stages", async () => {
+    const { processor, logs } = startupProcessor();
+    await processor.start();
+    expect(logs).toContain("attention workspace: ready");
+    expect(logs).toContain("Codex App Server: ready");
+    expect(logs).toContain("user skill inventory: ready");
+    await processor.stop();
+  });
+
+  it("logs user skill inventory failure and continues startup", async () => {
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      const { processor, codex, logs } = startupProcessor(async () => { throw new Error("scan failed"); });
+      await processor.start();
+      expect(codex.start).toHaveBeenCalledOnce();
+      expect(logs).toContain("user skill inventory: unavailable; continuing");
+      expect(stderr).toHaveBeenCalledWith(expect.stringContaining("worker user skill inventory unavailable"));
+      await processor.stop();
+    } finally {
+      stderr.mockRestore();
+    }
+  });
+});
 
 const signal = (id: string, attachments: Signal["attachments"]): Signal => ({
   id,
