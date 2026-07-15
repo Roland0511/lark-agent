@@ -18,6 +18,7 @@ describe("聊天记忆列表", () => {
       threadId: "0190f8c5-5605-7d08-9000-thread-a",
       state: "ready",
       executorId: "runner-sh01",
+      executorDisplayName: "阿朱 SH01",
       workspaceRootAlias: "workspace",
       autoCompactionCount: 3,
       lastCompactedAt: new Date().toISOString(),
@@ -27,6 +28,7 @@ describe("聊天记忆列表", () => {
     expect(screen.getByText("项目助理")).toBeTruthy();
     expect(screen.getByText("群聊 · 群聊 A")).toBeTruthy();
     expect(screen.getByText("已绑定")).toBeTruthy();
+    expect(screen.getByText("阿朱 SH01")).toBeTruthy();
     expect(screen.getByText("runner-sh01")).toBeTruthy();
     expect(screen.getByText("workspace")).toBeTruthy();
     expect(screen.getByText("3 次")).toBeTruthy();

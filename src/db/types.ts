@@ -157,6 +157,7 @@ export interface BotDialogueGuardsTable {
 export interface WorkersTable {
   executor_id: string;
   display_name: string;
+  display_alias: Generated<string | null>;
   home_ref: string;
   codex_profile: string;
   config_fingerprint: string;

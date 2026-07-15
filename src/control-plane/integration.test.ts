@@ -98,6 +98,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextsSql = await readFile(fileURLToPath(new URL("../db/migrations/016_chat_contexts.sql", import.meta.url)), "utf8");
     const chatContextRecoveryAttemptsSql = await readFile(fileURLToPath(new URL("../db/migrations/017_chat_context_recovery_attempts.sql", import.meta.url)), "utf8");
     const chatContextRebindSql = await readFile(fileURLToPath(new URL("../db/migrations/018_rebind_chat_context_fingerprints.sql", import.meta.url)), "utf8");
+    const workerDisplayAliasSql = await readFile(fileURLToPath(new URL("../db/migrations/019_worker_display_alias.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -125,6 +126,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextRecoveryAttemptsApplied = await client.query("SELECT to_regclass('public.chat_context_recovery_attempts') AS table_name");
     if (!chatContextRecoveryAttemptsApplied.rows[0]?.table_name) await client.query(chatContextRecoveryAttemptsSql);
     await client.query(chatContextRebindSql);
+    await client.query(workerDisplayAliasSql);
     await client.end();
   });
 
@@ -408,6 +410,64 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect((await db.selectFrom("worker_device_credentials").select("revoked_at").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).revoked_at).not.toBeNull();
     expect((await db.selectFrom("tasks").select("executor_id").where("id", "=", task.id).executeTakeFirstOrThrow()).executor_id).toBe("worker-a");
     expect((await app.inject({ method: "GET", url: "/v1/admin/workers", headers })).json<{ items: unknown[] }>().items).toHaveLength(0);
+  });
+
+  it("saves, validates and clears a worker alias without changing its stable execution identity", async () => {
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-worker-alias"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "worker-alias-csrf",
+      last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    await insertWorker();
+    const headers = { cookie: "lark_agent_admin_session=owner-worker-alias", "x-csrf-token": "worker-alias-csrf" };
+    const before = await db.selectFrom("workers").select(["executor_id", "home_ref", "codex_profile", "config_fingerprint", "operational_mode", "status"]).where("executor_id", "=", "worker-a").executeTakeFirstOrThrow();
+
+    expect((await app.inject({ method: "PATCH", url: "/v1/admin/workers/worker-a/display-alias", payload: { displayAlias: "阿朱本机" } })).statusCode).toBe(401);
+    expect((await app.inject({ method: "PATCH", url: "/v1/admin/workers/worker-a/display-alias", headers: { cookie: headers.cookie }, payload: { displayAlias: "阿朱本机" } })).statusCode).toBe(403);
+    for (const displayAlias of ["   ", "a".repeat(65), "阿朱\n本机"]) {
+      expect((await app.inject({ method: "PATCH", url: "/v1/admin/workers/worker-a/display-alias", headers, payload: { displayAlias } })).statusCode).toBe(400);
+    }
+    expect((await app.inject({ method: "PATCH", url: "/v1/admin/workers/missing/display-alias", headers, payload: { displayAlias: "不存在" } })).statusCode).toBe(404);
+
+    const saved = await app.inject({ method: "PATCH", url: "/v1/admin/workers/worker-a/display-alias", headers, payload: { displayAlias: "  阿朱本机  " } });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({ ok: true, displayAlias: "阿朱本机", reportedDisplayName: "Worker A", displayName: "阿朱本机" });
+    expect(await db.selectFrom("workers").select(["executor_id", "home_ref", "codex_profile", "config_fingerprint", "operational_mode", "status"]).where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).toEqual(before);
+    expect((await app.inject({ method: "GET", url: "/v1/admin/workers", headers })).json<{ items: Array<Record<string, unknown>> }>().items[0]).toMatchObject({
+      executor_id: "worker-a", display_name: "阿朱本机", display_alias: "阿朱本机", reported_display_name: "Worker A"
+    });
+
+    await new ControlPlaneRepository(db, 60).upsertWorker({
+      executorId: "worker-a", displayName: "新设备名称", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "a".repeat(64), codexVersion: "test-upgraded", capacity: 1,
+      workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"], runnerVersion: "0.3.1", architecture: "arm64", registrationSource: "quick_install"
+    });
+    expect(await db.selectFrom("workers").select(["display_name", "display_alias", "codex_version"]).where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).toEqual({
+      display_name: "新设备名称", display_alias: "阿朱本机", codex_version: "test-upgraded"
+    });
+
+    const enrollmentToken = "worker-alias-reregister-token-0123456789";
+    await db.insertInto("worker_enrollment_tokens").values({
+      token_hash: sha256(enrollmentToken), expires_at: new Date(Date.now() + 60_000), used_at: null, revoked_at: null, executor_id: null
+    }).execute();
+    const reenrolled = await app.inject({
+      method: "POST", url: "/v1/runner/enroll", payload: {
+        token: enrollmentToken,
+        registration: {
+          executorId: "worker-a", displayName: "重新注册设备", homeRef: "worker-a:home", codexProfile: "lark-agent",
+          configFingerprint: "a".repeat(64), codexVersion: "test-reregistered", capacity: 1,
+          workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1"], runnerVersion: "0.3.1", architecture: "arm64", registrationSource: "quick_install"
+        }
+      }
+    });
+    expect(reenrolled.statusCode).toBe(200);
+    expect(await db.selectFrom("workers").select(["display_name", "display_alias"]).where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).toEqual({
+      display_name: "重新注册设备", display_alias: "阿朱本机"
+    });
+
+    const cleared = await app.inject({ method: "PATCH", url: "/v1/admin/workers/worker-a/display-alias", headers, payload: { displayAlias: null } });
+    expect(cleared.statusCode).toBe(200);
+    expect(cleared.json()).toMatchObject({ displayAlias: null, reportedDisplayName: "重新注册设备", displayName: "重新注册设备" });
   });
 
   it("binds a claimed task to the registered home/profile/fingerprint and holds a stale draft", async () => {
@@ -1699,10 +1759,12 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       last_seen_at: now, expires_at: new Date(Date.now() + 3_600_000)
     }).execute();
     await insertWorker();
+    await db.updateTable("workers").set({ display_alias: "阿朱执行器" }).where("executor_id", "=", "worker-a").execute();
     const conversation = await db.insertInto("conversations").values({
       chat_id: "oc_test", chat_type: "group", root_message_id: "om_flow", thread_id: null, room_seq: 2,
       active: false, response_message_id: "om_reply", updated_at: now
     }).returningAll().executeTakeFirstOrThrow();
+    await db.updateTable("chat_contexts").set({ executor_id: "worker-a", updated_at: now }).where("id", "=", conversation.chat_context_id).execute();
     const task = await db.insertInto("tasks").values({
       conversation_id: conversation.id, trigger_message_id: "om_flow", state: "completed", requester_id: "ou_owner", requester_role: "owner",
       authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
@@ -1730,18 +1792,26 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const headers = { cookie: "lark_agent_admin_session=owner-flow-token" };
     const inbox = await app.inject({ method: "GET", url: "/v1/admin/flow/items?view=inbox&range=all", headers });
     expect(inbox.statusCode).toBe(200);
-    expect(inbox.json<{ items: Array<{ content: string }> }>().items[0]?.content).toBe("请检查完整链路");
+    expect(inbox.json<{ items: Array<{ content: string; executor_display_name: string }> }>().items[0]).toMatchObject({ content: "请检查完整链路", executor_display_name: "阿朱执行器" });
     const flow = await app.inject({ method: "GET", url: "/v1/admin/flow/items?view=flow&range=all", headers });
     expect(flow.statusCode).toBe(200);
-    expect(flow.json<{ items: Array<{ resolved_workspace_alias: string }> }>().items[0]?.resolved_workspace_alias).toBe("repo");
+    expect(flow.json<{ items: Array<{ resolved_workspace_alias: string; executor_display_name: string }> }>().items[0]).toMatchObject({ resolved_workspace_alias: "repo", executor_display_name: "阿朱执行器" });
     const outbox = await app.inject({ method: "GET", url: "/v1/admin/flow/items?view=outbox&range=all", headers });
-    expect(outbox.json<{ items: Array<{ content: string }> }>().items[0]?.content).toBe("检查完成");
+    expect(outbox.json<{ items: Array<{ content: string; executor_display_name: string }> }>().items[0]).toMatchObject({ content: "检查完成", executor_display_name: "阿朱执行器" });
+    const tasks = await app.inject({ method: "GET", url: "/v1/admin/tasks", headers });
+    expect(tasks.json<{ items: Array<{ executor_display_name: string }> }>().items[0]?.executor_display_name).toBe("阿朱执行器");
+    const taskDetail = await app.inject({ method: "GET", url: `/v1/admin/tasks/${task.id}`, headers });
+    expect(taskDetail.json()).toMatchObject({ executor_display_name: "阿朱执行器", worker: { display_name: "阿朱执行器", display_alias: "阿朱执行器", reported_display_name: "Worker A" } });
+    const contextDetail = await app.inject({ method: "GET", url: `/v1/admin/chat-contexts/${conversation.chat_context_id}`, headers });
+    expect(contextDetail.json()).toMatchObject({ executorId: "worker-a", executorDisplayName: "阿朱执行器" });
     const trace = await app.inject({ method: "GET", url: `/v1/admin/tasks/${task.id}/trace`, headers });
     expect(trace.statusCode).toBe(200);
-    const traceBody = trace.json<{ checks: Array<{ key: string; state: string }>; stageTimings: Array<{ key: string; state: string }> }>();
+    const traceBody = trace.json<{ task: { executor_display_name: string }; checks: Array<{ key: string; state: string; detail: string }>; stageTimings: Array<{ key: string; state: string }> }>();
     const checks = traceBody.checks;
     expect(checks.find((item) => item.key === "codex")?.state).toBe("错误");
     expect(checks.find((item) => item.key === "platform")?.state).toBe("错误");
+    expect(checks.find((item) => item.key === "executor")?.detail).toContain("阿朱执行器（worker-a）");
+    expect(traceBody.task.executor_display_name).toBe("阿朱执行器");
     expect(traceBody.stageTimings.find((item) => item.key === "first_commentary")?.state).toBe("skipped");
     expect(trace.body).not.toContain("lease_token_hash");
     expect(trace.body).not.toContain("authorization_grant");

@@ -141,6 +141,7 @@ function publicContext(row: {
   chat_name: string | null;
   codex_thread_id: string | null;
   executor_id: string | null;
+  executor_display_name: string | null;
   executor_profile: string | null;
   executor_config_fingerprint: string | null;
   codex_version: string | null;
@@ -164,6 +165,7 @@ function publicContext(row: {
     chatName: row.chat_name,
     threadId: row.codex_thread_id,
     executorId: row.executor_id,
+    executorDisplayName: row.executor_display_name,
     executorProfile: row.executor_profile,
     executorConfigFingerprint: row.executor_config_fingerprint ? "已记录（值已隐藏）" : null,
     codexVersion: row.codex_version,
@@ -187,6 +189,7 @@ export function registerChatContextAdminRoutes(
 ): void {
   const baseQuery = () => db.selectFrom("chat_contexts")
     .innerJoin("bots", "bots.id", "chat_contexts.bot_id")
+    .leftJoin("workers as context_workers", "context_workers.executor_id", "chat_contexts.executor_id")
     .leftJoin("bot_chat_bindings", (join) => join
       .onRef("bot_chat_bindings.bot_id", "=", "chat_contexts.bot_id")
       .onRef("bot_chat_bindings.chat_id", "=", "chat_contexts.chat_id"))
@@ -194,6 +197,7 @@ export function registerChatContextAdminRoutes(
       "chat_contexts.id", "chat_contexts.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name",
       "chat_contexts.chat_id", "chat_contexts.chat_type", "bot_chat_bindings.chat_name",
       "chat_contexts.codex_thread_id", "chat_contexts.executor_id", "chat_contexts.executor_profile",
+      sql<string | null>`coalesce(context_workers.display_alias, context_workers.display_name)`.as("executor_display_name"),
       "chat_contexts.executor_config_fingerprint", "chat_contexts.codex_version", "chat_contexts.workspace_root_alias",
       "chat_contexts.state", "chat_contexts.blocked_reason", "chat_contexts.last_activity_at",
       "chat_contexts.last_compacted_at", "chat_contexts.auto_compaction_count", "chat_contexts.created_at", "chat_contexts.updated_at"
@@ -210,6 +214,8 @@ export function registerChatContextAdminRoutes(
         chat_contexts.chat_id ILIKE ${needle}
         OR COALESCE(bot_chat_bindings.chat_name, '') ILIKE ${needle}
         OR COALESCE(chat_contexts.codex_thread_id, '') ILIKE ${needle}
+        OR COALESCE(context_workers.display_alias, context_workers.display_name, '') ILIKE ${needle}
+        OR COALESCE(chat_contexts.executor_id, '') ILIKE ${needle}
         OR bots.display_name ILIKE ${needle}
       )`);
     }

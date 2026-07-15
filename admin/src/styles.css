@@ -2161,6 +2161,60 @@ td small {
   gap: 8px;
   margin-top: 18px;
 }
+.modal-actions.split-actions {
+  justify-content: space-between;
+  align-items: center;
+}
+.modal-actions.split-actions > div {
+  display: flex;
+  gap: 8px;
+}
+.worker-alias-context {
+  display: grid;
+  gap: 9px;
+  margin: 17px 0;
+  padding: 13px 15px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #f8fafc;
+}
+.worker-alias-context > div {
+  display: grid;
+  grid-template-columns: 112px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 12px;
+}
+.worker-alias-context span,
+.worker-alias-field small {
+  color: var(--muted);
+  font-size: 10px;
+}
+.worker-alias-context strong,
+.worker-alias-context code {
+  min-width: 0;
+  color: #2d4058;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.worker-alias-field {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  color: #40536a;
+  font-size: 11px;
+  font-weight: 700;
+}
+.worker-alias-field input {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 11px 12px;
+  background: #fff;
+  color: #20334c;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+}
 .modal button:disabled,
 .pending-item button:disabled,
 .ack-row button:disabled {
@@ -2542,6 +2596,26 @@ textarea:focus-visible {
 .entity-heading h2 {
   color: #142238;
   font-size: 20px;
+}
+.entity-title-row {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.alias-edit-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  padding: 3px 5px;
+  background: transparent;
+  color: var(--blue);
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.alias-edit-button:hover {
+  text-decoration: underline;
 }
 
 .entity-heading p {

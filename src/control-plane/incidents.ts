@@ -7,6 +7,7 @@ import type { ControlPlaneConfig } from "./config.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import { AdminEventBus } from "./admin-events.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
+import { effectiveWorkerDisplayName } from "./worker-display-name.js";
 
 interface Finding {
   fingerprint: string;
@@ -61,14 +62,14 @@ export class IncidentService {
       this.db.selectFrom("tasks").select(["executor_id", sql<number>`count(*)::int`.as("count")]).where("state", "=", "running").where("executor_id", "is not", null).groupBy("executor_id").execute()
     ]);
     const result: Finding[] = [];
-    for (const worker of workers) if (now - new Date(worker.last_seen_at).getTime() > 90_000) result.push(finding("worker_offline", worker.executor_id, "critical", "执行器已离线", `${worker.display_name} 超过 90 秒没有心跳`, "worker", worker.executor_id));
+    for (const worker of workers) if (now - new Date(worker.last_seen_at).getTime() > 90_000) result.push(finding("worker_offline", worker.executor_id, "critical", "执行器已离线", `${effectiveWorkerDisplayName(worker)} 超过 90 秒没有心跳`, "worker", worker.executor_id));
     for (const task of waiting) result.push(finding("task_waiting", task.id, "warning", "任务等待执行器", `任务已等待超过 5 分钟（${task.state}）`, "task", task.id));
     const activeCounts = new Map(activeByWorker.map((row) => [row.executor_id, row.count]));
     for (const task of claimSlow) {
       if (!task.preferred_executor_id) continue;
       const worker = workers.find((candidate) => candidate.executor_id === task.preferred_executor_id);
       if (!worker || now - new Date(worker.last_seen_at).getTime() > 45_000 || (activeCounts.get(worker.executor_id) ?? 0) >= worker.capacity) continue;
-      result.push(finding("task_claim_slow", task.id, "warning", "空闲执行器未及时领取", `任务超过 3 秒未被 ${worker.display_name} 领取，检查 Worker 长轮询和契约`, "task", task.id));
+      result.push(finding("task_claim_slow", task.id, "warning", "空闲执行器未及时领取", `任务超过 3 秒未被 ${effectiveWorkerDisplayName(worker)} 领取，检查 Worker 长轮询和契约`, "task", task.id));
     }
     for (const task of running) result.push(finding("task_long_running", task.id, "warning", "任务运行时间过长", "任务已运行超过 60 分钟", "task", task.id));
     for (const event of slowEvents) result.push(finding(event.event_type === "attention.slow" ? "attention_slow" : "execution_slow", event.task_id, "warning", event.event_type === "attention.slow" ? "注意力判断响应缓慢" : "模型响应缓慢", event.event_type === "attention.slow" ? "注意力判断已超过 15 秒" : "正式执行已超过 60 秒没有 App Server 事件；任务仍继续运行", "task", event.task_id));

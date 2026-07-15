@@ -11,6 +11,7 @@ import { AdminEventBus } from "./admin-events.js";
 import type { RuntimeStatus } from "./runtime-status.js";
 import type { BotGatewayRegistry } from "./bot-runtime.js";
 import { publicAttachments } from "../lark/attachments.js";
+import { effectiveWorkerDisplayName, publicWorkerDisplayName } from "./worker-display-name.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -20,6 +21,13 @@ const commandSchema = z.object({
 const workerCommandSchema = z.object({
   command: z.enum(["enable", "maintenance", "disable", "revoke_credentials"])
 });
+
+const workerDisplayAliasSchema = z.object({
+  displayAlias: z.union([
+    z.string().trim().min(1).max(64).refine((value) => !/[\u0000-\u001f\u007f-\u009f]/u.test(value), "别名不能包含控制字符"),
+    z.null()
+  ])
+}).strict();
 
 const decisionSchema = z.object({ approved: z.boolean() });
 const outboxCommandSchema = z.object({ command: z.enum(["retry", "mark_sent", "discard"]) });
@@ -105,7 +113,7 @@ export function registerAdminRoutes(
     const since = new Date(Date.now() - hours * 3_600_000);
     const [taskStates, workers, workerCredentials, pendingApprovals, outboxUnknown, outputUnknown, heldDrafts, duration, incidents, throughput, awaitingFollowup, bots] = await Promise.all([
       db.selectFrom("tasks").select(["state", sql<number>`count(*)::int`.as("count")]).groupBy("state").execute(),
-      db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy("display_name").execute(),
+      db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy(sql`coalesce(display_alias, display_name)`).execute(),
       db.selectFrom("worker_device_credentials")
         .select(["executor_id", sql<number>`count(*) filter (where revoked_at is null)::int`.as("active_count")])
         .groupBy("executor_id").execute(),
@@ -132,7 +140,8 @@ export function registerAdminRoutes(
       successRate: completed + failed ? completed / (completed + failed) : null,
       averageDurationSeconds: duration.avg_seconds === null ? null : Number(duration.avg_seconds),
       workers: workers.map((worker) => ({
-        executorId: worker.executor_id, displayName: worker.display_name, availability: availability(worker.last_seen_at),
+        executorId: worker.executor_id, displayName: effectiveWorkerDisplayName(worker), displayAlias: worker.display_alias,
+        reportedDisplayName: worker.display_name, availability: availability(worker.last_seen_at),
         operationalMode: worker.operational_mode, lastSeenAt: iso(worker.last_seen_at), profile: worker.codex_profile,
         credentialActive: (workerCredentials.find((item) => item.executor_id === worker.executor_id)?.active_count ?? 0) > 0
       })),
@@ -146,11 +155,13 @@ export function registerAdminRoutes(
   app.get<{ Querystring: { state?: string; bot?: string; executor?: string; workspace?: string; chatContextId?: string; q?: string; limit?: string; before?: string } }>("/v1/admin/tasks", async (request) => {
     await requireAdmin(db, config, request);
     const limit = Math.min(Math.max(Number(request.query.limit ?? 30), 1), 100);
-    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id").select([
+    let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
+      .leftJoin("workers as task_workers", "task_workers.executor_id", "tasks.executor_id").select([
       "tasks.id", "tasks.state", "tasks.revision", "tasks.executor_id", "tasks.requested_workspace_alias", "tasks.resolved_workspace_alias", "tasks.requester_id",
       "tasks.requester_role", "tasks.attempt", "tasks.summary", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
       "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name",
       "conversations.chat_context_id", "conversations.chat_type", "conversations.room_seq",
+      sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name"),
       sql<string | null>`(select signals.content from signals where signals.task_id = tasks.id order by signals.seq desc limit 1)`.as("latest_signal_content")
     ]).orderBy("tasks.created_at", "desc").orderBy("tasks.id", "desc").limit(limit + 1);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
@@ -195,7 +206,7 @@ export function registerAdminRoutes(
       ])
       .where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
-    const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
+    const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "display_alias", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
     const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;
     const conversationTurns = await db.selectFrom("tasks").select(["id", "turn_index", "state", "conversation_disposition", "created_at", "completed_at"])
       .where("conversation_id", "=", task.conversation_id).orderBy("turn_index").execute();
@@ -204,9 +215,10 @@ export function registerAdminRoutes(
       chat_name: chatName,
       created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), lease_expires_at: iso(task.lease_expires_at),
       followup_expires_at: iso(task.followup_expires_at),
+      executor_display_name: worker ? effectiveWorkerDisplayName(worker) : null,
       route_mismatch: Boolean(task.bot_default_executor_id && task.executor_id && task.bot_default_executor_id !== task.executor_id),
       conversation_turns: conversationTurns.map((turn) => ({ ...turn, created_at: iso(turn.created_at), completed_at: iso(turn.completed_at) })),
-      worker: worker ? { ...worker, capabilities: parseJsonArray(worker.capabilities), last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at) } : null
+      worker: worker ? { ...worker, ...publicWorkerDisplayName(worker), capabilities: parseJsonArray(worker.capabilities), last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at) } : null
     };
   });
 
@@ -278,19 +290,41 @@ export function registerAdminRoutes(
 
   app.get("/v1/admin/workers", async (request) => {
     await requireAdmin(db, config, request);
-    const rows = await db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy("display_name").execute();
+    const rows = await db.selectFrom("workers").selectAll().where("deleted_at", "is", null).orderBy(sql`coalesce(display_alias, display_name)`).execute();
     const active = await db.selectFrom("tasks").select(["executor_id", sql<number>`count(*)::int`.as("count")]).where("state", "=", "running").where("executor_id", "is not", null).groupBy("executor_id").execute();
     const credentials = await db.selectFrom("worker_device_credentials")
       .select(["executor_id", sql<number>`count(*) filter (where revoked_at is null)::int`.as("active_count"), sql<Date | null>`max(last_used_at)`.as("last_used_at")])
       .groupBy("executor_id").execute();
     return { items: rows.map((worker) => ({
-      ...worker, workspace_aliases: parseJsonArray(worker.workspace_aliases), capabilities: parseJsonArray(worker.capabilities),
+      ...worker, ...publicWorkerDisplayName(worker), workspace_aliases: parseJsonArray(worker.workspace_aliases), capabilities: parseJsonArray(worker.capabilities),
       model_catalog: Array.isArray(worker.model_catalog) ? worker.model_catalog : [],
       model_catalog_updated_at: iso(worker.model_catalog_updated_at),
       last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at), activeTasks: active.find((x) => x.executor_id === worker.executor_id)?.count ?? 0,
       credentialActive: (credentials.find((x) => x.executor_id === worker.executor_id)?.active_count ?? 0) > 0,
       credentialLastUsedAt: iso(credentials.find((x) => x.executor_id === worker.executor_id)?.last_used_at ?? null)
     })) };
+  });
+
+  app.patch<{ Params: { id: string } }>("/v1/admin/workers/:id/display-alias", async (request) => {
+    const principal = await requireAdmin(db, config, request, true);
+    requireCsrf(request, principal);
+    const parsed = workerDisplayAliasSchema.safeParse(request.body);
+    if (!parsed.success) throw new AppError("别名去除首尾空格后须为 1–64 个字符，且不能包含控制字符", 400, "invalid_worker_display_alias");
+    const body = parsed.data;
+    const worker = await db.updateTable("workers")
+      .set({ display_alias: body.displayAlias, updated_at: new Date() })
+      .where("executor_id", "=", request.params.id)
+      .where("deleted_at", "is", null)
+      .returning(["display_name", "display_alias"])
+      .executeTakeFirst();
+    if (!worker) throw new AppError("执行器不存在", 404, "not_found");
+    events.publish("worker", request.params.id);
+    return {
+      ok: true,
+      displayAlias: worker.display_alias,
+      reportedDisplayName: worker.display_name,
+      displayName: effectiveWorkerDisplayName(worker)
+    };
   });
 
   app.post<{ Params: { id: string } }>("/v1/admin/workers/:id/commands", async (request) => {
