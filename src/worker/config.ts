@@ -252,6 +252,7 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   const codexVersion = await commandVersion(raw.executor.codex_binary, codexHome);
   const protocol = await protocolFingerprint(raw.executor.codex_binary, codexHome);
   if (!capabilities.includes("thread_snapshot_v1")) capabilities.push("thread_snapshot_v1");
+  if (!capabilities.includes("thread_turn_summary_v1")) capabilities.push("thread_turn_summary_v1");
   const overrides = profileOverrides(profileConfig);
   const baseValues = baseConfig ? parseToml(baseConfig) as Record<string, unknown> : {};
   const profileValues = parseToml(profileConfig) as Record<string, unknown>;

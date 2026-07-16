@@ -137,10 +137,13 @@ restart_service() {
 }
 
 wait_online() {
-  local server="$1" executor="$2" credential="$3"
+  local server="$1" executor="$2" credential="$3" expected_version="$4"
   local attempt
   for attempt in {1..30}; do
-    if curl -fsS --connect-timeout 3 -H "Authorization: Bearer $credential" "$server/v1/runner/status/$executor" 2>/dev/null | grep -q '"online":true'; then
+    if curl -fsS --connect-timeout 3 -H "Authorization: Bearer $credential" \
+      "$server/v1/runner/status/$executor" -o "$RESPONSE" 2>/dev/null \
+      && [[ "$(optional_json_value "$RESPONSE" online false)" == true ]] \
+      && [[ "$(optional_json_value "$RESPONSE" runnerVersion '')" == "$expected_version" ]]; then
       return 0
     fi
     sleep 1
@@ -164,14 +167,18 @@ assert_safe_to_upgrade() {
     "$server/v1/runner/status/$executor" -o "$RESPONSE"; then
     fail "无法连接控制面确认执行器是否空闲，未执行升级"
   fi
-  local active_tasks active_runtime_sync_jobs
+  local active_tasks active_runtime_sync_jobs active_thread_snapshot_jobs
   active_tasks="$(optional_json_value "$RESPONSE" activeTasks invalid)"
   # 0.4.0 之前的控制面没有该字段；缺失时按 0 处理以允许先升级控制面、再滚动升级 Runner。
   active_runtime_sync_jobs="$(optional_json_value "$RESPONSE" activeRuntimeSyncJobs 0)"
+  # 旧控制面没有 Thread 快照忙碌字段；缺失时按 0 保持升级顺序向后兼容。
+  active_thread_snapshot_jobs="$(optional_json_value "$RESPONSE" activeThreadSnapshotJobs 0)"
   [[ "$active_tasks" == <-> ]] || fail "控制面返回的活跃任务状态无效，未执行升级"
   [[ "$active_runtime_sync_jobs" == <-> ]] || fail "控制面返回的技能同步状态无效，未执行升级"
+  [[ "$active_thread_snapshot_jobs" == <-> ]] || fail "控制面返回的 Thread 快照状态无效，未执行升级"
   (( active_tasks == 0 )) || fail "执行器仍有 $active_tasks 个活跃任务，完成后再升级"
   (( active_runtime_sync_jobs == 0 )) || fail "执行器仍有 $active_runtime_sync_jobs 个活跃技能同步任务，完成后再升级"
+  (( active_thread_snapshot_jobs == 0 )) || fail "执行器仍有 $active_thread_snapshot_jobs 个活跃 Thread 快照任务，完成后再升级"
   if [[ -n "$expected_drain_token" ]]; then
     local upgrade_draining upgrade_drain_owned
     upgrade_draining="$(optional_json_value "$RESPONSE" upgradeDraining false)"
@@ -244,7 +251,7 @@ if [[ "$UPGRADE" == true ]]; then
   update_config_runner_version "$INSTALL_DIR/config.yaml" "$VERSION"
   PREVIOUS="$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)"
   ln -sfn "versions/$VERSION" "$INSTALL_DIR/current"
-  if ! restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || ! wait_online "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL"; then
+  if ! restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || ! wait_online "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL" "$VERSION"; then
     [[ -z "$PREVIOUS" ]] || ln -sfn "$PREVIOUS" "$INSTALL_DIR/current"
     [[ -z "$PREVIOUS_RUNNER_VERSION" ]] || update_config_runner_version "$INSTALL_DIR/config.yaml" "$PREVIOUS_RUNNER_VERSION"
     restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || true
@@ -423,7 +430,7 @@ chmod 600 "$PLIST_PATH"
 
 info "启动常驻执行器"
 restart_service "$LAUNCHD_LABEL" "$PLIST_PATH"
-if ! wait_online "$SERVER" "$EXECUTOR_ID" "$CREDENTIAL"; then
+if ! wait_online "$SERVER" "$EXECUTOR_ID" "$CREDENTIAL" "$VERSION"; then
   fail "执行器未在 30 秒内上线，请查看 $LOG_DIR/worker.err.log"
 fi
 print -- ""

@@ -3295,7 +3295,7 @@ textarea:focus-visible {
 
 .thread-snapshot-status strong,
 .thread-snapshot-status span {
-  font-size: 10px;
+  font-size: 12px;
   line-height: 1.45;
 }
 
@@ -3379,7 +3379,7 @@ textarea:focus-visible {
 
 .thread-load-earlier span {
   color: var(--muted);
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .thread-memory-timeline,
@@ -3598,7 +3598,7 @@ textarea:focus-visible {
   border-radius: 999px;
   background: #eaf7f1;
   color: #23805f;
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 800;
 }
 
@@ -3668,7 +3668,7 @@ textarea:focus-visible {
 
 .thread-dialog-header p {
   color: #758499;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .thread-dialog-snapshot-state {
@@ -3676,7 +3676,7 @@ textarea:focus-visible {
   border-radius: 999px;
   background: #eaf7f1;
   color: #23805f;
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 800;
 }
 
@@ -3708,7 +3708,7 @@ textarea:focus-visible {
   background: #fff;
   color: #344a64;
   font: inherit;
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .thread-dialog-search input:focus {
@@ -3719,7 +3719,7 @@ textarea:focus-visible {
 .thread-dialog-search > span {
   min-width: 58px;
   text-align: right;
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 700;
 }
 
@@ -3727,7 +3727,7 @@ textarea:focus-visible {
   position: relative;
   display: grid;
   min-height: 0;
-  grid-template-columns: 150px minmax(0, 1fr) 220px;
+  grid-template-columns: 190px minmax(0, 1fr) 220px;
   overflow: hidden;
 }
 
@@ -3754,7 +3754,7 @@ textarea:focus-visible {
 
 .thread-turn-nav h3 {
   padding: 0 8px 9px;
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .thread-turn-nav > div {
@@ -3766,9 +3766,9 @@ textarea:focus-visible {
 .thread-turn-nav > div > button {
   display: flex;
   width: 100%;
-  align-items: center;
-  justify-content: space-between;
-  gap: 6px;
+  align-items: flex-start;
+  flex-direction: column;
+  gap: 4px;
   margin: 2px 0;
   padding: 8px;
   border: 0;
@@ -3777,14 +3777,26 @@ textarea:focus-visible {
   background: transparent;
   color: #51667f;
   font: inherit;
-  font-size: 9px;
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
 }
 
+.thread-turn-nav > div > button strong {
+  display: -webkit-box;
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
 .thread-turn-nav > div > button small {
   color: #8a98aa;
-  font-size: 7px;
+  font-size: 12px;
+  line-height: 1.3;
   white-space: nowrap;
 }
 
@@ -3808,7 +3820,7 @@ textarea:focus-visible {
   background: #fff;
   color: #4772b4;
   font: inherit;
-  font-size: 9px;
+  font-size: 13px;
   font-weight: 700;
   cursor: pointer;
 }
@@ -3819,7 +3831,7 @@ textarea:focus-visible {
   min-height: 0;
   padding: 16px 22px 58px;
   overflow: auto;
-  scroll-behavior: smooth;
+  scroll-behavior: auto;
   background: #fff;
   scrollbar-gutter: stable;
 }
@@ -3844,7 +3856,7 @@ textarea:focus-visible {
   gap: 8px;
   margin: 1px 0 13px;
   color: #77879b;
-  font-size: 8px;
+  font-size: 12px;
 }
 
 .thread-conversation-turn > header > span {
@@ -3854,12 +3866,12 @@ textarea:focus-visible {
 
 .thread-conversation-turn > header strong {
   color: #64768d;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .thread-conversation-turn > header time {
   color: #8997a8;
-  font-size: 8px;
+  font-size: 12px;
 }
 
 .thread-conversation-turn > div {
@@ -3901,7 +3913,7 @@ textarea:focus-visible {
 
 .thread-chat-content > header strong {
   color: #31465f;
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .thread-chat-content > header span {
@@ -3909,13 +3921,13 @@ textarea:focus-visible {
   border-radius: 999px;
   background: #f0f3f7;
   color: #77879b;
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 700;
 }
 
 .thread-chat-content > header small {
   color: #9aa6b5;
-  font-size: 7px;
+  font-size: 10px;
 }
 
 .thread-message-bubble {
@@ -3939,7 +3951,7 @@ textarea:focus-visible {
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  font: 11px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font: 14px/1.55 ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 .thread-chat-item.participant-other .thread-chat-avatar {
@@ -3996,7 +4008,7 @@ textarea:focus-visible {
   background: transparent;
   color: #3772cf;
   font: inherit;
-  font-size: 9px;
+  font-size: 12px;
   font-weight: 800;
   cursor: pointer;
 }
@@ -4040,7 +4052,7 @@ textarea:focus-visible {
   background: transparent;
   color: #6a7c91;
   font: inherit;
-  font-size: 8px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -4059,25 +4071,31 @@ textarea:focus-visible {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   color: #3e536c;
-  font: 8px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.thread-conversation-end {
+  width: 100%;
+  height: 1px;
 }
 
 .thread-floating-latest {
   position: sticky;
-  bottom: 0;
+  bottom: 12px;
   left: 50%;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 5px;
   width: max-content;
-  margin: 20px auto 0;
+  margin: -37px auto 0;
   padding: 7px 11px;
   border: 1px solid #d5deea;
   border-radius: 999px;
   background: #fff;
   color: #3c70bf;
   font: inherit;
-  font-size: 8px;
+  font-size: 12px;
   font-weight: 800;
   box-shadow: 0 6px 18px #1c355926;
   cursor: pointer;
@@ -4096,7 +4114,7 @@ textarea:focus-visible {
 }
 
 .thread-filter-heading h3 {
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .thread-filter-heading button {
@@ -4105,7 +4123,7 @@ textarea:focus-visible {
   background: transparent;
   color: #4a78be;
   font: inherit;
-  font-size: 8px;
+  font-size: 12px;
   cursor: pointer;
 }
 
@@ -4116,7 +4134,7 @@ textarea:focus-visible {
 .thread-filter-panel h4 {
   margin-bottom: 7px;
   color: #728196;
-  font-size: 9px;
+  font-size: 12px;
 }
 
 .thread-filter-panel section > button {
@@ -4132,7 +4150,7 @@ textarea:focus-visible {
   background: transparent;
   color: #52677f;
   font: inherit;
-  font-size: 10px;
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
 }
@@ -4146,7 +4164,7 @@ textarea:focus-visible {
 
 .thread-filter-panel section > button small {
   color: #8b99aa;
-  font-size: 8px;
+  font-size: 12px;
 }
 
 .thread-filter-panel label {
@@ -4155,7 +4173,7 @@ textarea:focus-visible {
   gap: 7px;
   min-height: 28px;
   color: #52677f;
-  font-size: 10px;
+  font-size: 13px;
   cursor: pointer;
 }
 
@@ -4189,7 +4207,7 @@ textarea:focus-visible {
 }
 
 @media (max-width: 980px) {
-  .thread-dialog-body { grid-template-columns: 132px minmax(0, 1fr) 190px; }
+  .thread-dialog-body { grid-template-columns: 170px minmax(0, 1fr) 190px; }
   .thread-conversation { padding-inline: 15px; }
   .thread-chat-content { max-width: 84%; }
 }
@@ -4201,7 +4219,7 @@ textarea:focus-visible {
   .thread-dialog-overlay { padding: 0; }
   .thread-dialog { width: 100vw; height: 100dvh; min-height: 0; border: 0; border-radius: 0; }
   .thread-dialog-header { min-height: 58px; padding: 10px 12px; }
-  .thread-dialog-header h2 { font-size: 14px; }
+  .thread-dialog-header h2 { font-size: 16px; }
   .thread-dialog-header .thread-dialog-snapshot-state,
   .thread-dialog-header .ghost-button { display: none; }
   .thread-dialog-search { min-height: 50px; padding: 8px 12px; }

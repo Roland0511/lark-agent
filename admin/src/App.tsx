@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type SetStateAction } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type SetStateAction } from "react";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
@@ -462,13 +462,17 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
 }) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const chatRef = useRef<HTMLDivElement>(null);
+  const conversationEndRef = useRef<HTMLDivElement>(null);
   const turnRefs = useRef(new Map<string, HTMLElement>());
   const closeRef = useRef(onClose);
   const initialScrollDone = useRef(false);
+  const isAtLatestRef = useRef(true);
+  const renderedViewRef = useRef("");
   const [search, setSearch] = useState("");
   const [participant, setParticipant] = useState<ThreadParticipant>("all");
   const [contentKinds, setContentKinds] = useState<Set<ThreadContentKind>>(() => new Set(threadContentFilters.map((item) => item.value)));
   const [activeTurn, setActiveTurn] = useState(() => threadGroupKey(groups.at(-1), Math.max(0, groups.length - 1)));
+  const [showLatestButton, setShowLatestButton] = useState(false);
   closeRef.current = onClose;
 
   const participantCounts = useMemo(() => {
@@ -487,14 +491,42 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
     return !normalizedSearch || threadItemSearchText(item).toLocaleLowerCase("zh-CN").includes(normalizedSearch);
   }) })).filter((group) => group.items.length), [agentName, contentKinds, groups, normalizedSearch, participant]);
   const visibleCount = visibleGroups.reduce((total, group) => total + group.items.length, 0);
+  const renderedView = `${normalizedSearch}\u0000${participant}\u0000${[...contentKinds].sort().join(",")}\u0000${visibleGroups.map((group) => `${group.sourceIndex}:${group.items.map((item) => item.itemId ?? item.ordinal).join(",")}`).join("|")}`;
+
+  const setLatestVisibility = (atLatest: boolean) => {
+    isAtLatestRef.current = atLatest;
+    setShowLatestButton(!atLatest);
+  };
+  const syncLatestVisibility = () => {
+    const chat = chatRef.current;
+    if (!chat) return;
+    setLatestVisibility(chat.scrollHeight - chat.scrollTop - chat.clientHeight <= 2);
+  };
 
   const scrollToLatest = () => {
     const chat = chatRef.current;
     if (!chat) return;
+    if (typeof chat.scrollTo === "function") chat.scrollTo({ top: chat.scrollHeight, behavior: "auto" });
     chat.scrollTop = chat.scrollHeight;
+    setLatestVisibility(true);
     const last = visibleGroups.at(-1);
-    if (last) setActiveTurn(threadGroupKey(last, Math.max(0, visibleGroups.length - 1)));
+    if (last) setActiveTurn(threadGroupKey(last, last.sourceIndex));
   };
+  useLayoutEffect(() => {
+    dialogRef.current?.querySelector<HTMLInputElement>("input[type='search']")?.focus({ preventScroll: true });
+  }, []);
+  useLayoutEffect(() => {
+    if (initialScrollDone.current || !items.length) return;
+    scrollToLatest();
+    initialScrollDone.current = true;
+    renderedViewRef.current = renderedView;
+  }, [items.length, renderedView]);
+  useLayoutEffect(() => {
+    if (!initialScrollDone.current || renderedViewRef.current === renderedView) return;
+    renderedViewRef.current = renderedView;
+    if (isAtLatestRef.current) scrollToLatest();
+    else syncLatestVisibility();
+  }, [renderedView]);
   useEffect(() => {
     const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     const previousOverflow = document.body.style.overflow;
@@ -511,13 +543,30 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
       else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
     };
     document.addEventListener("keydown", onKeyDown);
-    scheduleThreadFrame(() => scheduleThreadFrame(() => { scrollToLatest(); initialScrollDone.current = true; dialogRef.current?.querySelector<HTMLInputElement>("input[type='search']")?.focus(); }));
     return () => { document.removeEventListener("keydown", onKeyDown); document.body.style.overflow = previousOverflow; previous?.focus(); };
   }, []);
   useEffect(() => {
-    if (initialScrollDone.current || !items.length) return;
-    scheduleThreadFrame(() => scheduleThreadFrame(() => { scrollToLatest(); initialScrollDone.current = true; }));
-  }, [items.length]);
+    const chat = chatRef.current;
+    const anchor = conversationEndRef.current;
+    if (!chat || !anchor) return;
+    const intersectionObserver = typeof IntersectionObserver === "function" ? new IntersectionObserver((entries) => {
+      const entry = entries.at(-1);
+      if (entry) setLatestVisibility(entry.isIntersecting && entry.intersectionRatio >= 0.99);
+    }, { root: chat, threshold: 0.99 }) : null;
+    intersectionObserver?.observe(anchor);
+    const resizeObserver = typeof ResizeObserver === "function" ? new ResizeObserver(syncLatestVisibility) : null;
+    resizeObserver?.observe(chat);
+    const mutationObserver = typeof MutationObserver === "function" ? new MutationObserver(syncLatestVisibility) : null;
+    mutationObserver?.observe(chat, { childList: true, subtree: true });
+    window.addEventListener("resize", syncLatestVisibility);
+    if (!intersectionObserver) syncLatestVisibility();
+    return () => {
+      intersectionObserver?.disconnect();
+      resizeObserver?.disconnect();
+      mutationObserver?.disconnect();
+      window.removeEventListener("resize", syncLatestVisibility);
+    };
+  }, []);
 
   const jumpToTurn = (key: string) => {
     const target = turnRefs.current.get(key);
@@ -531,9 +580,10 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
     const previousHeight = chat?.scrollHeight ?? 0;
     const previousTop = chat?.scrollTop ?? 0;
     await onLoadEarlier();
-    scheduleThreadFrame(() => scheduleThreadFrame(() => {
+    scheduleThreadFrame(() => {
       if (chat) chat.scrollTop = previousTop + Math.max(0, chat.scrollHeight - previousHeight);
-    }));
+      syncLatestVisibility();
+    });
   };
   const toggleContentKind = (kind: ThreadContentKind) => setContentKinds((current) => {
     const next = new Set(current);
@@ -541,9 +591,10 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
     return next;
   });
   const clearFilters = () => { setSearch(""); setParticipant("all"); setContentKinds(new Set(threadContentFilters.map((item) => item.value))); };
-  const updateActiveTurn = () => {
+  const updateConversationPosition = () => {
     const chat = chatRef.current;
     if (!chat) return;
+    syncLatestVisibility();
     if (chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 160) {
       const last = visibleGroups.at(-1);
       if (last) setActiveTurn(threadGroupKey(last, last.sourceIndex));
@@ -565,9 +616,10 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
         <nav className="thread-turn-nav" aria-label="Thread 回合导航"><h3>回合导航</h3><div>{groups.map((group, index) => {
           const key = threadGroupKey(group, index);
           const turn = group.turnId ? turnMap.get(group.turnId) : null;
-          return <button key={key} className={activeTurn === key ? "active" : ""} onClick={() => jumpToTurn(key)}><span>回合 {turn ? Number(turn.turnIndex) + 1 : index + 1}</span><small>{turn?.durationMs != null ? formatDurationPrecise(Number(turn.durationMs) / 1_000) : `${group.items.length} 项`}</small></button>;
+          const summary = threadTurnNavigationSummary(group, turn);
+          return <button key={key} className={activeTurn === key ? "active" : ""} title={summary.full} onClick={() => jumpToTurn(key)}><strong>{summary.label}</strong><small>回合 {turn ? Number(turn.turnIndex) + 1 : index + 1} · {turn?.durationMs != null ? formatDurationPrecise(Number(turn.durationMs) / 1_000) : "耗时未知"}</small></button>;
         })}</div><button className="thread-jump-latest-nav" onClick={scrollToLatest}><ArrowDown size={15} />跳到最新</button></nav>
-        <main ref={chatRef} className="thread-conversation" onScroll={updateActiveTurn}>
+        <main ref={chatRef} className="thread-conversation" onScroll={updateConversationPosition}>
           {refreshing && <div className="thread-snapshot-status running" aria-live="polite"><RefreshCw className="spin" size={17} /><div><strong>{refreshState?.state === "running" ? "原执行器正在读取 Thread" : executorUnavailable ? "原执行器当前离线，快照保持排队" : "快照已排队，等待原执行器"}</strong><span>{executorUnavailable ? `最近心跳 ${relativeTime(refreshState?.executorLastSeenAt)}；请在固定设备启动 Runner。` : snapshot ? "刷新期间继续展示上一份成功快照。" : "完成后会自动显示最近 50 项。"}</span></div></div>}
           {refreshState?.state === "failed" && <div className="thread-snapshot-status failed" role="alert"><AlertTriangle size={17} /><div><strong>本次 Thread 读取失败</strong><span>{refreshState.error ?? "执行器未能生成快照。"}{snapshot ? " 已保留上一份成功快照。" : ""}</span></div></div>}
           {Boolean(refreshError) && <ErrorBox error={refreshError} />}
@@ -582,7 +634,8 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
               return <section ref={(element) => { if (element) turnRefs.current.set(key, element); else turnRefs.current.delete(key); }} className="thread-conversation-turn" key={key}><header><span /><strong>回合 {turn ? Number(turn.turnIndex) + 1 : fallbackIndex + 1}</strong>{turn?.durationMs != null && <time>{formatDurationPrecise(Number(turn.durationMs) / 1_000)}</time>}<span /></header><div>{group.items.map((item) => <ThreadConversationItem agentName={agentName} groupPrompt={turnPrompt} item={item} key={`${item.ordinal}-${item.itemId}`} />)}</div></section>;
             }) : <Empty icon={<Search />} title="没有匹配的 Thread 记录" text="调整搜索词或筛选条件后再试。" />}
           </> : <Empty icon={<MessagesSquare />} title="正在准备首次快照" text="页面会自动请求原执行器只读加载 Thread 历史。" />}
-          <button className="thread-floating-latest" onClick={scrollToLatest}><ArrowDown size={15} />最新消息</button>
+          <div ref={conversationEndRef} className="thread-conversation-end" aria-hidden="true" />
+          {showLatestButton && <button className="thread-floating-latest" onClick={scrollToLatest}><ArrowDown size={15} />回到最新</button>}
         </main>
         <aside className="thread-filter-panel"><div className="thread-filter-heading"><h3>筛选</h3><button onClick={clearFilters}>重置</button></div><section><h4>参与者</h4>{([
           ["all", "全部消息", items.length], ["user", "用户", participantCounts.user], ["self", agentName, participantCounts.self], ["other", "其它 Agent", participantCounts.other]
@@ -594,6 +647,19 @@ function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, 
 
 function threadGroupKey(group: { turnId: string | null } | undefined, index: number): string {
   return group?.turnId ?? `unassigned-${index}`;
+}
+
+function threadTurnNavigationSummary(group: { items: AnyRecord[] }, turn: AnyRecord | null | undefined): { label: string; full: string } {
+  const persisted = typeof turn?.summary === "string" ? turn.summary : "";
+  const fallbackItem = group.items.find((item) => {
+    const type = String(item.itemType ?? item.raw?.type ?? "unknown");
+    return ["userMessage", "agentMessage", "collabAgentToolCall"].includes(type) && Boolean(threadItemDisplayText(item).trim());
+  });
+  const full = (persisted || (fallbackItem ? threadItemDisplayText(fallbackItem) : ""))
+    .replace(/\s+/gu, " ")
+    .trim() || "暂无可读消息";
+  const characters = Array.from(full);
+  return { label: characters.length > 24 ? `${characters.slice(0, 23).join("")}…` : full, full };
 }
 
 function scheduleThreadFrame(callback: () => void): number {
@@ -612,9 +678,9 @@ function ThreadConversationItem({ agentName, groupPrompt, item }: { agentName: s
   const [copied, setCopied] = useState(false);
   const detailRef = useRef<HTMLDivElement>(null);
   const detailText = detailMode === "json" ? JSON.stringify(item.raw, null, 2) : fullPrompt;
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!expanded) return;
-    scheduleThreadFrame(() => detailRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" }));
+    detailRef.current?.scrollIntoView?.({ block: "nearest", behavior: "auto" });
   }, [expanded]);
   const copyDetail = () => {
     if (navigator.clipboard?.writeText) void navigator.clipboard.writeText(detailText).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1_500); });

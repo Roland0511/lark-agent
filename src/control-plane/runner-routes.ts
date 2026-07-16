@@ -176,12 +176,16 @@ export function registerRunnerRoutes(
     const worker = await db.selectFrom("workers").select(["status", "last_seen_at", "runner_version", "operational_mode", "workspace_aliases", "upgrade_drain_token_hash"])
       .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
     if (!worker) throw new AppError("执行器不存在", 404, "not_found");
-    const [active, activeRuntimeSync] = await Promise.all([
+    const now = new Date();
+    const [active, activeRuntimeSync, activeThreadSnapshots] = await Promise.all([
       db.selectFrom("tasks").select(sql<number>`count(*)::int`.as("count"))
         .where("executor_id", "=", request.params.id).where("state", "in", [...executorActiveTaskStates]).executeTakeFirstOrThrow(),
       db.selectFrom("skill_file_sync_jobs").select(sql<number>`count(*)::int`.as("count"))
         .where("executor_id", "=", request.params.id).where("state", "=", "running")
-        .where("lease_expires_at", ">", new Date()).executeTakeFirstOrThrow()
+        .where("lease_expires_at", ">", now).executeTakeFirstOrThrow(),
+      db.selectFrom("chat_thread_snapshot_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "=", "running")
+        .where("lease_expires_at", ">", now).executeTakeFirstOrThrow()
     ]);
     const age = Date.now() - new Date(worker.last_seen_at).getTime();
     const workspaceAliases = Array.isArray(worker.workspace_aliases) ? worker.workspace_aliases.map(String) : [];
@@ -194,6 +198,7 @@ export function registerRunnerRoutes(
       operationalMode: worker.operational_mode,
       activeTasks: active.count,
       activeRuntimeSyncJobs: activeRuntimeSync.count,
+      activeThreadSnapshotJobs: activeThreadSnapshots.count,
       upgradeDraining: worker.upgrade_drain_token_hash !== null,
       upgradeDrainOwned: typeof presentedDrainToken === "string" && worker.upgrade_drain_token_hash === sha256(presentedDrainToken),
       workspaceAliases,
@@ -227,6 +232,12 @@ export function registerRunnerRoutes(
         .where("executor_id", "=", request.params.id).where("state", "=", "running")
         .where("lease_expires_at", ">", now).executeTakeFirstOrThrow();
       if (activeRuntimeSync.count > 0) throw new AppError("执行器仍有活跃技能同步任务，不能进入升级排空", 409, "worker_has_active_runtime_sync");
+      const activeThreadSnapshots = await trx.selectFrom("chat_thread_snapshot_jobs").select(sql<number>`count(*)::int`.as("count"))
+        .where("executor_id", "=", request.params.id).where("state", "=", "running")
+        .where("lease_expires_at", ">", now).executeTakeFirstOrThrow();
+      if (activeThreadSnapshots.count > 0) {
+        throw new AppError("执行器仍有活跃 Thread 快照任务，不能进入升级排空", 409, "worker_has_active_thread_snapshot");
+      }
       return worker.operational_mode;
     });
     events?.publish("worker", request.params.id);

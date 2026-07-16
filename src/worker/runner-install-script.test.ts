@@ -107,6 +107,12 @@ async function runGuard(status: Record<string, unknown>, options: {
 }
 
 describe.skipIf(process.platform !== "darwin" || !existsSync("/bin/zsh"))("Runner upgrade safety guard", () => {
+  it("waits for the newly installed Runner version instead of accepting a stale online heartbeat", async () => {
+    const script = await readFile(installer, "utf8");
+    expect(script).toContain("optional_json_value \"$RESPONSE\" runnerVersion ''");
+    expect(script).toContain("wait_online \"$CONTROL_PLANE_URL\" \"$EXECUTOR_ID\" \"$CREDENTIAL\" \"$VERSION\"");
+  });
+
   it("stops before reading the release manifest when a runtime sync lease is active", async () => {
     const { result, calls } = await runGuard({ online: true, activeTasks: 0, activeRuntimeSyncJobs: 1 });
     expect(result.status).not.toBe(0);
@@ -124,10 +130,22 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/bin/zsh"))("Runne
     expect(calls[0]).toContain("/v1/runner/status/worker-a");
   });
 
+  it("stops before reading the release manifest when a Thread snapshot lease is active", async () => {
+    const { result, calls } = await runGuard({
+      online: true, activeTasks: 0, activeRuntimeSyncJobs: 0, activeThreadSnapshotJobs: 1
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("活跃 Thread 快照任务");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toContain("/v1/runner/status/worker-a");
+    expect(calls[0]).not.toContain("manifest.json");
+  });
+
   it("treats a missing runtime-sync field from an old control plane as zero", async () => {
     const { result, calls } = await runGuard({ online: true, activeTasks: 0 });
     expect(result.status).not.toBe(0);
     expect(result.stderr).not.toContain("技能同步状态无效");
+    expect(result.stderr).not.toContain("Thread 快照状态无效");
     expect(calls[0]).toContain("/v1/runner/status/worker-a");
     expect(calls.some((call) => call.includes("-X POST") && call.includes("/v1/runner/upgrade-drain/worker-a"))).toBe(true);
     expect(calls.some((call) => call.includes("/runner/manifest.json"))).toBe(true);

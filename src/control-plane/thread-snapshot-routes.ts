@@ -5,7 +5,8 @@ import type { Database } from "../db/types.js";
 import {
   threadSnapshotChunkSchema,
   threadSnapshotCompleteSchema,
-  threadSnapshotFailureSchema
+  threadSnapshotFailureSchema,
+  threadSnapshotTurnSummariesPageSchema
 } from "../shared/contracts.js";
 import { AppError } from "../shared/errors.js";
 import { requireAdmin, requireCsrf, setNoStore } from "./admin-auth.js";
@@ -18,6 +19,10 @@ import { ThreadSnapshotService } from "./thread-snapshot-service.js";
 const MAX_CHUNK_BYTES = 4 * 1024 * 1024;
 const ROUTE_BODY_LIMIT = 8 * 1024 * 1024;
 const viewQuerySchema = z.object({
+  before: z.string().max(128).optional(),
+  limit: z.coerce.number().int().min(1).max(50).default(50)
+});
+const summaryQuerySchema = z.object({
   before: z.string().max(128).optional(),
   limit: z.coerce.number().int().min(1).max(50).default(50)
 });
@@ -60,6 +65,21 @@ export function registerThreadSnapshotRoutes(
     const principal = await requireWorkerSession(db, config, request);
     return service.heartbeat(principal.executorId, request.params.jobId, snapshotLeaseToken(request));
   });
+
+  app.get<{ Params: { jobId: string }; Querystring: { before?: string; limit?: string } }>(
+    "/v1/workers/thread-snapshot-jobs/:jobId/turn-summaries",
+    async (request) => {
+      const principal = await requireWorkerSession(db, config, request);
+      const query = summaryQuerySchema.parse(request.query);
+      return threadSnapshotTurnSummariesPageSchema.parse(await service.previousAiSummaries(
+        principal.executorId,
+        request.params.jobId,
+        snapshotLeaseToken(request),
+        query.before,
+        query.limit
+      ));
+    }
+  );
 
   app.post<{ Params: { jobId: string } }>("/v1/workers/thread-snapshot-jobs/:jobId/chunks", { bodyLimit: ROUTE_BODY_LIMIT }, async (request) => {
     const principal = await requireWorkerSession(db, config, request);

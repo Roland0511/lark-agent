@@ -8,6 +8,7 @@ import {
   threadSnapshotCompleteSchema,
   threadSnapshotFailureSchema,
   threadSnapshotJobSchema,
+  threadSnapshotTurnSummariesPageSchema,
   workerUserSkillsReportSchema,
   workerSessionResponseSchema,
   workspaceRuntimeSyncJobSchema,
@@ -23,6 +24,7 @@ import {
   type ThreadSnapshotChunk,
   type ThreadSnapshotComplete,
   type ThreadSnapshotJob,
+  type ThreadSnapshotTurnSummary,
   type WorkerRegistration,
   type WorkerModelCatalogEntry,
   type WorkerUserSkillsReport,
@@ -173,6 +175,30 @@ export class ControlPlaneClient {
       throw new Error("thread snapshot heartbeat response is invalid");
     }
     return { leaseExpiresAt: body.leaseExpiresAt };
+  }
+
+  async previousThreadTurnSummaries(job: ThreadSnapshotJob): Promise<ThreadSnapshotTurnSummary[]> {
+    const summaries: ThreadSnapshotTurnSummary[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    do {
+      const params = new URLSearchParams({ limit: "50" });
+      if (cursor) params.set("before", cursor);
+      const response = await this.authorizedFetch(`/v1/workers/thread-snapshot-jobs/${job.id}/turn-summaries?${params}`, {
+        headers: snapshotLeaseHeaders(job.leaseToken)
+      });
+      if (response.status === 404 || response.status === 405) {
+        await response.body?.cancel().catch(() => undefined);
+        return [];
+      }
+      const page = threadSnapshotTurnSummariesPageSchema.parse(await jsonResponse(response));
+      summaries.push(...page.summaries);
+      const next = page.nextCursor;
+      if (next && seenCursors.has(next)) throw new Error("thread summary response repeated a pagination cursor");
+      if (next) seenCursors.add(next);
+      cursor = next;
+    } while (cursor);
+    return summaries;
   }
 
   async uploadThreadSnapshotChunk(job: ThreadSnapshotJob, chunk: ThreadSnapshotChunk): Promise<void> {

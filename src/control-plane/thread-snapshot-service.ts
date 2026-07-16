@@ -45,6 +45,23 @@ function ordinalFromCursor(cursor: string | undefined): number | null {
   }
 }
 
+function turnCursorFor(turnIndex: number): string {
+  return Buffer.from(String(turnIndex), "utf8").toString("base64url");
+}
+
+function turnIndexFromCursor(cursor: string | undefined): number | null {
+  if (!cursor) return null;
+  try {
+    const decoded = Buffer.from(cursor, "base64url").toString("utf8");
+    if (!/^\d+$/.test(decoded)) throw new Error("invalid cursor");
+    const turnIndex = Number(decoded);
+    if (!Number.isSafeInteger(turnIndex) || turnIndex < 0) throw new Error("invalid cursor");
+    return turnIndex;
+  } catch {
+    throw new AppError("Thread 回合摘要分页游标无效", 400, "invalid_thread_summary_cursor");
+  }
+}
+
 function capabilities(value: unknown): string[] {
   return Array.isArray(value) ? value.map(String) : [];
 }
@@ -60,6 +77,11 @@ function stable(value: unknown): string {
 function sameNullableNumber(left: number | string | bigint | null, right: number | null): boolean {
   if (left === null || right === null) return left === null && right === null;
   return Number(left) === right;
+}
+
+function sameNullableTimestamp(left: Date | string | null, right: string | null | undefined): boolean {
+  if (left === null || right == null) return left === null && right == null;
+  return new Date(left).getTime() === new Date(right).getTime();
 }
 
 export class ThreadSnapshotService {
@@ -133,6 +155,9 @@ export class ThreadSnapshotService {
     leaseToken: string;
     leaseExpiresAt: string;
     attempt: number;
+    summaryEnabled: boolean;
+    summaryModel: string | null;
+    summaryReasoningEffort: string | null;
   } | null> {
     await this.expireJobs();
     const token = randomToken();
@@ -141,14 +166,15 @@ export class ThreadSnapshotService {
       await lockExecutorClaim(trx, principal.executorId);
       const worker = await trx.selectFrom("workers").select([
         "capacity", "operational_mode", "home_ref", "codex_profile", "config_fingerprint",
-        "workspace_mapping_fingerprint", "capabilities", "deleted_at"
+        "workspace_mapping_fingerprint", "capabilities", "upgrade_drain_token_hash", "deleted_at"
       ]).where("executor_id", "=", principal.executorId).forUpdate().executeTakeFirst();
       if (!worker || worker.deleted_at) return null;
       if (worker.home_ref !== principal.homeRef || worker.codex_profile !== principal.codexProfile || worker.config_fingerprint !== principal.configFingerprint
         || worker.workspace_mapping_fingerprint !== (principal.workspaceMappingFingerprint ?? null)) {
         throw new AppError("worker configuration changed; create a new session", 409, "worker_config_changed");
       }
-      if (!["enabled", "maintenance"].includes(worker.operational_mode) || !capabilities(worker.capabilities).includes("thread_snapshot_v1")) return null;
+      if (worker.upgrade_drain_token_hash || !["enabled", "maintenance"].includes(worker.operational_mode)
+        || !capabilities(worker.capabilities).includes("thread_snapshot_v1")) return null;
       if (!await executorHasClaimCapacity(trx, principal.executorId, worker.capacity)) return null;
       const claimed = await sql<{
         id: string; chat_context_id: string; codex_thread_id: string; attempt: number;
@@ -176,13 +202,27 @@ export class ThreadSnapshotService {
         FROM candidate WHERE job.id = candidate.id
         RETURNING job.id, job.chat_context_id, job.codex_thread_id, job.attempt
       `.execute(trx);
-      return claimed.rows[0] ?? null;
+      const job = claimed.rows[0] ?? null;
+      if (!job) return null;
+      const summaryEnabled = capabilities(worker.capabilities).includes("thread_turn_summary_v1");
+      const policy = summaryEnabled ? await trx.selectFrom("chat_contexts")
+        .innerJoin("bots", "bots.id", "chat_contexts.bot_id")
+        .select(["bots.attention_model", "bots.attention_reasoning_effort"])
+        .where("chat_contexts.id", "=", job.chat_context_id).executeTakeFirstOrThrow() : null;
+      return {
+        ...job,
+        summaryEnabled,
+        summaryModel: policy?.attention_model ?? null,
+        summaryReasoningEffort: policy?.attention_reasoning_effort ?? null
+      };
     });
     if (!result) return null;
     this.events.publish("chat_context", result.chat_context_id);
     return {
       id: result.id, chatContextId: result.chat_context_id, threadId: result.codex_thread_id,
-      leaseToken: token, leaseExpiresAt: leaseExpiresAt.toISOString(), attempt: result.attempt
+      leaseToken: token, leaseExpiresAt: leaseExpiresAt.toISOString(), attempt: result.attempt,
+      summaryEnabled: result.summaryEnabled, summaryModel: result.summaryModel,
+      summaryReasoningEffort: result.summaryReasoningEffort
     };
   }
 
@@ -207,6 +247,39 @@ export class ThreadSnapshotService {
     return job;
   }
 
+  async previousAiSummaries(
+    executorId: string,
+    jobId: string,
+    leaseToken: string,
+    cursor: string | undefined,
+    limit: number
+  ) {
+    const before = turnIndexFromCursor(cursor);
+    return this.db.transaction().execute(async (trx) => {
+      const job = await this.lockedJob(trx, executorId, jobId, leaseToken);
+      const previous = await trx.selectFrom("chat_thread_snapshot_jobs").select("id")
+        .where("chat_context_id", "=", job.chat_context_id).where("state", "=", "completed")
+        .executeTakeFirst();
+      if (!previous) return { summaries: [], nextCursor: null };
+      let query = trx.selectFrom("chat_thread_snapshot_turns")
+        .select(["turn_index", "turn_id", "summary", "summary_model", "summary_generated_at"])
+        .where("job_id", "=", previous.id).where("summary_source", "=", "ai").where("summary", "is not", null);
+      if (before !== null) query = query.where("turn_index", "<", before);
+      const rows = await query.orderBy("turn_index", "desc").limit(limit + 1).execute();
+      const hasMore = rows.length > limit;
+      const page = rows.slice(0, limit);
+      return {
+        summaries: page.map((turn) => ({
+          turnId: turn.turn_id,
+          summary: turn.summary as string,
+          summaryModel: turn.summary_model,
+          summaryGeneratedAt: iso(turn.summary_generated_at) as string
+        })),
+        nextCursor: hasMore && page.length ? turnCursorFor(page.at(-1)!.turn_index) : null
+      };
+    });
+  }
+
   async uploadChunk(executorId: string, jobId: string, leaseToken: string, chunk: ThreadSnapshotChunk): Promise<void> {
     await this.db.transaction().execute(async (trx) => {
       await this.lockedJob(trx, executorId, jobId, leaseToken);
@@ -217,14 +290,18 @@ export class ThreadSnapshotService {
           const matches = existing.turn_id === turn.turnId && existing.status === turn.status
             && sameNullableNumber(existing.started_at_epoch, turn.startedAt) && sameNullableNumber(existing.completed_at_epoch, turn.completedAt)
             && sameNullableNumber(existing.duration_ms, turn.durationMs) && stable(existing.error) === stable(turn.error)
-            && stable(existing.raw_turn) === stable(turn.raw);
+            && stable(existing.raw_turn) === stable(turn.raw) && existing.summary === (turn.summary ?? null)
+            && existing.summary_source === (turn.summarySource ?? null) && existing.summary_model === (turn.summaryModel ?? null)
+            && sameNullableTimestamp(existing.summary_generated_at, turn.summaryGeneratedAt);
           if (!matches) throw new AppError("重复的 Thread 回合分块内容不一致", 409, "thread_snapshot_chunk_conflict");
           continue;
         }
         await trx.insertInto("chat_thread_snapshot_turns").values({
           job_id: jobId, turn_index: turn.turnIndex, turn_id: turn.turnId, status: turn.status,
           started_at_epoch: turn.startedAt, completed_at_epoch: turn.completedAt, duration_ms: turn.durationMs,
-          error: json(turn.error), raw_turn: json(turn.raw)
+          error: json(turn.error), raw_turn: json(turn.raw), summary: turn.summary ?? null,
+          summary_source: turn.summarySource ?? null, summary_model: turn.summaryModel ?? null,
+          summary_generated_at: turn.summaryGeneratedAt ? new Date(turn.summaryGeneratedAt) : null
         }).execute();
       }
       for (const item of chunk.items) {
@@ -351,7 +428,9 @@ export class ThreadSnapshotService {
       turns: turns.map((turn) => ({
         turnIndex: turn.turn_index, turnId: turn.turn_id, status: turn.status,
         startedAt: turn.started_at_epoch, completedAt: turn.completed_at_epoch,
-        durationMs: turn.duration_ms, error: turn.error, raw: turn.raw_turn
+        durationMs: turn.duration_ms, error: turn.error, raw: turn.raw_turn,
+        summary: turn.summary, summarySource: turn.summary_source, summaryModel: turn.summary_model,
+        summaryGeneratedAt: iso(turn.summary_generated_at)
       })),
       nextCursor: hasMore && pageDescending.length ? cursorFor(pageDescending.at(-1)!.ordinal) : null
     };

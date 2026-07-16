@@ -57,6 +57,8 @@ describe("worker config", () => {
     expect(config.capabilities).toContain("skill_runtime_config_v1");
     expect(config.capabilities).toContain("user_skills_inventory_v1");
     expect(config.capabilities).toContain("workspace_mapping_v1");
+    expect(config.capabilities).toContain("thread_snapshot_v1");
+    expect(config.capabilities).toContain("thread_turn_summary_v1");
     expect(config.runtimeStateDir).toBe(await realpath(join(dirname(data.configFile), "state")));
     expect(config.attachmentMaxBytes).toBe(104_857_600);
     expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
@@ -130,7 +132,8 @@ describe("worker config", () => {
       "skill_runtime_config_v1",
       "user_skills_inventory_v1",
       "workspace_mapping_v1",
-      "thread_snapshot_v1"
+      "thread_snapshot_v1",
+      "thread_turn_summary_v1"
     ]);
   });
 

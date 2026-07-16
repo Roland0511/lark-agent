@@ -137,6 +137,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const skillhubRuntimeSql = await readFile(fileURLToPath(new URL("../db/migrations/020_skillhub_runtime.sql", import.meta.url)), "utf8");
     const chatContextIdentitySql = await readFile(fileURLToPath(new URL("../db/migrations/021_chat_context_identity.sql", import.meta.url)), "utf8");
     const chatThreadSnapshotsSql = await readFile(fileURLToPath(new URL("../db/migrations/022_chat_thread_snapshots.sql", import.meta.url)), "utf8");
+    const chatThreadTurnSummariesSql = await readFile(fileURLToPath(new URL("../db/migrations/023_chat_thread_turn_summaries.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -169,6 +170,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextIdentityApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'chat_contexts' AND column_name = 'peer_open_id'");
     if (chatContextIdentityApplied.rowCount === 0) await client.query(chatContextIdentitySql);
     await client.query(chatThreadSnapshotsSql);
+    await client.query(chatThreadTurnSummariesSql);
     await client.end();
   });
 
@@ -806,12 +808,55 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect((await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } })).statusCode).toBe(401);
   });
 
-  it("drains an idle executor atomically for upgrade and restores its previous mode", async () => {
+  it("reports active Thread snapshots and refuses upgrade drain until their lease expires", async () => {
     await insertWorker();
-    const deviceToken = "device-token-upgrade-drain";
+    const deviceToken = "device-token-thread-snapshot-drain";
     await db.insertInto("worker_device_credentials").values({
       executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
     }).execute();
+    const context = await insertSkillContext("oc_thread_snapshot_drain", "worker-a");
+    const snapshot = await db.insertInto("chat_thread_snapshot_jobs").values({
+      chat_context_id: context.id, executor_id: "worker-a", codex_thread_id: "thread-snapshot-drain",
+      requested_by: "ou_owner", state: "running", lease_token_hash: sha256("thread-snapshot-drain-lease"),
+      lease_expires_at: new Date(Date.now() + 60_000), attempt: 1, updated_at: new Date()
+    }).returning("id").executeTakeFirstOrThrow();
+    const authorization = { authorization: `Bearer ${deviceToken}` };
+
+    expect((await app.inject({ method: "GET", url: "/v1/runner/status/worker-a", headers: authorization })).json())
+      .toMatchObject({ activeThreadSnapshotJobs: 1 });
+    const blocked = await app.inject({ method: "POST", url: "/v1/runner/upgrade-drain/worker-a", headers: authorization });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json<{ error: { code: string } }>().error.code).toBe("worker_has_active_thread_snapshot");
+    expect((await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).operational_mode)
+      .toBe("enabled");
+
+    await db.updateTable("chat_thread_snapshot_jobs").set({ lease_expires_at: new Date(Date.now() - 1_000), updated_at: new Date() })
+      .where("id", "=", snapshot.id).execute();
+    expect((await app.inject({ method: "GET", url: "/v1/runner/status/worker-a", headers: authorization })).json())
+      .toMatchObject({ activeThreadSnapshotJobs: 0 });
+  });
+
+  it("drains an idle executor atomically for upgrade and restores its previous mode", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-upgrade-drain";
+    const credential = await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).returning("id").executeTakeFirstOrThrow();
+    await db.updateTable("workers").set({
+      capabilities: JSON.stringify(["codex", "chat_context_v1", "thread_snapshot_v1"]), updated_at: new Date()
+    }).where("executor_id", "=", "worker-a").execute();
+    const snapshotContext = await insertSkillContext("oc_upgrade_drain_snapshot", "worker-a");
+    await db.updateTable("chat_contexts").set({
+      codex_thread_id: "thread-upgrade-drain", state: "ready", updated_at: new Date()
+    }).where("id", "=", snapshotContext.id).execute();
+    await db.insertInto("chat_thread_snapshot_jobs").values({
+      chat_context_id: snapshotContext.id, executor_id: "worker-a", codex_thread_id: "thread-upgrade-drain",
+      requested_by: "ou_owner", state: "queued", updated_at: new Date()
+    }).execute();
+    const workerSession = await issueWorkerSession(config, {
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "a".repeat(64), workspaceMappingFingerprint: null, credentialId: credential.id
+    });
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
     const routed = await new MessageRouter(db).route(bot, {
       eventId: "ev_upgrade_drain", eventType: "im.message.receive_v1", messageId: "om_upgrade_drain",
@@ -830,6 +875,10 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       headers: { ...authorization, "x-upgrade-drain-token": drainToken }
     })).json()).toMatchObject({ upgradeDraining: true, upgradeDrainOwned: true });
     expect((await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).operational_mode).toBe("maintenance");
+    expect((await app.inject({
+      method: "POST", url: "/v1/workers/thread-snapshot-jobs/claim",
+      headers: { authorization: `Bearer ${workerSession.token}` }
+    })).statusCode).toBe(204);
     await expect(new ControlPlaneRepository(db, 60).claimTask({
       executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64)
     })).resolves.toBeNull();
@@ -1826,11 +1875,14 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   it("snapshots a fixed Thread with idempotent chunks, backward pagination, and failure fallback", async () => {
     await insertWorker();
     await db.updateTable("workers").set({
-      capabilities: JSON.stringify(["codex", "chat_context_v1", "thread_snapshot_v1"]),
+      capabilities: JSON.stringify(["codex", "chat_context_v1", "thread_snapshot_v1", "thread_turn_summary_v1"]),
       operational_mode: "maintenance",
-      runner_version: "0.4.2",
+      runner_version: "0.4.4",
       updated_at: new Date()
     }).where("executor_id", "=", "worker-a").execute();
+    await db.updateTable("bots").set({
+      attention_model: "attention-fast", attention_reasoning_effort: "low"
+    }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     const context = await insertSkillContext("oc_thread_snapshot", "worker-a");
     await db.updateTable("chat_contexts").set({
       codex_thread_id: "thread-snapshot-test", state: "blocked", blocked_reason: "测试维护模式只读",
@@ -1871,15 +1923,26 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
     const claimed = await app.inject({ method: "POST", url: "/v1/workers/thread-snapshot-jobs/claim", headers: workerHeaders });
     expect(claimed.statusCode).toBe(200);
-    const job = claimed.json<{ id: string; chatContextId: string; threadId: string; leaseToken: string; attempt: number }>();
-    expect(job).toMatchObject({ chatContextId: context.id, threadId: "thread-snapshot-test", attempt: 1 });
+    const job = claimed.json<{
+      id: string; chatContextId: string; threadId: string; leaseToken: string; attempt: number;
+      summaryEnabled: boolean; summaryModel: string | null; summaryReasoningEffort: string | null;
+    }>();
+    expect(job).toMatchObject({
+      chatContextId: context.id, threadId: "thread-snapshot-test", attempt: 1,
+      summaryEnabled: true, summaryModel: "attention-fast", summaryReasoningEffort: "low"
+    });
     const leaseHeaders = { ...workerHeaders, "x-snapshot-lease-token": job.leaseToken };
     expect((await app.inject({ method: "POST", url: `/v1/workers/thread-snapshot-jobs/${job.id}/heartbeat`, headers: leaseHeaders })).statusCode).toBe(200);
 
-    const turns = [0, 1].map((turnIndex) => ({
+    const summaryGeneratedAt = "2026-07-16T08:00:00.000Z";
+    const turns = [0, 1, 2].map((turnIndex) => ({
       turnIndex, turnId: `turn-${turnIndex}`, status: "completed", startedAt: turnIndex * 1000,
       completedAt: turnIndex * 1000 + 900, durationMs: 900, error: null,
-      raw: { id: `turn-${turnIndex}`, status: "completed" }
+      raw: { id: `turn-${turnIndex}`, status: "completed" },
+      summary: `处理主题 ${turnIndex}`,
+      summarySource: turnIndex === 2 ? "fallback" : "ai",
+      summaryModel: "attention-fast",
+      summaryGeneratedAt
     }));
     const items = Array.from({ length: 61 }, (_, ordinal) => ({
       ordinal, turnId: ordinal < 30 ? "turn-0" : "turn-1", itemIndex: ordinal < 30 ? ordinal : ordinal - 30,
@@ -1898,16 +1961,25 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
     const completed = await app.inject({
       method: "POST", url: `/v1/workers/thread-snapshot-jobs/${job.id}/complete`, headers: leaseHeaders,
-      payload: { threadMetadata: { id: "thread-snapshot-test", cwd: "/private/workspace" }, protocolSource: "thread/read+thread/items/list", turnCount: 2, itemCount: 61 }
+      payload: { threadMetadata: { id: "thread-snapshot-test", cwd: "/private/workspace" }, protocolSource: "thread/read+thread/items/list", turnCount: 3, itemCount: 61 }
     });
     expect(completed.statusCode).toBe(200);
     const latest = await app.inject({ method: "GET", url: `/v1/admin/chat-contexts/${context.id}/thread-snapshot?limit=50`, headers: cookie });
     expect(latest.statusCode).toBe(200);
-    const firstPage = latest.json<{ snapshot: { itemCount: number; thread: Record<string, unknown> }; refresh: unknown; items: Array<{ ordinal: number; raw: Record<string, unknown> }>; nextCursor: string }>();
+    const firstPage = latest.json<{
+      snapshot: { itemCount: number; thread: Record<string, unknown> }; refresh: unknown;
+      items: Array<{ ordinal: number; raw: Record<string, unknown> }>;
+      turns: Array<{ turnId: string; summary: string | null; summarySource: string | null; summaryModel: string | null; summaryGeneratedAt: string | null }>;
+      nextCursor: string;
+    }>();
     expect(firstPage.snapshot).toMatchObject({ itemCount: 61, thread: { id: "thread-snapshot-test", cwd: "/private/workspace" } });
     expect(firstPage.refresh).toBeNull();
     expect(firstPage.items.map((item) => item.ordinal)).toEqual(Array.from({ length: 50 }, (_, index) => index + 11));
     expect(firstPage.items.at(-1)?.raw).toMatchObject({ text: "消息 60" });
+    expect(firstPage.turns).toEqual(expect.arrayContaining([
+      expect.objectContaining({ turnId: "turn-0", summary: "处理主题 0", summarySource: "ai", summaryModel: "attention-fast", summaryGeneratedAt }),
+      expect.objectContaining({ turnId: "turn-1", summary: "处理主题 1", summarySource: "ai", summaryModel: "attention-fast", summaryGeneratedAt })
+    ]));
     const earlier = await app.inject({ method: "GET", url: `/v1/admin/chat-contexts/${context.id}/thread-snapshot?limit=50&before=${encodeURIComponent(firstPage.nextCursor)}`, headers: cookie });
     expect(earlier.json<{ items: Array<{ ordinal: number }>; nextCursor: null }>().items.map((item) => item.ordinal)).toEqual(Array.from({ length: 11 }, (_, index) => index));
     expect(earlier.json<{ nextCursor: null }>().nextCursor).toBeNull();
@@ -1916,6 +1988,50 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(refresh.statusCode).toBe(202);
     const refreshClaim = await app.inject({ method: "POST", url: "/v1/workers/thread-snapshot-jobs/claim", headers: workerHeaders });
     const failedJob = refreshClaim.json<{ id: string; leaseToken: string }>();
+    const summaryUrl = `/v1/workers/thread-snapshot-jobs/${failedJob.id}/turn-summaries`;
+    await db.insertInto("workers").values({
+      executor_id: "worker-b", display_name: "Worker B", home_ref: "worker-b:home", codex_profile: "lark-agent",
+      config_fingerprint: "b".repeat(64), codex_version: "test", capacity: 1,
+      workspace_aliases: JSON.stringify(["repo"]), capabilities: JSON.stringify(["codex", "thread_snapshot_v1"]),
+      last_seen_at: new Date(), updated_at: new Date()
+    }).execute();
+    const otherCredential = await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-b", credential_hash: sha256("thread-snapshot-other-device"), last_used_at: null, revoked_at: null
+    }).returning("id").executeTakeFirstOrThrow();
+    const otherWorkerSession = await issueWorkerSession(config, {
+      executorId: "worker-b", homeRef: "worker-b:home", codexProfile: "lark-agent",
+      configFingerprint: "b".repeat(64), workspaceMappingFingerprint: null, credentialId: otherCredential.id
+    });
+    expect((await app.inject({ method: "GET", url: summaryUrl, headers: workerHeaders })).statusCode).toBe(401);
+    expect((await app.inject({
+      method: "GET", url: summaryUrl, headers: { ...workerHeaders, "x-snapshot-lease-token": "wrong" }
+    })).statusCode).toBe(409);
+    expect((await app.inject({
+      method: "GET", url: summaryUrl,
+      headers: { authorization: `Bearer ${otherWorkerSession.token}`, "x-snapshot-lease-token": failedJob.leaseToken }
+    })).statusCode).toBe(409);
+    const summaryHeaders = { ...workerHeaders, "x-snapshot-lease-token": failedJob.leaseToken };
+    const summaryPage = await app.inject({ method: "GET", url: `${summaryUrl}?limit=1`, headers: summaryHeaders });
+    expect(summaryPage.statusCode).toBe(200);
+    const recentSummary = summaryPage.json<{
+      summaries: Array<{ turnId: string; summary: string; summaryModel: string | null; summaryGeneratedAt: string | null }>;
+      nextCursor: string;
+    }>();
+    expect(recentSummary.summaries).toEqual([{
+      turnId: "turn-1", summary: "处理主题 1", summaryModel: "attention-fast", summaryGeneratedAt
+    }]);
+    const olderSummary = (await app.inject({
+      method: "GET", url: `${summaryUrl}?limit=1&before=${encodeURIComponent(recentSummary.nextCursor)}`, headers: summaryHeaders
+    })).json<{ summaries: Array<{ turnId: string }>; nextCursor: null }>();
+    expect(olderSummary).toEqual({
+      summaries: [{ turnId: "turn-0", summary: "处理主题 0", summaryModel: "attention-fast", summaryGeneratedAt }],
+      nextCursor: null
+    });
+    const invalidSummaryCursor = await app.inject({
+      method: "GET", url: `${summaryUrl}?before=invalid`, headers: summaryHeaders
+    });
+    expect(invalidSummaryCursor.statusCode).toBe(400);
+    expect(invalidSummaryCursor.json<{ error: { code: string } }>().error.code).toBe("invalid_thread_summary_cursor");
     expect((await app.inject({
       method: "POST", url: `/v1/workers/thread-snapshot-jobs/${failedJob.id}/fail`,
       headers: { ...workerHeaders, "x-snapshot-lease-token": failedJob.leaseToken }, payload: { summary: "Codex 协议读取失败" }
@@ -1970,12 +2086,27 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       capabilities: JSON.stringify(["codex", "chat_context_v1", "thread_snapshot_v1"]),
       runner_version: "0.4.2", last_seen_at: new Date(Date.now() - 5 * 60_000), updated_at: new Date()
     }).where("executor_id", "=", "worker-a").execute();
+    const credential = await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256("thread-compatibility-device"), last_used_at: null, revoked_at: null
+    }).returning("id").executeTakeFirstOrThrow();
+    const session = await issueWorkerSession(config, {
+      executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "a".repeat(64), workspaceMappingFingerprint: null, credentialId: credential.id
+    });
     expect((await app.inject({ method: "POST", url: `/v1/admin/chat-contexts/${context.id}/thread-snapshot`, headers })).statusCode).toBe(202);
     const view = (await app.inject({
       method: "GET", url: `/v1/admin/chat-contexts/${context.id}/thread-snapshot`, headers: { cookie: headers.cookie }
     })).json<{ refresh: { state: string; executorAvailability: string; executorLastSeenAt: string; runnerVersion: string } }>();
     expect(view.refresh).toMatchObject({ state: "queued", executorAvailability: "offline", runnerVersion: "0.4.2" });
     expect(view.refresh.executorLastSeenAt).toEqual(expect.any(String));
+    const oldRunnerClaim = await app.inject({
+      method: "POST", url: "/v1/workers/thread-snapshot-jobs/claim",
+      headers: { authorization: `Bearer ${session.token}` }
+    });
+    expect(oldRunnerClaim.statusCode).toBe(200);
+    expect(oldRunnerClaim.json()).toMatchObject({
+      summaryEnabled: false, summaryModel: null, summaryReasoningEffort: null
+    });
   });
 
   it("retries expired Thread snapshot leases three times, clears partial chunks, and times out stale queues", async () => {

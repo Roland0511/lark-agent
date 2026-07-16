@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { claimedTaskSchema, signalSchema, workerRegistrationSchema, workerUserSkillsReportSchema } from "./contracts.js";
+import {
+  claimedTaskSchema,
+  signalSchema,
+  threadSnapshotJobSchema,
+  threadSnapshotTurnSchema,
+  threadSnapshotTurnSummariesPageSchema,
+  workerRegistrationSchema,
+  workerUserSkillsReportSchema
+} from "./contracts.js";
 
 function claim(botId: string) {
   return {
@@ -114,5 +122,88 @@ describe("workerRegistrationSchema workspace mapping compatibility", () => {
     expect(workerRegistrationSchema.safeParse(registration).success).toBe(true);
     expect(workerRegistrationSchema.safeParse({ ...registration, workspaceMappingFingerprint: "b".repeat(64) }).success).toBe(true);
     expect(workerRegistrationSchema.safeParse({ ...registration, workspaceMappingFingerprint: "invalid" }).success).toBe(false);
+  });
+});
+
+describe("Thread snapshot summary contracts", () => {
+  const legacyJob = {
+    id: "11111111-1111-4111-8111-111111111111",
+    chatContextId: "22222222-2222-4222-8222-222222222222",
+    threadId: "thread-1",
+    leaseToken: "lease",
+    leaseExpiresAt: new Date().toISOString(),
+    attempt: 1
+  };
+  const legacyTurn = {
+    turnIndex: 0,
+    turnId: "turn-1",
+    status: "completed",
+    startedAt: null,
+    completedAt: null,
+    durationMs: null,
+    error: null,
+    raw: { id: "turn-1" }
+  };
+
+  it("为旧控制面 Claim 提供关闭摘要的默认策略", () => {
+    expect(threadSnapshotJobSchema.parse(legacyJob)).toMatchObject({
+      summaryEnabled: false,
+      summaryModel: null,
+      summaryReasoningEffort: null
+    });
+  });
+
+  it("兼容旧 Runner 回合，并校验摘要元数据必须完整", () => {
+    expect(threadSnapshotTurnSchema.safeParse(legacyTurn).success).toBe(true);
+    expect(threadSnapshotTurnSchema.safeParse({ ...legacyTurn, summary: "修复分页" }).success).toBe(false);
+    expect(threadSnapshotTurnSchema.safeParse({
+      ...legacyTurn,
+      summary: "修复分页",
+      summarySource: "ai",
+      summaryModel: null,
+      summaryGeneratedAt: new Date().toISOString()
+    }).success).toBe(true);
+    expect(threadSnapshotTurnSchema.safeParse({
+      ...legacyTurn,
+      summary: "超过二十四个字符的回合摘要必须被接口契约明确拒绝掉"
+    }).success).toBe(false);
+  });
+
+  it("按 Unicode code point 校验 emoji 摘要长度", () => {
+    const metadata = {
+      summarySource: "ai" as const,
+      summaryModel: "gpt-test",
+      summaryGeneratedAt: new Date().toISOString()
+    };
+    expect(threadSnapshotTurnSchema.safeParse({
+      ...legacyTurn,
+      ...metadata,
+      summary: "😀".repeat(24)
+    }).success).toBe(true);
+    expect(threadSnapshotTurnSchema.safeParse({
+      ...legacyTurn,
+      ...metadata,
+      summary: "😀".repeat(25)
+    }).success).toBe(false);
+    expect(threadSnapshotTurnSummariesPageSchema.safeParse({
+      summaries: [{
+        turnId: "turn-emoji",
+        summary: "🚀".repeat(24),
+        summaryModel: "gpt-test",
+        summaryGeneratedAt: metadata.summaryGeneratedAt
+      }],
+      nextCursor: null
+    }).success).toBe(true);
+  });
+
+  it("摘要复用分页最多返回 50 项", () => {
+    const summary = {
+      turnId: "turn-1",
+      summary: "修复分页",
+      summaryModel: "gpt-test",
+      summaryGeneratedAt: new Date().toISOString()
+    };
+    expect(threadSnapshotTurnSummariesPageSchema.safeParse({ summaries: [summary], nextCursor: null }).success).toBe(true);
+    expect(threadSnapshotTurnSummariesPageSchema.safeParse({ summaries: Array(51).fill(summary), nextCursor: null }).success).toBe(false);
   });
 });

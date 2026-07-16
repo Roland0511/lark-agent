@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
+import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 import type {
   AttentionResult,
   ClaimedTask,
@@ -18,13 +19,159 @@ import { errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-client.js";
-import { CodexAdapter, type CodexThreadHistory } from "./codex-adapter.js";
+import {
+  buildThreadTurnSummaryPrompt,
+  CodexAdapter,
+  MAX_THREAD_SUMMARY_BATCH_TURNS,
+  MAX_THREAD_SUMMARY_PROMPT_BYTES,
+  type CodexThreadHistory,
+  type ThreadTurnSummaryInput
+} from "./codex-adapter.js";
 import { buildUserSkillsReport, isolatedCodexEnvironment, SkillRuntimeError, SkillRuntimeManager } from "./skills.js";
 import { resolveBotWorkspace, resolveChatWorkspace, type BotWorkspace } from "./workspace.js";
 import { attachmentTarget, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
 
+const THREAD_SUMMARY_PROCESS_OVERRIDES = [
+  'sandbox_mode="read-only"',
+  'approval_policy="never"',
+  'web_search="disabled"',
+  "mcp_servers={}",
+  "apps._default.enabled=false",
+  "apps._default.destructive_enabled=false",
+  "apps._default.open_world_enabled=false",
+  "features.apps=false",
+  "features.plugins=false",
+  "features.remote_plugin=false",
+  "features.shell_tool=false",
+  "features.unified_exec=false",
+  "features.multi_agent=false",
+  "features.multi_agent_v2=false",
+  "features.enable_fanout=false",
+  "features.goals=false",
+  "features.browser_use=false",
+  "features.browser_use_external=false",
+  "features.browser_use_full_cdp_access=false",
+  "features.in_app_browser=false",
+  "features.computer_use=false",
+  "features.image_generation=false",
+  "features.hooks=false",
+  "features.code_mode=false",
+  "features.code_mode_host=false",
+  "features.code_mode_only=false",
+  "features.deferred_executor=false",
+  "features.enable_mcp_apps=false",
+  "features.skill_mcp_dependency_install=false",
+  "features.workspace_dependencies=false",
+  "features.tool_suggest=false",
+  "features.auth_elicitation=false",
+  "features.tool_call_mcp_elicitation=false"
+] as const;
+
+const THREAD_SUMMARY_PROCESS_ENVIRONMENT = [
+  "PATH", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+  "LANG", "LC_ALL", "LC_CTYPE", "TERM", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+  "SSL_CERT_FILE", "SSL_CERT_DIR"
+] as const;
+
+export async function prepareThreadSummaryCodexConfig(config: ResolvedWorkerConfig): Promise<ResolvedWorkerConfig> {
+  const summaryHome = join(config.runtimeStateDir, "thread-summary-codex-home");
+  const baseConfig = await readOptionalToml(join(config.codexHome, "config.toml"));
+  const profileConfig = await readOptionalToml(join(config.codexHome, `${config.codexProfile}.config.toml`));
+  const sanitized = {
+    ...threadSummaryConfigWhitelist(baseConfig),
+    ...threadSummaryConfigWhitelist(profileConfig)
+  };
+  if (baseConfig.model_providers && !profileConfig.model_providers) {
+    sanitized.model_providers = baseConfig.model_providers;
+  } else if (baseConfig.model_providers && profileConfig.model_providers &&
+    typeof baseConfig.model_providers === "object" && typeof profileConfig.model_providers === "object") {
+    sanitized.model_providers = {
+      ...(baseConfig.model_providers as Record<string, unknown>),
+      ...(profileConfig.model_providers as Record<string, unknown>)
+    };
+  }
+  if (config.profileModel && sanitized.model === undefined) sanitized.model = config.profileModel;
+  if (config.profileReasoningEffort && sanitized.model_reasoning_effort === undefined) {
+    sanitized.model_reasoning_effort = config.profileReasoningEffort;
+  }
+
+  const auth = await readOptionalFile(join(config.codexHome, "auth.json"));
+  let catalog: Buffer | null = null;
+  if (typeof sanitized.model_catalog_json === "string" && sanitized.model_catalog_json.trim()) {
+    const catalogSource = isAbsolute(sanitized.model_catalog_json)
+      ? sanitized.model_catalog_json
+      : join(config.codexHome, sanitized.model_catalog_json);
+    catalog = await readFile(catalogSource);
+    sanitized.model_catalog_json = join(summaryHome, "model-catalog.json");
+  }
+
+  await rm(summaryHome, { recursive: true, force: true });
+  await mkdir(summaryHome, { recursive: true, mode: 0o700 });
+  await chmod(summaryHome, 0o700);
+  if (auth) {
+    const authTarget = join(summaryHome, "auth.json");
+    await writeFile(authTarget, auth, { mode: 0o600 });
+    await chmod(authTarget, 0o600);
+  }
+  if (catalog) {
+    const catalogTarget = join(summaryHome, "model-catalog.json");
+    await writeFile(catalogTarget, catalog, { mode: 0o600 });
+    await chmod(catalogTarget, 0o600);
+  }
+  const configTarget = join(summaryHome, "config.toml");
+  await writeFile(configTarget, stringifyToml(sanitized), { mode: 0o600 });
+  await chmod(configTarget, 0o600);
+
+  return {
+    ...config,
+    codexHome: summaryHome,
+    profileOverrides: [...THREAD_SUMMARY_PROCESS_OVERRIDES]
+  };
+}
+
+function threadSummaryConfigWhitelist(source: Record<string, unknown>): Record<string, unknown> {
+  const allowed = new Set([
+    "model",
+    "model_provider",
+    "model_providers",
+    "model_reasoning_effort",
+    "service_tier",
+    "forced_login_method",
+    "forced_chatgpt_workspace_id",
+    "model_catalog_json"
+  ]);
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    if (allowed.has(key)) sanitized[key] = value;
+  }
+  return sanitized;
+}
+
+async function readOptionalToml(path: string): Promise<Record<string, unknown>> {
+  const content = await readOptionalFile(path);
+  return content ? parseToml(content.toString("utf8")) as Record<string, unknown> : {};
+}
+
+async function readOptionalFile(path: string): Promise<Buffer | null> {
+  try {
+    return await readFile(path);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function threadSummaryProcessEnvironment(home: string): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = { HOME: home };
+  for (const name of THREAD_SUMMARY_PROCESS_ENVIRONMENT) {
+    if (process.env[name] !== undefined) environment[name] = process.env[name];
+  }
+  return environment;
+}
+
 export interface TaskProcessorStartupOptions {
   log?: (message: string) => void;
+  summaryTimeoutMs?: number;
 }
 
 export class TaskProcessor {
@@ -45,6 +192,8 @@ export class TaskProcessor {
   private compactionChain: Promise<void> = Promise.resolve();
   private latestTokenUsage: Record<string, number> | null = null;
   private codex: CodexAdapter;
+  private summaryCodex: CodexAdapter | null = null;
+  private summaryCodexGeneration = 0;
   private taskCodex: CodexAdapter | null = null;
   private readonly skillRuntime: SkillRuntimeManager;
   private userSkillTimer: NodeJS.Timeout | null = null;
@@ -86,6 +235,7 @@ export class TaskProcessor {
     this.startupLog("Codex App Server: starting");
     await this.codex.start();
     this.startupLog("Codex App Server: ready");
+    this.startupLog("Thread summary App Server: deferred until snapshot refresh");
     this.startupLog("user skill inventory: scanning");
     let userSkillsReady = true;
     await this.refreshUserSkills().catch((error) => {
@@ -111,6 +261,7 @@ export class TaskProcessor {
     this.userSkillTimer = null;
     await this.taskCodex?.stop().catch(() => undefined);
     this.taskCodex = null;
+    await this.summaryCodex?.stop().catch(() => undefined);
     await this.codex.stop();
   }
 
@@ -201,7 +352,11 @@ export class TaskProcessor {
         });
       }, 20_000);
       heartbeatTimer.unref();
-      const history = await this.codex.readThreadHistory(job.threadId, this.config.supportsThreadItemsList);
+      const rawHistory = await this.codex.readThreadHistory(job.threadId, this.config.supportsThreadItemsList);
+      assertLease();
+      const history = job.summaryEnabled
+        ? await this.attachThreadTurnSummaries(job, rawHistory, assertLease)
+        : rawHistory;
       assertLease();
       for (const chunk of buildThreadSnapshotChunks(history)) {
         await this.client.uploadThreadSnapshotChunk(job, chunk);
@@ -223,6 +378,129 @@ export class TaskProcessor {
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       this.threadSnapshotBusy = false;
+    }
+  }
+
+  private async attachThreadTurnSummaries(
+    job: ThreadSnapshotJob,
+    history: CodexThreadHistory,
+    assertLease: () => void
+  ): Promise<CodexThreadHistory> {
+    const generatedAt = () => new Date().toISOString();
+    const effectiveSummaryModel = this.observedModelPolicy(job.summaryModel, job.summaryReasoningEffort).model;
+    const summaries = new Map<string, Pick<ThreadSnapshotTurn, "summary" | "summarySource" | "summaryModel" | "summaryGeneratedAt">>();
+    try {
+      for (const previous of await this.client.previousThreadTurnSummaries(job)) {
+        summaries.set(previous.turnId, {
+          summary: previous.summary,
+          summarySource: "ai",
+          summaryModel: previous.summaryModel,
+          summaryGeneratedAt: previous.summaryGeneratedAt ?? generatedAt()
+        });
+      }
+    } catch (error) {
+      process.stderr.write(`thread summary reuse unavailable; using fresh summaries: ${this.safeErrorSummary(error)}\n`);
+    }
+    assertLease();
+
+    const pending = history.turns
+      .filter((turn) => !summaries.has(turn.turnId))
+      .map((turn) => threadTurnSummaryInput(turn.turnId, history.items));
+    const withMessages = pending.filter((turn) => turn.messages.length > 0);
+    for (const turn of pending.filter((entry) => entry.messages.length === 0)) {
+      summaries.set(turn.turnId, fallbackThreadTurnSummary(turn, generatedAt()));
+    }
+
+    const summaryPlan = buildThreadSummaryBatchPlan(withMessages);
+    for (const turn of summaryPlan.oversized) {
+      summaries.set(turn.turnId, fallbackThreadTurnSummary(turn, generatedAt()));
+    }
+    for (const batch of summaryPlan.batches) {
+      assertLease();
+      try {
+        const result = await this.summarizeThreadBatch(job, batch);
+        const batchGeneratedAt = generatedAt();
+        for (const entry of result) {
+          summaries.set(entry.turnId, {
+            summary: entry.summary,
+            summarySource: "ai",
+            summaryModel: effectiveSummaryModel,
+            summaryGeneratedAt: batchGeneratedAt
+          });
+        }
+      } catch (error) {
+        process.stderr.write(`thread summary generation failed; using visible-message fallback: ${this.safeErrorSummary(error)}\n`);
+        const fallbackGeneratedAt = generatedAt();
+        for (const turn of batch) summaries.set(turn.turnId, fallbackThreadTurnSummary(turn, fallbackGeneratedAt));
+      }
+      assertLease();
+    }
+
+    return {
+      ...history,
+      turns: history.turns.map((turn) => ({ ...turn, ...summaries.get(turn.turnId) }))
+    };
+  }
+
+  private async summarizeThreadBatch(job: ThreadSnapshotJob, batch: ThreadTurnSummaryInput[]) {
+    const timeoutMs = this.startupOptions.summaryTimeoutMs ?? 45_000;
+    const timeoutError = new Error(`thread summary batch timed out after ${timeoutMs} ms`);
+    let timeout: NodeJS.Timeout | null = null;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(timeoutError), timeoutMs);
+    });
+    const operation = (async () => {
+      const adapter = await this.ensureSummaryCodex();
+      return adapter.summarizeThreadTurns(this.attentionWorkspace, batch, {
+        model: job.summaryModel,
+        effort: job.summaryReasoningEffort
+      });
+    })();
+    try {
+      return await Promise.race([operation, deadline]);
+    } catch (error) {
+      if (error === timeoutError) {
+        this.summaryCodexGeneration += 1;
+        this.summaryCodex?.abort(timeoutError);
+      }
+      throw error;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private async ensureSummaryCodex(): Promise<CodexAdapter> {
+    const generation = this.summaryCodexGeneration;
+    let adapter = this.summaryCodex;
+    if (!adapter) {
+      const summaryConfig = await prepareThreadSummaryCodexConfig(this.config);
+      if (generation !== this.summaryCodexGeneration) throw new Error("thread summary startup was abandoned");
+      adapter = new CodexAdapter(
+        summaryConfig,
+        async () => "decline",
+        undefined,
+        undefined,
+        undefined,
+        {
+          environment: threadSummaryProcessEnvironment(summaryConfig.codexHome),
+          shellEnvironmentAllowlist: [],
+          ...(this.startupOptions.summaryTimeoutMs !== undefined
+            ? { summaryTimeoutMs: this.startupOptions.summaryTimeoutMs }
+            : {})
+        }
+      );
+      this.summaryCodex = adapter;
+    }
+    try {
+      await adapter.start();
+      if (generation !== this.summaryCodexGeneration) {
+        adapter.abort(new Error("thread summary startup was abandoned"));
+        throw new Error("thread summary startup was abandoned");
+      }
+      return adapter;
+    } catch (error) {
+      await adapter.stop().catch(() => undefined);
+      throw error;
     }
   }
 
@@ -949,6 +1227,130 @@ interface CodexCompactionAudit {
 }
 
 const MAX_THREAD_SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
+const MAX_THREAD_SUMMARY_MESSAGES = 8;
+const MAX_THREAD_SUMMARY_MESSAGE_BYTES = 4 * 1024;
+
+export function threadTurnSummaryInput(turnId: string, items: CodexThreadHistory["items"]): ThreadTurnSummaryInput {
+  const visible = items
+    .filter((item) => item.turnId === turnId && ["userMessage", "agentMessage", "collabAgentToolCall"].includes(item.itemType))
+    .flatMap((item): ThreadTurnSummaryInput["messages"] => {
+      const raw = item.raw;
+      if (item.itemType === "userMessage") {
+        const fullText = textFromThreadValue(raw.content ?? raw.text);
+        const signal = extractVisibleThreadSignal(fullText);
+        const text = truncateUtf8((signal?.text ?? fullText).trim(), MAX_THREAD_SUMMARY_MESSAGE_BYTES);
+        if (!text) return [];
+        return [{
+          speaker: signal?.senderType === "bot" ? "other_agent" : "user",
+          speakerName: signal?.senderType === "bot" ? signal.senderName || "其它 Agent" : "用户",
+          text
+        }];
+      }
+      if (item.itemType === "collabAgentToolCall") {
+        const text = truncateUtf8(textFromThreadValue(raw.result ?? raw.text ?? raw.content ?? raw.prompt).trim(), MAX_THREAD_SUMMARY_MESSAGE_BYTES);
+        if (!text) return [];
+        return [{
+          speaker: "other_agent",
+          speakerName: String(raw.senderName ?? raw.agentName ?? "协作 Agent"),
+          text
+        }];
+      }
+      const rawText = textFromThreadValue(raw.text ?? raw.content);
+      const text = truncateUtf8(agentVisibleReply(rawText).trim(), MAX_THREAD_SUMMARY_MESSAGE_BYTES);
+      return text ? [{ speaker: "agent", speakerName: "本 Agent", text }] : [];
+    });
+  if (visible.length <= MAX_THREAD_SUMMARY_MESSAGES) return { turnId, messages: visible };
+  const leading = visible.slice(0, Math.ceil(MAX_THREAD_SUMMARY_MESSAGES / 2));
+  const trailing = visible.slice(-(MAX_THREAD_SUMMARY_MESSAGES - leading.length));
+  return { turnId, messages: [...leading, ...trailing] };
+}
+
+export function buildThreadSummaryBatches(turns: ThreadTurnSummaryInput[]): ThreadTurnSummaryInput[][] {
+  return buildThreadSummaryBatchPlan(turns).batches;
+}
+
+export function buildThreadSummaryBatchPlan(turns: ThreadTurnSummaryInput[]): {
+  batches: ThreadTurnSummaryInput[][];
+  oversized: ThreadTurnSummaryInput[];
+} {
+  const batches: ThreadTurnSummaryInput[][] = [];
+  const oversized: ThreadTurnSummaryInput[] = [];
+  let current: ThreadTurnSummaryInput[] = [];
+  for (const turn of turns) {
+    if (Buffer.byteLength(buildThreadTurnSummaryPrompt([turn]), "utf8") > MAX_THREAD_SUMMARY_PROMPT_BYTES) {
+      if (current.length) batches.push(current);
+      current = [];
+      oversized.push(turn);
+      continue;
+    }
+    const candidate = [...current, turn];
+    if (candidate.length > MAX_THREAD_SUMMARY_BATCH_TURNS || Buffer.byteLength(buildThreadTurnSummaryPrompt(candidate), "utf8") > MAX_THREAD_SUMMARY_PROMPT_BYTES) {
+      if (current.length) batches.push(current);
+      current = [turn];
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length) batches.push(current);
+  return { batches, oversized };
+}
+
+export function fallbackThreadTurnSummary(
+  turn: ThreadTurnSummaryInput,
+  generatedAt = new Date().toISOString()
+): Pick<ThreadSnapshotTurn, "summary" | "summarySource" | "summaryModel" | "summaryGeneratedAt"> {
+  const first = turn.messages[0]?.text ?? "本轮执行记录";
+  const normalized = first
+    .replace(/```[\s\S]*?```/gu, "代码内容")
+    .replace(/^[\s#>*_`\-—:：]+/gu, "")
+    .replace(/\s+/gu, " ")
+    .trim();
+  const characters = [...(normalized || "本轮执行记录")];
+  const summary = characters.length === 1 ? `${characters[0]}相关` : characters.slice(0, 24).join("");
+  return { summary, summarySource: "fallback", summaryModel: null, summaryGeneratedAt: generatedAt };
+}
+
+function extractVisibleThreadSignal(text: string): { senderType: "user" | "bot"; senderName: string; text: string } | null {
+  const matches = [...text.matchAll(/^\s*-\s*\[(user|bot):([^|\]]+)(?:\|[^\]]*)?\]\s*(.*)$/gmu)];
+  const match = matches.at(-1);
+  if (!match) return null;
+  return {
+    senderType: match[1] as "user" | "bot",
+    senderName: match[2]?.trim() ?? "",
+    text: match[3]?.trim() ?? ""
+  };
+}
+
+function agentVisibleReply(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    return textFromThreadValue(parsed.reply ?? parsed.output ?? parsed.text) || text;
+  } catch {
+    return text;
+  }
+}
+
+function textFromThreadValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(textFromThreadValue).filter(Boolean).join("\n");
+  if (!value || typeof value !== "object") return "";
+  const record = value as Record<string, unknown>;
+  for (const key of ["text", "content", "reply", "output"]) {
+    const text = textFromThreadValue(record[key]);
+    if (text) return text;
+  }
+  return "";
+}
+
+function truncateUtf8(value: string, maximumBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maximumBytes) return value;
+  let result = "";
+  for (const character of value) {
+    if (Buffer.byteLength(`${result}${character}…`, "utf8") > maximumBytes) break;
+    result += character;
+  }
+  return `${result}…`;
+}
 
 export function buildThreadSnapshotChunks(history: Pick<CodexThreadHistory, "turns" | "items">): ThreadSnapshotChunk[] {
   const turns: ThreadSnapshotTurn[] = history.turns.map((turn) => ({ ...turn }));

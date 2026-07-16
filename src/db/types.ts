@@ -120,6 +120,10 @@ export interface ChatThreadSnapshotTurnsTable {
   duration_ms: number | null;
   error: Json | null;
   raw_turn: Json;
+  summary: string | null;
+  summary_source: "ai" | "fallback" | null;
+  summary_model: string | null;
+  summary_generated_at: NullableTimestamp;
 }
 
 export interface ChatThreadSnapshotItemsTable {

@@ -2,7 +2,7 @@ import { lstat, mkdtemp, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { ClaimedTask, Signal } from "../shared/contracts.js";
+import type { ClaimedTask, Signal, ThreadSnapshotJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-client.js";
 
@@ -148,6 +148,38 @@ describe("ControlPlaneClient workspace runtime sync protocol", () => {
     expect(fetchMock.mock.calls[3]?.[0]).toBe(`https://agent.example.test/v1/workers/runtime-sync-jobs/${job.id}/result`);
     expect(new Headers(resultRequest.headers).get("x-sync-lease-token")).toBe("sync-lease");
     expect(JSON.parse(String(resultRequest.body))).toMatchObject({ desiredFingerprint: job.desiredFingerprint });
+  });
+});
+
+describe("ControlPlaneClient thread summary reuse protocol", () => {
+  it("paginates previous AI summaries under the snapshot lease", async () => {
+    const job = {
+      id: "99999999-9999-4999-8999-999999999999",
+      chatContextId: "88888888-8888-4888-8888-888888888888",
+      threadId: "thread-fixed",
+      leaseToken: "summary-lease",
+      leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      attempt: 1,
+      summaryEnabled: true,
+      summaryModel: "summary-model",
+      summaryReasoningEffort: "medium"
+    } satisfies ThreadSnapshotJob;
+    const first = { turnId: "turn-1", summary: "第一轮摘要", summaryModel: "summary-model", summaryGeneratedAt: "2026-07-16T00:00:00.000Z" };
+    const second = { turnId: "turn-2", summary: "第二轮摘要", summaryModel: null, summaryGeneratedAt: "2026-07-16T00:01:00.000Z" };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sessionResponse())
+      .mockResolvedValueOnce(Response.json({ summaries: [first], nextCursor: "cursor-2" }))
+      .mockResolvedValueOnce(Response.json({ summaries: [second], nextCursor: null }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ControlPlaneClient(config);
+    await client.createSession();
+
+    await expect(client.previousThreadTurnSummaries(job)).resolves.toEqual([first, second]);
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(`https://agent.example.test/v1/workers/thread-snapshot-jobs/${job.id}/turn-summaries?limit=50`);
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(`https://agent.example.test/v1/workers/thread-snapshot-jobs/${job.id}/turn-summaries?limit=50&before=cursor-2`);
+    for (const call of fetchMock.mock.calls.slice(1)) {
+      expect(new Headers((call[1] as RequestInit).headers).get("x-snapshot-lease-token")).toBe("summary-lease");
+    }
   });
 });
 

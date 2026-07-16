@@ -284,9 +284,20 @@ export const threadSnapshotJobSchema = z.object({
   threadId: z.string().min(1).max(256),
   leaseToken: z.string().min(1),
   leaseExpiresAt: z.string().datetime(),
-  attempt: z.number().int().positive()
+  attempt: z.number().int().positive(),
+  summaryEnabled: z.boolean().default(false),
+  summaryModel: z.string().min(1).max(256).nullable().default(null),
+  summaryReasoningEffort: z.string().min(1).max(32).nullable().default(null)
 });
 export type ThreadSnapshotJob = z.infer<typeof threadSnapshotJobSchema>;
+
+export const threadSnapshotSummarySourceSchema = z.enum(["ai", "fallback"]);
+export type ThreadSnapshotSummarySource = z.infer<typeof threadSnapshotSummarySourceSchema>;
+
+const persistedThreadTurnSummarySchema = z.string().trim().refine((value) => {
+  const length = [...value].length;
+  return length >= 1 && length <= 24;
+}, "回合摘要必须包含 1-24 个 Unicode code point");
 
 export const threadSnapshotTurnSchema = z.object({
   turnIndex: z.number().int().nonnegative(),
@@ -296,9 +307,35 @@ export const threadSnapshotTurnSchema = z.object({
   completedAt: z.number().int().nullable(),
   durationMs: z.number().int().nonnegative().nullable(),
   error: z.unknown().nullable(),
-  raw: z.unknown()
+  raw: z.unknown(),
+  summary: persistedThreadTurnSummarySchema.nullable().optional(),
+  summarySource: threadSnapshotSummarySourceSchema.nullable().optional(),
+  summaryModel: z.string().min(1).max(256).nullable().optional(),
+  summaryGeneratedAt: z.string().datetime().nullable().optional()
+}).superRefine((turn, context) => {
+  const hasSummary = turn.summary !== undefined && turn.summary !== null;
+  const hasMetadata = turn.summarySource != null || turn.summaryModel != null || turn.summaryGeneratedAt != null;
+  if (hasSummary && (turn.summarySource == null || turn.summaryGeneratedAt == null)) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "回合摘要必须包含来源和生成时间" });
+  } else if (!hasSummary && hasMetadata) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "无摘要时不得携带摘要元数据" });
+  }
 });
 export type ThreadSnapshotTurn = z.infer<typeof threadSnapshotTurnSchema>;
+
+export const threadSnapshotTurnSummarySchema = z.object({
+  turnId: z.string().min(1).max(256),
+  summary: persistedThreadTurnSummarySchema,
+  summaryModel: z.string().min(1).max(256).nullable(),
+  summaryGeneratedAt: z.string().datetime()
+});
+export type ThreadSnapshotTurnSummary = z.infer<typeof threadSnapshotTurnSummarySchema>;
+
+export const threadSnapshotTurnSummariesPageSchema = z.object({
+  summaries: z.array(threadSnapshotTurnSummarySchema).max(50),
+  nextCursor: z.string().max(128).nullable()
+});
+export type ThreadSnapshotTurnSummariesPage = z.infer<typeof threadSnapshotTurnSummariesPageSchema>;
 
 export const threadSnapshotItemSchema = z.object({
   ordinal: z.number().int().nonnegative(),

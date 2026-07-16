@@ -1,11 +1,23 @@
-import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, realpath, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
-import type { ClaimedTask, Signal, ThreadSnapshotJob, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
+import { parse as parseToml } from "smol-toml";
+import { threadSnapshotChunkSchema, type ClaimedTask, type Signal, type ThreadSnapshotJob, type WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, type ControlPlaneClient } from "./control-plane-client.js";
-import { buildTaskPrompt, buildThreadSnapshotChunks, codexCompactionFromActivity, shouldMergeCausalBotRevision, TaskProcessor } from "./processor.js";
+import {
+  buildTaskPrompt,
+  buildThreadSnapshotChunks,
+  buildThreadSummaryBatchPlan,
+  buildThreadSummaryBatches,
+  codexCompactionFromActivity,
+  fallbackThreadTurnSummary,
+  prepareThreadSummaryCodexConfig,
+  shouldMergeCausalBotRevision,
+  TaskProcessor,
+  threadTurnSummaryInput
+} from "./processor.js";
 
 function startupProcessor(listSkills: () => Promise<never[]> = async () => []) {
   const logs: string[] = [];
@@ -22,15 +34,21 @@ function startupProcessor(listSkills: () => Promise<never[]> = async () => []) {
     stop: vi.fn(async () => undefined),
     listSkills: vi.fn(listSkills)
   };
+  const summaryCodex = {
+    start: vi.fn(async () => undefined),
+    stop: vi.fn(async () => undefined)
+  };
   (processor as unknown as { codex: typeof codex }).codex = codex;
-  return { processor, codex, logs };
+  (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+  return { processor, codex, summaryCodex, logs };
 }
 
 describe("TaskProcessor startup", () => {
   it("skips global attachment cleanup and continues to Codex startup", async () => {
-    const { processor, codex, logs } = startupProcessor();
+    const { processor, codex, summaryCodex, logs } = startupProcessor();
     await processor.start();
     expect(codex.start).toHaveBeenCalledOnce();
+    expect(summaryCodex.start).not.toHaveBeenCalled();
     expect(logs).toContain("global attachment cleanup: skipped; deferred to maintenance");
     await processor.stop();
   });
@@ -40,6 +58,7 @@ describe("TaskProcessor startup", () => {
     await processor.start();
     expect(logs).toContain("attention workspace: ready");
     expect(logs).toContain("Codex App Server: ready");
+    expect(logs).toContain("Thread summary App Server: deferred until snapshot refresh");
     expect(logs).toContain("user skill inventory: ready");
     await processor.stop();
   });
@@ -56,6 +75,74 @@ describe("TaskProcessor startup", () => {
     } finally {
       stderr.mockRestore();
     }
+  });
+});
+
+describe("thread summary Codex isolation", () => {
+  it("derives a private home with only authentication and model/provider configuration", async () => {
+    const root = await mkdtemp(join(tmpdir(), "thread-summary-home-"));
+    const codexHome = join(root, "source-home");
+    const runtimeStateDir = join(root, "state");
+    await mkdir(codexHome, { recursive: true });
+    await mkdir(runtimeStateDir, { recursive: true });
+    const catalogPath = join(codexHome, "catalog.json");
+    await writeFile(join(codexHome, "auth.json"), JSON.stringify({ token: "auth-secret" }), { mode: 0o644 });
+    await writeFile(catalogPath, JSON.stringify({ models: [{ slug: "summary-model" }] }));
+    await writeFile(join(codexHome, "config.toml"), [
+      'model = "base-model"',
+      'sandbox_mode = "danger-full-access"',
+      'approval_policy = "never"',
+      `model_catalog_json = ${JSON.stringify(catalogPath)}`,
+      '[model_providers.safe]',
+      'name = "Safe provider"',
+      'base_url = "https://provider.invalid/v1"',
+      'experimental_bearer_token = "provider-secret"',
+      '[mcp_servers.unsafe]',
+      'command = "unsafe-tool"',
+      '[plugins.unsafe]',
+      'enabled = true'
+    ].join("\n"));
+    await writeFile(join(codexHome, "safe.config.toml"), [
+      'model = "summary-model"',
+      'model_provider = "safe"',
+      'model_reasoning_effort = "medium"',
+      '[features]',
+      'shell_tool = true',
+      'plugins = true'
+    ].join("\n"));
+
+    const resolved = await prepareThreadSummaryCodexConfig({
+      codexHome,
+      codexProfile: "safe",
+      runtimeStateDir,
+      profileOverrides: ['features.shell_tool=true'],
+      profileModel: "summary-model",
+      profileReasoningEffort: "medium"
+    } as ResolvedWorkerConfig);
+
+    const generated = parseToml(await readFile(join(resolved.codexHome, "config.toml"), "utf8")) as Record<string, unknown>;
+    expect(generated).toEqual({
+      model: "summary-model",
+      model_provider: "safe",
+      model_reasoning_effort: "medium",
+      model_catalog_json: join(resolved.codexHome, "model-catalog.json"),
+      model_providers: {
+        safe: {
+          name: "Safe provider",
+          base_url: "https://provider.invalid/v1",
+          experimental_bearer_token: "provider-secret"
+        }
+      }
+    });
+    expect(await readFile(join(resolved.codexHome, "auth.json"), "utf8")).toBe(JSON.stringify({ token: "auth-secret" }));
+    expect(await readFile(join(resolved.codexHome, "model-catalog.json"), "utf8")).toBe(await readFile(catalogPath, "utf8"));
+    expect((await stat(resolved.codexHome)).mode & 0o777).toBe(0o700);
+    expect((await stat(join(resolved.codexHome, "auth.json"))).mode & 0o777).toBe(0o600);
+    expect((await stat(join(resolved.codexHome, "config.toml"))).mode & 0o777).toBe(0o600);
+    expect(resolved.profileOverrides).toContain("features.shell_tool=false");
+    expect(resolved.profileOverrides).toContain("features.plugins=false");
+    expect(resolved.profileOverrides).not.toContain("features.shell_tool=true");
+    expect(JSON.stringify(generated)).not.toContain("unsafe-tool");
   });
 });
 
@@ -244,7 +331,10 @@ describe("TaskProcessor Thread snapshots", () => {
     threadId: "thread-fixed",
     leaseToken: "snapshot-lease",
     leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
-    attempt: 1
+    attempt: 1,
+    summaryEnabled: false,
+    summaryModel: null,
+    summaryReasoningEffort: null
   });
 
   it("uploads bounded chunks, excludes snapshot work from idle state, and completes without starting a turn", async () => {
@@ -312,6 +402,367 @@ describe("TaskProcessor Thread snapshots", () => {
     expect(() => buildThreadSnapshotChunks({ turns: [], items: [{
       ordinal: 0, turnId: null, itemIndex: null, itemId: "huge", itemType: "unknown", raw: { payload: "x".repeat(4 * 1024 * 1024) }
     }] })).toThrow(/未截断快照内容/);
+  });
+
+  it("reuses AI summaries, summarizes only visible messages, and falls back without failing the snapshot", async () => {
+    const uploaded: Array<{ turns: Array<Record<string, unknown>>; items: unknown[] }> = [];
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => [{
+        turnId: "turn-0", summary: "已有摘要", summaryModel: "older-model", summaryGeneratedAt: "2026-07-15T00:00:00.000Z"
+      }]),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: Array<Record<string, unknown>>; items: unknown[] }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client);
+    const history = {
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+      turns: ["turn-0", "turn-1", "turn-2"].map((turnId, turnIndex) => ({
+        turnIndex, turnId, status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: { id: turnId }
+      })),
+      items: [
+        { ordinal: 0, turnId: "turn-0", itemIndex: 0, itemId: "old", itemType: "userMessage", raw: { content: [{ type: "text", text: "旧消息" }] } },
+        { ordinal: 1, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { content: [{ type: "text", text: "飞书信号：\n- [bot:协作助手|member|depth=1] 请完成部署回测" }] } },
+        { ordinal: 2, turnId: "turn-1", itemIndex: 1, itemId: "reason", itemType: "reasoning", raw: { summary: ["隐藏推理不得提交"] } },
+        { ordinal: 3, turnId: "turn-1", itemIndex: 2, itemId: "agent", itemType: "agentMessage", raw: { text: JSON.stringify({ reply: "部署回测完成", rationale: "内部原因" }) } },
+        { ordinal: 4, turnId: "turn-2", itemIndex: 0, itemId: "command", itemType: "commandExecution", raw: { command: "secret-command" } }
+      ]
+    };
+    const codex = { readThreadHistory: vi.fn(async () => history) };
+    const summaryCodex = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      summarizeThreadTurns: vi.fn(async (_cwd, turns) => turns.map((turn) => ({ turnId: turn.turnId, summary: "完成部署回测" })))
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await processor.processThreadSnapshot({
+      ...snapshotJob(), summaryEnabled: true, summaryModel: "summary-model", summaryReasoningEffort: "medium"
+    });
+
+    expect(summaryCodex.summarizeThreadTurns).toHaveBeenCalledTimes(1);
+    const summaryInputs = summaryCodex.summarizeThreadTurns.mock.calls[0]?.[1];
+    expect(summaryInputs).toEqual([{
+      turnId: "turn-1",
+      messages: [
+        { speaker: "other_agent", speakerName: "协作助手", text: "请完成部署回测" },
+        { speaker: "agent", speakerName: "本 Agent", text: "部署回测完成" }
+      ]
+    }]);
+    expect(JSON.stringify(summaryInputs)).not.toContain("隐藏推理");
+    expect(JSON.stringify(summaryInputs)).not.toContain("secret-command");
+    const turns = uploaded.flatMap((chunk) => chunk.turns);
+    expect(turns).toEqual([
+      expect.objectContaining({ turnId: "turn-0", summary: "已有摘要", summarySource: "ai", summaryModel: "older-model", summaryGeneratedAt: "2026-07-15T00:00:00.000Z" }),
+      expect.objectContaining({ turnId: "turn-1", summary: "完成部署回测", summarySource: "ai", summaryModel: "summary-model" }),
+      expect.objectContaining({ turnId: "turn-2", summary: "本轮执行记录", summarySource: "fallback", summaryModel: null })
+    ]);
+    expect(client.completeThreadSnapshot).toHaveBeenCalledOnce();
+    expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("never starts a Turn on the original Thread while generating summaries", async () => {
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async () => undefined),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client);
+    const codex = {
+      readThreadHistory: vi.fn(async () => ({
+        thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+        turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: {} }],
+        items: [{ ordinal: 0, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "只读原 Thread" } }]
+      })),
+      startEphemeralThread: vi.fn(),
+      runTurn: vi.fn()
+    };
+    const summaryCodex = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      summarizeThreadTurns: vi.fn(async () => [{ turnId: "turn-1", summary: "只读快照摘要" }])
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true });
+
+    expect(codex.readThreadHistory).toHaveBeenCalledWith("thread-fixed", false);
+    expect(codex.startEphemeralThread).not.toHaveBeenCalled();
+    expect(codex.runTurn).not.toHaveBeenCalled();
+    expect(summaryCodex.summarizeThreadTurns).toHaveBeenCalledOnce();
+    expect(client.completeThreadSnapshot).toHaveBeenCalledOnce();
+  });
+
+  it("renews the snapshot lease while a summary batch crosses the heartbeat interval", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-16T08:00:00.000Z"));
+    let summaryStarted!: () => void;
+    const started = new Promise<void>((resolve) => { summaryStarted = resolve; });
+    let releaseSummary!: () => void;
+    const summaryResult = new Promise<Array<{ turnId: string; summary: string }>>((resolve) => {
+      releaseSummary = () => resolve([{ turnId: "turn-1", summary: "续租期间生成摘要" }]);
+    });
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async () => undefined),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client);
+    const codex = { readThreadHistory: vi.fn(async () => ({
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+      turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: {} }],
+      items: [{ ordinal: 0, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "等待慢摘要" } }]
+    })) };
+    const summaryCodex = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      summarizeThreadTurns: vi.fn(() => {
+        summaryStarted();
+        return summaryResult;
+      })
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    try {
+      const running = processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true });
+      await started;
+      expect(client.heartbeatThreadSnapshot).toHaveBeenCalledTimes(1);
+
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(client.heartbeatThreadSnapshot).toHaveBeenCalledTimes(2);
+
+      releaseSummary();
+      await running;
+      expect(client.completeThreadSnapshot).toHaveBeenCalledOnce();
+      expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("falls back for an entire failed AI batch and retries fallback summaries on the next refresh", async () => {
+    const uploaded: Array<{ turns: Array<Record<string, unknown>> }> = [];
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: Array<Record<string, unknown>> }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({ workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp" } as ResolvedWorkerConfig, client);
+    const codex = {
+      readThreadHistory: vi.fn(async () => ({
+        thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+        turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: {} }],
+        items: [{ ordinal: 0, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "重新生成摘要" } }]
+      }))
+    };
+    const summaryCodex = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      summarizeThreadTurns: vi.fn(async () => { throw new Error("summary unavailable"); })
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await expect(processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true })).resolves.toBeUndefined();
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toEqual([
+      expect.objectContaining({ turnId: "turn-1", summary: "重新生成摘要", summarySource: "fallback" })
+    ]);
+    expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+    expect(client.previousThreadTurnSummaries).toHaveBeenCalledOnce();
+  });
+
+  it("bounds a hung summary App Server initialize, falls back, and retries next refresh", async () => {
+    const uploaded: Array<{ turns: Array<Record<string, unknown>> }> = [];
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: Array<Record<string, unknown>> }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const history = {
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+      turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: {} }],
+      items: [{ ordinal: 0, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "隔离进程重试" } }]
+    };
+    const codex = { readThreadHistory: vi.fn(async () => history) };
+    const summaryCodex = {
+      start: vi.fn()
+        .mockImplementationOnce(() => new Promise<void>(() => undefined))
+        .mockResolvedValue(undefined),
+      stop: vi.fn(async () => undefined),
+      abort: vi.fn(),
+      summarizeThreadTurns: vi.fn(async () => [{ turnId: "turn-1", summary: "隔离进程恢复" }])
+    };
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client, { summaryTimeoutMs: 20 });
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await expect(processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true })).resolves.toBeUndefined();
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toEqual([
+      expect.objectContaining({ turnId: "turn-1", summary: "隔离进程重试", summarySource: "fallback" })
+    ]);
+    expect(summaryCodex.summarizeThreadTurns).not.toHaveBeenCalled();
+    expect(summaryCodex.abort).toHaveBeenCalledWith(expect.objectContaining({ message: expect.stringContaining("timed out") }));
+    expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+
+    uploaded.length = 0;
+    await expect(processor.processThreadSnapshot({ ...snapshotJob(), id: "33333333-3333-4333-8333-333333333333", summaryEnabled: true })).resolves.toBeUndefined();
+    expect(summaryCodex.start).toHaveBeenCalledTimes(2);
+    expect(summaryCodex.summarizeThreadTurns).toHaveBeenCalledOnce();
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toEqual([
+      expect.objectContaining({ turnId: "turn-1", summary: "隔离进程恢复", summarySource: "ai" })
+    ]);
+  });
+
+  it("applies one deadline across summary process startup and generation", async () => {
+    const uploaded: Array<{ turns: Array<Record<string, unknown>> }> = [];
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: Array<Record<string, unknown>> }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client, { summaryTimeoutMs: 45 });
+    const codex = { readThreadHistory: vi.fn(async () => ({
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+      turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: {} }],
+      items: [{ ordinal: 0, turnId: "turn-1", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "整批截止时间" } }]
+    })) };
+    const summaryCodex = {
+      start: vi.fn(async () => { await new Promise((resolve) => setTimeout(resolve, 30)); }),
+      stop: vi.fn(async () => undefined),
+      abort: vi.fn(),
+      summarizeThreadTurns: vi.fn(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return [{ turnId: "turn-1", summary: "不应采用的迟到摘要" }];
+      })
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await expect(processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true })).resolves.toBeUndefined();
+    expect(summaryCodex.abort).toHaveBeenCalledOnce();
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toEqual([
+      expect.objectContaining({ turnId: "turn-1", summary: "整批截止时间", summarySource: "fallback" })
+    ]);
+  });
+
+  it("falls back only the turn whose JSON-encoded summary input exceeds 48 KiB", async () => {
+    const uploaded: Array<{ turns: Array<Record<string, unknown>> }> = [];
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      previousThreadTurnSummaries: vi.fn(async () => []),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: Array<Record<string, unknown>> }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], runtimeStateDir: "/tmp", supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client);
+    const escaped = "\\".repeat(4 * 1024);
+    const history = {
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const,
+      turns: ["turn-oversized", "turn-normal"].map((turnId, turnIndex) => ({
+        turnIndex, turnId, status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: { id: turnId }
+      })),
+      items: [
+        ...Array.from({ length: 8 }, (_, itemIndex) => ({
+          ordinal: itemIndex, turnId: "turn-oversized", itemIndex, itemId: `escaped-${itemIndex}`,
+          itemType: "userMessage", raw: { text: escaped }
+        })),
+        { ordinal: 8, turnId: "turn-normal", itemIndex: 0, itemId: "normal", itemType: "userMessage", raw: { text: "正常摘要输入" } }
+      ]
+    };
+    const codex = { readThreadHistory: vi.fn(async () => history) };
+    const summaryCodex = {
+      start: vi.fn(async () => undefined),
+      stop: vi.fn(async () => undefined),
+      summarizeThreadTurns: vi.fn(async (_cwd, turns) => turns.map((turn) => ({ turnId: turn.turnId, summary: "正常回合摘要" })))
+    };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+    (processor as unknown as { summaryCodex: typeof summaryCodex }).summaryCodex = summaryCodex;
+
+    await expect(processor.processThreadSnapshot({ ...snapshotJob(), summaryEnabled: true })).resolves.toBeUndefined();
+
+    expect(summaryCodex.summarizeThreadTurns).toHaveBeenCalledOnce();
+    expect(summaryCodex.summarizeThreadTurns.mock.calls[0]?.[1]).toEqual([
+      { turnId: "turn-normal", messages: [{ speaker: "user", speakerName: "用户", text: "正常摘要输入" }] }
+    ]);
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toEqual([
+      expect.objectContaining({ turnId: "turn-oversized", summarySource: "fallback" }),
+      expect.objectContaining({ turnId: "turn-normal", summary: "正常回合摘要", summarySource: "ai" })
+    ]);
+    expect(client.completeThreadSnapshot).toHaveBeenCalledOnce();
+    expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("bounds summary batches and derives a readable fallback from visible messages", () => {
+    const inputs = Array.from({ length: 101 }, (_, index) => ({
+      turnId: `turn-${index}`,
+      messages: [{ speaker: "user" as const, speakerName: "用户", text: `第 ${index} 条消息` }]
+    }));
+    const batches = buildThreadSummaryBatches(inputs);
+    expect(batches.map((batch) => batch.length)).toEqual([50, 50, 1]);
+    const escaped = "\\".repeat(4 * 1024);
+    const oversized = { turnId: "oversized", messages: Array.from({ length: 8 }, () => ({ speaker: "user" as const, speakerName: "用户", text: escaped })) };
+    expect(buildThreadSummaryBatchPlan([inputs[0]!, oversized, inputs[1]!])).toEqual({
+      batches: [[inputs[0]!], [inputs[1]!]],
+      oversized: [oversized]
+    });
+    expect(fallbackThreadTurnSummary(inputs[0]!, "2026-07-16T00:00:00.000Z")).toEqual({
+      summary: "第 0 条消息", summarySource: "fallback", summaryModel: null, summaryGeneratedAt: "2026-07-16T00:00:00.000Z"
+    });
+    const emojiFallback = fallbackThreadTurnSummary({
+      turnId: "turn-emoji",
+      messages: [{ speaker: "user", speakerName: "用户", text: "😀".repeat(30) }]
+    }, "2026-07-16T00:00:00.000Z");
+    expect(emojiFallback.summary).toBe("😀".repeat(24));
+    expect(threadSnapshotChunkSchema.safeParse({
+      chunkIndex: 0,
+      turns: [{
+        turnIndex: 0,
+        turnId: "turn-emoji",
+        status: "completed",
+        startedAt: null,
+        completedAt: null,
+        durationMs: null,
+        error: null,
+        raw: {},
+        ...emojiFallback
+      }],
+      items: []
+    }).success).toBe(true);
+    expect(threadTurnSummaryInput("turn", [{
+      ordinal: 0, turnId: "turn", itemIndex: 0, itemId: "user", itemType: "userMessage", raw: { text: "用户消息" }
+    }, {
+      ordinal: 1, turnId: "turn", itemIndex: 1, itemId: "collab", itemType: "collabAgentToolCall",
+      raw: { senderName: "审查 Agent", prompt: "检查代码", result: "没有发现阻塞" }
+    }])).toEqual({ turnId: "turn", messages: [
+      { speaker: "user", speakerName: "用户", text: "用户消息" },
+      { speaker: "other_agent", speakerName: "审查 Agent", text: "没有发现阻塞" }
+    ] });
   });
 });
 
