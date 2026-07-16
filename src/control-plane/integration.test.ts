@@ -879,6 +879,22 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       method: "GET", url: `/v1/admin/workers/worker-a/device-commands/${expiringId}`, headers: adminHeaders
     });
     expect(expired.json()).toMatchObject({ state: "expired" });
+
+    const start = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "start" }
+    });
+    const startId = start.json<{ id: string }>().id;
+    const startClaim = await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    });
+    const startLease = startClaim.json<{ leaseToken: string }>().leaseToken;
+    expect((await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${startId}/complete`, headers: managerHeaders,
+      payload: { leaseToken: startLease, result: { localState: "running" } }
+    })).statusCode).toBe(200);
+    expect(await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow())
+      .toEqual({ operational_mode: "enabled" });
   });
 
   it("rolls back a failed Profile switch and atomically completes a no-context retry", async () => {

@@ -540,7 +540,11 @@ export function registerDeviceCommandRoutes(
           updated_at: now
         }).where("id", "=", migration.id).execute();
       }
-      const restoreMode = command.command_type === "stop" ? "maintenance" : command.previous_operational_mode;
+      const restoreMode = command.command_type === "stop"
+        ? "maintenance"
+        : command.command_type === "start"
+          ? "enabled"
+          : command.previous_operational_mode;
       if (restoreMode) await trx.updateTable("workers").set({ operational_mode: restoreMode, updated_at: now }).where("executor_id", "=", request.params.id).execute();
       await trx.updateTable("device_commands").set({
         state: "succeeded",
