@@ -173,7 +173,10 @@ export function registerRunnerRoutes(
   app.get<{ Params: { id: string } }>("/v1/runner/status/:id", async (request) => {
     const header = request.headers.authorization;
     await requireDeviceCredential(db, request.params.id, header);
-    const worker = await db.selectFrom("workers").select(["status", "last_seen_at", "runner_version", "operational_mode", "workspace_aliases", "upgrade_drain_token_hash"])
+    const worker = await db.selectFrom("workers").select([
+      "status", "last_seen_at", "runner_version", "operational_mode", "workspace_aliases", "upgrade_drain_token_hash",
+      "codex_profile", "config_fingerprint", "manager_version", "manager_last_seen_at"
+    ])
       .where("executor_id", "=", request.params.id).where("deleted_at", "is", null).executeTakeFirst();
     if (!worker) throw new AppError("执行器不存在", 404, "not_found");
     const now = new Date();
@@ -195,6 +198,11 @@ export function registerRunnerRoutes(
       online: worker.status === "online" && age <= 45_000,
       lastSeenAt: iso(worker.last_seen_at),
       runnerVersion: worker.runner_version,
+      codexProfile: worker.codex_profile,
+      configFingerprint: worker.config_fingerprint,
+      managerVersion: worker.manager_version,
+      managerOnline: Boolean(worker.manager_last_seen_at && Date.now() - new Date(worker.manager_last_seen_at).getTime() <= 45_000),
+      managerLastSeenAt: iso(worker.manager_last_seen_at),
       operationalMode: worker.operational_mode,
       activeTasks: active.count,
       activeRuntimeSyncJobs: activeRuntimeSync.count,

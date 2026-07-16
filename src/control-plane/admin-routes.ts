@@ -315,8 +315,11 @@ export function registerAdminRoutes(
       .groupBy("executor_id").execute();
     return { items: rows.map((worker) => ({
       ...worker, ...publicWorkerDisplayName(worker), workspace_aliases: parseJsonArray(worker.workspace_aliases), capabilities: parseJsonArray(worker.capabilities),
+      available_profiles: Array.isArray(worker.available_profiles) ? worker.available_profiles : [],
       model_catalog: Array.isArray(worker.model_catalog) ? worker.model_catalog : [],
       model_catalog_updated_at: iso(worker.model_catalog_updated_at),
+      manager_last_seen_at: iso(worker.manager_last_seen_at),
+      manager_online: Boolean(worker.manager_last_seen_at && Date.now() - new Date(worker.manager_last_seen_at).getTime() <= 45_000),
       last_seen_at: iso(worker.last_seen_at), availability: availability(worker.last_seen_at), activeTasks: active.find((x) => x.executor_id === worker.executor_id)?.count ?? 0,
       credentialActive: (credentials.find((x) => x.executor_id === worker.executor_id)?.active_count ?? 0) > 0,
       credentialLastUsedAt: iso(credentials.find((x) => x.executor_id === worker.executor_id)?.last_used_at ?? null)

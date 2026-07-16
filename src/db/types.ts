@@ -231,6 +231,9 @@ export interface WorkersTable {
   model_catalog_updated_at: NullableTimestamp;
   runner_version: string | null;
   architecture: string | null;
+  manager_version: Generated<string | null>;
+  manager_last_seen_at: NullableTimestamp;
+  available_profiles: GeneratedJson;
   registration_source: Generated<"unregistered" | "quick_install">;
   status: Generated<string>;
   operational_mode: Generated<"enabled" | "maintenance" | "disabled">;
@@ -244,6 +247,58 @@ export interface WorkersTable {
   upgrade_drain_token_hash: Generated<string | null>;
   upgrade_drain_previous_mode: Generated<"enabled" | "maintenance" | "disabled" | null>;
   last_seen_at: Timestamp;
+  created_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface DeviceCommandsTable {
+  id: Generated<string>;
+  executor_id: string;
+  command_type: "status" | "start" | "stop" | "restart" | "logs" | "switch_profile";
+  parameters: GeneratedJson;
+  state: Generated<"queued" | "running" | "succeeded" | "failed" | "expired">;
+  requested_by: string;
+  previous_operational_mode: "enabled" | "maintenance" | "disabled" | null;
+  lease_token_hash: string | null;
+  lease_expires_at: NullableTimestamp;
+  attempt: Generated<number>;
+  result: Json | null;
+  last_error: string | null;
+  requested_at: Timestamp;
+  started_at: NullableTimestamp;
+  completed_at: NullableTimestamp;
+  expires_at: Timestamp;
+  updated_at: Timestamp;
+}
+
+export interface ProfileSwitchMigrationsTable {
+  id: Generated<string>;
+  command_id: string;
+  executor_id: string;
+  source_profile: string;
+  source_config_fingerprint: string;
+  target_profile: string;
+  target_config_fingerprint: string | null;
+  state: Generated<"preparing" | "ready" | "switching" | "committing" | "succeeded" | "rolling_back" | "rolled_back" | "failed">;
+  context_count: Generated<number>;
+  last_error: string | null;
+  created_at: Timestamp;
+  completed_at: NullableTimestamp;
+  updated_at: Timestamp;
+}
+
+export interface ProfileSwitchContextsTable {
+  migration_id: string;
+  chat_context_id: string;
+  bot_app_id: string;
+  workspace_root_alias: string | null;
+  source_thread_id: string;
+  target_thread_id: string | null;
+  snapshot_job_id: string | null;
+  migration_summary: string | null;
+  summary_sha256: string | null;
+  state: "pending" | "snapshotting" | "ready" | "imported" | "failed";
+  last_error: string | null;
   created_at: Timestamp;
   updated_at: Timestamp;
 }
@@ -601,6 +656,9 @@ export interface Database {
   bot_dialogue_settings: BotDialogueSettingsTable;
   bot_dialogue_guards: BotDialogueGuardsTable;
   workers: WorkersTable;
+  device_commands: DeviceCommandsTable;
+  profile_switch_migrations: ProfileSwitchMigrationsTable;
+  profile_switch_contexts: ProfileSwitchContextsTable;
   worker_enrollment_tokens: WorkerEnrollmentTokensTable;
   worker_device_credentials: WorkerDeviceCredentialsTable;
   task_events: TaskEventsTable;

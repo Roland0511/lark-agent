@@ -53,6 +53,7 @@ async function runGuard(status: Record<string, unknown>, options: {
     await mkdir(oldVersion, { recursive: true });
     await writeFile(join(nextVersion, "node", "bin", "node"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
     await writeFile(join(nextVersion, "worker.mjs"), "// test worker\n");
+    await writeFile(join(nextVersion, "manager.mjs"), "// test manager\n");
     await symlink("versions/0.3.1", join(installDir, "current"));
   }
   const fakeCurl = join(fakeBin, "curl");
@@ -157,6 +158,7 @@ describe.skipIf(process.platform !== "darwin" || !existsSync("/bin/zsh"))("Runne
       version: "0.4.0", publishedAt: "2026-07-15T00:00:00.000Z",
       worker: { path: "releases/0.4.0/worker.mjs", sha256: "a".repeat(64) },
       manager: { path: "releases/0.4.0/lark-agent-runner", sha256: "b".repeat(64) },
+      daemon: { path: "releases/0.4.0/manager.mjs", sha256: "e".repeat(64) },
       node: {
         arm64: { path: "releases/0.4.0/node-arm64.tar.gz", sha256: "c".repeat(64) },
         x64: { path: "releases/0.4.0/node-x64.tar.gz", sha256: "d".repeat(64) }

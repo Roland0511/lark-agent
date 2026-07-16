@@ -82,6 +82,8 @@ load_install() {
   INSTALL_DIR="$1"
   [[ -f "$INSTALL_DIR/installation.env" && -f "$INSTALL_DIR/credentials" ]] || fail "安装目录不完整：${INSTALL_DIR:t}"
   source "$INSTALL_DIR/installation.env"
+  MANAGER_LAUNCHD_LABEL="${MANAGER_LAUNCHD_LABEL:-io.github.lark-agent.manager.$EXECUTOR_ID}"
+  MANAGER_PLIST_PATH="${MANAGER_PLIST_PATH:-$HOME/Library/LaunchAgents/$MANAGER_LAUNCHD_LABEL.plist}"
   CREDENTIAL="$(<"$INSTALL_DIR/credentials")"
   [[ -n "$CREDENTIAL" ]] || fail "设备凭据为空：${INSTALL_DIR:t}"
 }
@@ -249,7 +251,10 @@ case "$COMMAND" in
     fi
     rm -f "$response"
     stop_service
+    launchctl disable "gui/$UID/$MANAGER_LAUNCHD_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "gui/$UID" "$MANAGER_PLIST_PATH" >/dev/null 2>&1 || true
     rm -f "$PLIST_PATH"
+    rm -f "$MANAGER_PLIST_PATH"
     rm -rf "$INSTALL_DIR"
     if [[ -z "$(installed_dirs)" ]]; then
       rm -f "$ENTRYPOINT"

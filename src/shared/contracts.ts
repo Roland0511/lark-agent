@@ -61,6 +61,50 @@ export const workerRegistrationSchema = z.object({
 });
 export type WorkerRegistration = z.infer<typeof workerRegistrationSchema>;
 
+export const deviceProfileSchema = z.object({
+  name: z.string().regex(/^[A-Za-z0-9_-]+$/),
+  model: z.string().max(256).nullable(),
+  modelProvider: z.string().max(256).nullable(),
+  modifiedAt: z.string().datetime()
+});
+export type DeviceProfile = z.infer<typeof deviceProfileSchema>;
+
+export const deviceManagerHeartbeatSchema = z.object({
+  version: z.string().min(1).max(128),
+  profiles: z.array(deviceProfileSchema).max(128),
+  localState: z.enum(["running", "stopped", "not_loaded"]),
+  activeProfile: z.string().regex(/^[A-Za-z0-9_-]+$/)
+});
+export type DeviceManagerHeartbeat = z.infer<typeof deviceManagerHeartbeatSchema>;
+
+export const deviceCommandTypeSchema = z.enum(["status", "start", "stop", "restart", "logs", "switch_profile"]);
+export type DeviceCommandType = z.infer<typeof deviceCommandTypeSchema>;
+
+export const adminDeviceCommandSchema = z.discriminatedUnion("type", [
+  z.object({ type: z.literal("status") }),
+  z.object({ type: z.literal("start") }),
+  z.object({ type: z.literal("stop") }),
+  z.object({ type: z.literal("restart") }),
+  z.object({ type: z.literal("logs"), lines: z.number().int().min(1).max(500).default(200) }),
+  z.object({ type: z.literal("switch_profile"), targetProfile: z.string().regex(/^[A-Za-z0-9_-]+$/) })
+]);
+export type AdminDeviceCommand = z.infer<typeof adminDeviceCommandSchema>;
+
+export const deviceCommandResultSchema = z.object({
+  result: z.record(z.string(), z.unknown()).default({}),
+  targetProfile: z.string().regex(/^[A-Za-z0-9_-]+$/).optional(),
+  targetConfigFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  targetCodexVersion: z.string().min(1).max(128).optional(),
+  targetHomeRef: z.string().min(1).max(128).optional(),
+  targetWorkspaceMappingFingerprint: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  contexts: z.array(z.object({
+    chatContextId: z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/),
+    targetThreadId: z.string().min(1).max(256),
+    migrationSummary: z.string().min(1).max(12_000).optional()
+  })).max(10_000).optional()
+});
+export type DeviceCommandResult = z.infer<typeof deviceCommandResultSchema>;
+
 export const workerModelCatalogEntrySchema = z.object({
   id: z.string().min(1).max(256),
   displayName: z.string().min(1).max(256),

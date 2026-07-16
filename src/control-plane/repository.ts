@@ -29,6 +29,14 @@ export async function upsertWorkerRegistration(
     .select(["config_fingerprint", "workspace_mapping_fingerprint"])
     .where("executor_id", "=", registration.executorId)
     .executeTakeFirst();
+  const expectedProfileSwitch = await db.selectFrom("profile_switch_migrations")
+    .innerJoin("device_commands", "device_commands.id", "profile_switch_migrations.command_id")
+    .select("profile_switch_migrations.id")
+    .where("profile_switch_migrations.executor_id", "=", registration.executorId)
+    .where("profile_switch_migrations.target_profile", "=", registration.codexProfile)
+    .where("profile_switch_migrations.state", "in", ["preparing", "ready", "switching", "committing"])
+    .where("device_commands.state", "=", "running")
+    .executeTakeFirst();
 
   await db.insertInto("workers").values({
     executor_id: registration.executorId,
@@ -106,23 +114,25 @@ export async function upsertWorkerRegistration(
       .execute();
   }
 
-  await db.updateTable("tasks")
-    .set({ state: "waiting_input", revision: sql`revision + 1`, summary: "执行器 CODEX_HOME/profile 配置指纹已变化，需要主人确认", lease_token_hash: null, lease_expires_at: null, updated_at: now })
-    .where("executor_id", "=", registration.executorId)
-    .where("executor_config_fingerprint", "is not", null)
-    .where("executor_config_fingerprint", "!=", registration.configFingerprint)
-    .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
-    .execute();
-  await db.updateTable("chat_contexts")
-    .set({ state: "blocked", blocked_reason: "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认", updated_at: now })
-    .where("executor_id", "=", registration.executorId)
-    .where("codex_thread_id", "is not", null)
-    .where((eb) => eb.or([
-      eb("executor_home_ref", "is distinct from", registration.homeRef),
-      eb("executor_profile", "is distinct from", registration.codexProfile),
-      eb("executor_config_fingerprint", "is distinct from", registration.configFingerprint)
-    ]))
-    .execute();
+  if (!expectedProfileSwitch) {
+    await db.updateTable("tasks")
+      .set({ state: "waiting_input", revision: sql`revision + 1`, summary: "执行器 CODEX_HOME/profile 配置指纹已变化，需要主人确认", lease_token_hash: null, lease_expires_at: null, updated_at: now })
+      .where("executor_id", "=", registration.executorId)
+      .where("executor_config_fingerprint", "is not", null)
+      .where("executor_config_fingerprint", "!=", registration.configFingerprint)
+      .where("state", "in", ["queued", "waiting_worker", "running", "waiting_approval", "held_draft"])
+      .execute();
+    await db.updateTable("chat_contexts")
+      .set({ state: "blocked", blocked_reason: "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认", updated_at: now })
+      .where("executor_id", "=", registration.executorId)
+      .where("codex_thread_id", "is not", null)
+      .where((eb) => eb.or([
+        eb("executor_home_ref", "is distinct from", registration.homeRef),
+        eb("executor_profile", "is distinct from", registration.codexProfile),
+        eb("executor_config_fingerprint", "is distinct from", registration.configFingerprint)
+      ]))
+      .execute();
+  }
 }
 
 export class ControlPlaneRepository {

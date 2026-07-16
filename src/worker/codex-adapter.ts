@@ -176,7 +176,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.4" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.5.0" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -210,6 +210,21 @@ export class CodexAdapter {
     if (threadId && id !== threadId) {
       throw new Error(`Codex resumed an unexpected thread id (expected ${threadId}, received ${id})`);
     }
+    return id;
+  }
+
+  async startImportedThread(cwd: string, migrationContext: string, model: string | null = null): Promise<string> {
+    const result = (await this.request("thread/start", {
+      cwd,
+      approvalPolicy: "on-request",
+      approvalsReviewer: "user",
+      ephemeral: false,
+      serviceName: "lark-agent-profile-migration",
+      developerInstructions: migrationContext,
+      ...(model ? { model } : {})
+    })) as { thread?: { id?: string } };
+    const id = result.thread?.id;
+    if (!id) throw new Error("Codex did not return an imported thread id");
     return id;
   }
 
@@ -438,6 +453,43 @@ export class CodexAdapter {
     } finally {
       if (timeout) clearTimeout(timeout);
     }
+  }
+
+  async summarizeMigrationContext(
+    cwd: string,
+    sourceContext: string,
+    policy: { model: string | null; effort: string | null } = { model: null, effort: null }
+  ): Promise<string> {
+    if (!sourceContext.trim()) throw new Error("migration context source is empty");
+    if ([...sourceContext].length > 12_000) throw new Error("migration context source exceeds 12000 characters");
+    const prompt = [
+      "请把下面的旧会话材料整理为可供新 Codex Thread 延续工作的结构化迁移上下文。",
+      "必须使用以下标题：目标与背景、长期约束与偏好、关键决定与理由、当前状态与已完成工作、未完成事项与下一步、重要路径与标识、近期对话要点。",
+      "只保留材料中有依据的事实，不推测；移除凭据、令牌、密码和无关执行日志；总长度不超过 12000 个字符。",
+      "只返回符合 schema 的 JSON。",
+      "",
+      sourceContext
+    ].join("\n");
+    const threadId = await this.startEphemeralThread(cwd, policy.model, "lark-agent-profile-migration-summary", true);
+    const result = await this.runTurn(threadId, prompt, {
+      model: policy.model,
+      effort: policy.effort,
+      outputSchema: {
+        type: "object",
+        additionalProperties: false,
+        required: ["summary"],
+        properties: { summary: { type: "string", minLength: 1, maxLength: 12_000 } }
+      },
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      environments: [],
+      runtimeWorkspaceRoots: [],
+      approvalPolicy: "never",
+      rejectToolItems: true
+    });
+    const parsed = parseJsonText(result.text) as Record<string, unknown>;
+    const summary = typeof parsed.summary === "string" ? parsed.summary.trim() : "";
+    if (!summary || [...summary].length > 12_000) throw new Error("Codex returned an invalid migration summary");
+    return summary;
   }
 
   async steer(threadId: string, turnId: string, text: string): Promise<void> {

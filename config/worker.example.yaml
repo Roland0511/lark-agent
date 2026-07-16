@@ -9,7 +9,7 @@ executor:
   codex_profile: "lark-agent"
   codex_binary: "codex"
   runtime_state_dir: "/absolute/path/to/Lark Agent Runner/mac-example/state"
-  runner_version: "0.4.4"
+  runner_version: "0.5.0"
   capacity: 1
   app_launcher: "/absolute/path/to/lark-agent/scripts/open-codex-app.sh"
   capabilities:

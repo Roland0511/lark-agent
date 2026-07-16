@@ -2,9 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { build } from "esbuild";
 
 await mkdir("dist/runner", { recursive: true });
-await build({
-  entryPoints: ["src/worker/main.ts"],
-  outfile: "dist/runner/worker.mjs",
+const common = {
   bundle: true,
   platform: "node",
   format: "esm",
@@ -13,4 +11,9 @@ await build({
   sourcemap: false,
   minify: false,
   legalComments: "none"
-});
+};
+
+await Promise.all([
+  build({ ...common, entryPoints: ["src/worker/main.ts"], outfile: "dist/runner/worker.mjs" }),
+  build({ ...common, entryPoints: ["src/manager/main.ts"], outfile: "dist/runner/manager.mjs" })
+]);

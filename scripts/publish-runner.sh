@@ -30,6 +30,7 @@ pnpm build:runner
 rm -rf "$ROOT"
 mkdir -p "$RELEASE"
 cp dist/runner/worker.mjs "$RELEASE/worker.mjs"
+cp dist/runner/manager.mjs "$RELEASE/manager.mjs"
 cp scripts/runner/lark-agent-runner "$RELEASE/lark-agent-runner"
 cp scripts/runner/install.sh "$RUNNER_ROOT/install.sh"
 chmod 755 "$RELEASE/lark-agent-runner"
@@ -48,9 +49,10 @@ download_node x64
 
 worker_sha=$(shasum -a 256 "$RELEASE/worker.mjs" | awk '{print $1}')
 manager_sha=$(shasum -a 256 "$RELEASE/lark-agent-runner" | awk '{print $1}')
+daemon_sha=$(shasum -a 256 "$RELEASE/manager.mjs" | awk '{print $1}')
 arm_sha=$(shasum -a 256 "$RELEASE/node-darwin-arm64.tar.gz" | awk '{print $1}')
 x64_sha=$(shasum -a 256 "$RELEASE/node-darwin-x64.tar.gz" | awk '{print $1}')
-(cd "$RELEASE" && shasum -a 256 worker.mjs lark-agent-runner node-darwin-arm64.tar.gz node-darwin-x64.tar.gz > checksums.sha256)
+(cd "$RELEASE" && shasum -a 256 worker.mjs manager.mjs lark-agent-runner node-darwin-arm64.tar.gz node-darwin-x64.tar.gz > checksums.sha256)
 
 published_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 cat > "$RUNNER_ROOT/manifest.json" <<EOF
@@ -64,6 +66,10 @@ cat > "$RUNNER_ROOT/manifest.json" <<EOF
   "manager": {
     "path": "releases/$VERSION/lark-agent-runner",
     "sha256": "$manager_sha"
+  },
+  "daemon": {
+    "path": "releases/$VERSION/manager.mjs",
+    "sha256": "$daemon_sha"
   },
   "node": {
     "arm64": {
@@ -108,6 +114,7 @@ verify_download() {
 
 verify_download "releases/$VERSION/worker.mjs" "$worker_sha"
 verify_download "releases/$VERSION/lark-agent-runner" "$manager_sha"
+verify_download "releases/$VERSION/manager.mjs" "$daemon_sha"
 verify_download "releases/$VERSION/node-darwin-arm64.tar.gz" "$arm_sha"
 verify_download "releases/$VERSION/node-darwin-x64.tar.gz" "$x64_sha"
 rsync_put "runner/install.sh"

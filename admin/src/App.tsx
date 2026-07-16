@@ -1088,7 +1088,7 @@ function Workers({ user }: { user: AdminUser }) {
   return <><PageTitle eyebrow="本地能力" title="执行器" description="通过一次性注册指令挂载 Mac；每个实例固定绑定一组 Codex Home 与 Profile。" action={<button className="primary-button" disabled={release.data?.source === "unavailable"} onClick={openEnrollment}><Plus size={17} />添加执行器</button>} />
     {release.data?.source === "unavailable" && <div className="inline-alert"><AlertTriangle size={17} />Runner CDN manifest 当前不可用，暂时不能生成可靠的安装指令。</div>}
     {!workers.data ? <PageLoading /> : items.length ? <div className="master-detail-layout worker-master-detail"><aside className="master-list-panel" aria-label="执行器列表"><div className="master-list-search"><Search size={17} /><span>执行器</span><span>{items.length}</span></div><div className="master-list">{items.map((worker: AnyRecord) => { const state = worker.operational_mode !== "enabled" ? worker.operational_mode : worker.availability; return <button key={worker.executor_id} aria-pressed={selected?.executor_id === worker.executor_id} className={selected?.executor_id === worker.executor_id ? "master-list-item selected" : "master-list-item"} onClick={() => setSelectedId(worker.executor_id)}><span className="list-item-icon"><Server size={20} /></span><span><strong>{worker.display_name}</strong><small title={worker.reported_display_name}>设备：{worker.reported_display_name} · {worker.architecture}</small><small title={worker.executor_id}>ID {shortId(worker.executor_id)} · 心跳 {relativeTime(worker.last_seen_at)}</small></span><StateBadge state={state} /></button>; })}</div>{recentEnrollments.length > 0 && <details className="master-list-foot"><summary><KeyRound size={16} />最近注册指令<ChevronRight size={15} /></summary><div className="compact-enrollments">{recentEnrollments.map((item: AnyRecord) => <div key={item.id}><code>{shortId(item.id)}</code><StateBadge state={item.state} label={({ pending: "待使用", used: "已使用", expired: "已过期", revoked: "已撤销" } as AnyRecord)[item.state]} /></div>)}</div></details>}</aside>
-      {selected && <WorkerMasterDetailPane worker={selected} recommendedVersion={recommendedVersion} upgradeCommand={upgradeCommand} onEditAlias={() => setEditingAlias(selected)} onCommand={(command) => setTarget({ worker: selected, command })} />}</div> : <article className="panel"><Empty icon={<Server />} title="还没有执行器" text="使用一次性注册指令挂载第一台 Mac。" /></article>}
+      {selected && <WorkerMasterDetailPane worker={selected} user={user} recommendedVersion={recommendedVersion} upgradeCommand={upgradeCommand} onEditAlias={() => setEditingAlias(selected)} onCommand={(command) => setTarget({ worker: selected, command })} />}</div> : <article className="panel"><Empty icon={<Server />} title="还没有执行器" text="使用一次性注册指令挂载第一台 Mac。" /></article>}
     {target && <WorkerDialog {...target} user={user} onClose={() => { setTarget(null); void workers.refetch(); }} />}{editingAlias && <WorkerAliasDialog worker={editingAlias} user={user} onClose={() => setEditingAlias(null)} />}{adding && <EnrollmentDialog user={user} onClose={() => { setAdding(false); void enrollments.refetch(); void workers.refetch(); }} />}</>;
 }
 
@@ -1097,9 +1097,9 @@ export function resolveSelectedWorkerId(items: AnyRecord[], selectedId: string):
   return items[0]?.executor_id ?? "";
 }
 
-function WorkerMasterDetailPane({ worker, recommendedVersion, upgradeCommand, onEditAlias, onCommand }: { worker: AnyRecord; recommendedVersion: string | null | undefined; upgradeCommand: string | null; onEditAlias(): void; onCommand(command: string): void }) {
+function WorkerMasterDetailPane({ worker, user, recommendedVersion, upgradeCommand, onEditAlias, onCommand }: { worker: AnyRecord; user: AdminUser; recommendedVersion: string | null | undefined; upgradeCommand: string | null; onEditAlias(): void; onCommand(command: string): void }) {
   const updateAvailable = Boolean(recommendedVersion && worker.runner_version && recommendedVersion !== worker.runner_version);
-  const managementAvailable = Boolean(recommendedVersion && worker.runner_version === recommendedVersion);
+  const managementAvailable = Boolean(worker.manager_online);
   const state = worker.operational_mode !== "enabled" ? worker.operational_mode : worker.availability;
   const canAcceptTasks = state === "online" && Boolean(worker.credentialActive);
   const capabilities = (worker.capabilities ?? []).map((capability: string) => humanCapability(capability)) as string[];
@@ -1109,7 +1109,7 @@ function WorkerMasterDetailPane({ worker, recommendedVersion, upgradeCommand, on
     <div className="layered-sections">
       <details open><summary><Cpu size={17} /><span><strong>环境与能力</strong><small>Codex Profile、工作区、模型与永久聊天记忆</small></span><ChevronDown size={17} /></summary><div className="worker-environment"><dl className="layered-detail-list"><Detail label="Codex Profile" value={worker.codex_profile} /><Detail label="Codex 版本" value={worker.codex_version} /><Detail label="Runner" value={worker.runner_version ? `${worker.runner_version}${updateAvailable ? `（可升级至 ${recommendedVersion}）` : "（最新）"}` : "版本未知"} /><Detail label="架构" value={worker.architecture} /><Detail label="总工作区" value={worker.workspace_aliases.join("、")} /><Detail label="模型目录" value={`${worker.model_catalog?.length ?? 0} 个${worker.model_catalog_updated_at ? ` · ${relativeTime(worker.model_catalog_updated_at)}更新` : " · 等待上报"}`} /></dl><div className="capability-list">{capabilities.map((capability) => <span key={capability}><CheckCircle2 size={15} />{capability}</span>)}</div></div></details>
       <WorkerUserSkills worker={worker} />
-      <details><summary><Wrench size={17} /><span><strong>设备端管理</strong><small>复制命令并在目标 Mac 本机执行</small></span><ChevronDown size={17} /></summary><RunnerManagement worker={worker} available={managementAvailable} upgradeCommand={updateAvailable && upgradeCommand ? `${upgradeCommand} --executor-id '${worker.executor_id}'` : null} /></details>
+      <details open><summary><Wrench size={17} /><span><strong>设备端管理</strong><small>直接执行启停、日志与 Profile 切换</small></span><ChevronDown size={17} /></summary><RunnerManagement worker={worker} user={user} available={managementAvailable} upgradeCommand={updateAvailable && upgradeCommand ? `${upgradeCommand} --executor-id '${worker.executor_id}'` : null} /></details>
       <details><summary><ShieldCheck size={17} /><span><strong>安全与生命周期</strong><small>注册、凭据与停用策略</small></span><ChevronDown size={17} /></summary><dl className="layered-detail-list"><Detail label="注册方式" value={worker.registration_source === "quick_install" ? "快速注册" : "尚未通过设备注册"} /><Detail label="设备凭据" value={worker.credentialActive ? "有效" : "未注册或已撤销"} /><Detail label="当前模式" value={displayState(worker.operational_mode)} /><Detail label="固定聊天影响" value="维护、停用、撤销或删除可能使永久聊天绑定进入阻塞" /></dl></details>
     </div></section>;
 }
@@ -1118,10 +1118,50 @@ function humanCapability(value: string): string {
   return ({ chat_context_v1: "永久聊天记忆（固定 Thread 与工作区）", app_handoff: "本机接手与归还", attachments_v1: "消息附件读取", cardkit_streaming: "CardKit 流式更新" } as Record<string, string>)[value] ?? value.replaceAll("_", " ");
 }
 
-function RunnerManagement({ worker, available, upgradeCommand }: { worker: AnyRecord; available: boolean; upgradeCommand: string | null }) {
-  const command = (action: string) => `lark-agent-runner ${action} ${worker.executor_id}`;
-  if (!available) return <div className="runner-management unavailable"><strong>设备端管理</strong><p>当前 Runner 尚未包含本机管理命令，请先升级后再使用。</p>{upgradeCommand && <CopyButton value={upgradeCommand} label="复制升级指令" />}</div>;
-  return <details className="runner-management"><summary>设备端管理</summary><p>请在设备“{worker.reported_display_name}”{worker.display_alias ? `（控制台别名：${worker.display_name}）` : ""}上执行。后台的维护和停用只控制任务领取，不会关闭 Mac 上的 Runner 进程。</p>{worker.availability === "offline" && worker.operational_mode === "enabled" && <div className="runner-offline-hint"><AlertTriangle size={15} />设备可能已关机，或本机 Runner 已停止。可在该设备执行启动命令。</div>}<div className="runner-command-grid"><CopyButton value={command("status")} label="查看状态" /><CopyButton value={command("start")} label="启动" /><CopyButton value={command("stop")} label="停止" /><CopyButton value={command("restart")} label="重启" /><CopyButton value={command("logs")} label="查看日志" /><CopyButton value="lark-agent-runner help" label="全部命令" /></div><small>停止会跨重启保持；卸载会撤销设备凭据并保留后台历史记录。</small></details>;
+function RunnerManagement({ worker, user, available, upgradeCommand }: { worker: AnyRecord; user: AdminUser; available: boolean; upgradeCommand: string | null }) {
+  const [commandId, setCommandId] = useState<string | null>(null);
+  const [targetProfile, setTargetProfile] = useState("");
+  const profiles = useQuery({
+    queryKey: ["worker-profiles", worker.executor_id],
+    queryFn: () => api<AnyRecord>(`/v1/admin/workers/${worker.executor_id}/profiles`),
+    enabled: available,
+    refetchInterval: 15_000
+  });
+  const command = useQuery({
+    queryKey: ["device-command", worker.executor_id, commandId],
+    queryFn: () => api<AnyRecord>(`/v1/admin/workers/${worker.executor_id}/device-commands/${commandId}`),
+    enabled: Boolean(commandId),
+    refetchInterval: (query) => ["succeeded", "failed", "expired"].includes((query.state.data as AnyRecord | undefined)?.state ?? "") ? false : 1_000
+  });
+  const submit = useMutation({
+    mutationFn: (body: AnyRecord) => api<AnyRecord>(`/v1/admin/workers/${worker.executor_id}/device-commands`, { method: "POST", body: JSON.stringify(body) }, user),
+    onSuccess: (data) => setCommandId(data.id)
+  });
+  useEffect(() => {
+    const candidates = (profiles.data?.profiles ?? []).filter((profile: AnyRecord) => profile.name !== profiles.data?.activeProfile);
+    if (!candidates.some((profile: AnyRecord) => profile.name === targetProfile)) setTargetProfile(candidates[0]?.name ?? "");
+  }, [profiles.data, targetProfile]);
+  const running = submit.isPending || Boolean(commandId && !["succeeded", "failed", "expired"].includes(command.data?.state ?? ""));
+  const execute = (type: string) => {
+    if (["stop", "restart"].includes(type) && !window.confirm(`${type === "stop" ? "停止" : "重启"}执行器前会等待当前任务安全结束，确认继续？`)) return;
+    submit.mutate(type === "logs" ? { type, lines: 200 } : { type });
+  };
+  const switchProfile = () => {
+    if (!targetProfile) return;
+    const count = profiles.data?.boundContextCount ?? 0;
+    if (!window.confirm(`切换到 Profile「${targetProfile}」将自动重启，并为 ${count} 个聊天创建新 Thread、导入结构化摘要。确认继续？`)) return;
+    submit.mutate({ type: "switch_profile", targetProfile });
+  };
+  if (!available) return <div className="runner-management unavailable"><strong>设备管理进程离线</strong><p>当前 Runner 尚未安装常驻管理进程，或设备本身离线。现有设备需要最后一次本机升级。</p>{upgradeCommand && <CopyButton value={upgradeCommand} label="复制升级指令" />}</div>;
+  const alternatives = (profiles.data?.profiles ?? []).filter((profile: AnyRecord) => profile.name !== profiles.data?.activeProfile);
+  return <div className="runner-management remote-management"><div className="runner-management-head"><div><strong>常驻管理进程在线</strong><small>版本 {worker.manager_version ?? "未知"} · 最近心跳 {relativeTime(worker.manager_last_seen_at)}</small></div><StateBadge state="online" /></div>
+    <p>操作会直接发送到设备“{worker.reported_display_name}”。停止 Worker 后，常驻管理进程仍可接收“启动”指令。</p>
+    <div className="runner-command-grid"><button className="secondary-button" disabled={running} onClick={() => execute("status")}><CircleGauge size={15} />查看状态</button><button className="secondary-button" disabled={running} onClick={() => execute("start")}><RefreshCw size={15} />启动</button><button className="secondary-button" disabled={running} onClick={() => execute("stop")}><X size={15} />停止</button><button className="secondary-button" disabled={running} onClick={() => execute("restart")}><RotateCcw size={15} />重启</button><button className="secondary-button" disabled={running} onClick={() => execute("logs")}><FileClock size={15} />最近日志</button></div>
+    <div className="profile-switch-control"><div><label htmlFor={`profile-${worker.executor_id}`}>切换 Codex Profile</label><small>当前：{profiles.data?.activeProfile ?? worker.codex_profile} · 影响 {profiles.data?.boundContextCount ?? 0} 个聊天</small></div><select id={`profile-${worker.executor_id}`} value={targetProfile} disabled={running || !alternatives.length} onChange={(event) => setTargetProfile(event.target.value)}>{alternatives.map((profile: AnyRecord) => <option key={profile.name} value={profile.name}>{profile.name}{profile.model ? ` · ${profile.model}` : ""}</option>)}</select><button className="primary-button" disabled={running || !targetProfile} onClick={switchProfile}>切换并重启</button></div>
+    {(submit.error || command.error) && <ErrorBox error={submit.error ?? command.error} />}
+    {commandId && <div className={`device-command-result state-${command.data?.state ?? "running"}`}><div><strong>{({ queued: "等待设备领取", running: "设备执行中", succeeded: "执行成功", failed: "执行失败", expired: "指令已过期" } as AnyRecord)[command.data?.state ?? "running"]}</strong><small>{command.data?.migration ? `迁移阶段：${command.data.migration.state} · ${command.data.migration.context_count} 个聊天` : `指令 ${shortId(commandId)}`}</small></div>{running && <div className="loading-orb compact" />}{command.data?.error && <p>{command.data.error}</p>}{command.data?.result?.content && <pre>{command.data.result.content}</pre>}</div>}
+    <small>所有指令均为固定白名单动作；繁忙时最长等待 10 分钟安全排空，不会强制中断任务。</small>
+  </div>;
 }
 
 function EnrollmentDialog({ user, onClose }: { user: AdminUser; onClose(): void }) {

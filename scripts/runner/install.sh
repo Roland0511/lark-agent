@@ -74,26 +74,31 @@ load_manifest() {
   WORKER_SHA="$(optional_json_value "$MANIFEST" worker.sha256 '')"
   MANAGER_PATH="$(optional_json_value "$MANIFEST" manager.path '')"
   MANAGER_SHA="$(optional_json_value "$MANIFEST" manager.sha256 '')"
+  DAEMON_PATH="$(optional_json_value "$MANIFEST" daemon.path '')"
+  DAEMON_SHA="$(optional_json_value "$MANIFEST" daemon.sha256 '')"
   NODE_PATH="$(optional_json_value "$MANIFEST" node.$ARCH.path '')"
   NODE_SHA="$(optional_json_value "$MANIFEST" node.$ARCH.sha256 '')"
-  [[ -n "$VERSION" && -n "$WORKER_PATH" && -n "$WORKER_SHA" && -n "$MANAGER_PATH" && -n "$MANAGER_SHA" && -n "$NODE_PATH" && -n "$NODE_SHA" ]]
+  [[ -n "$VERSION" && -n "$WORKER_PATH" && -n "$WORKER_SHA" && -n "$MANAGER_PATH" && -n "$MANAGER_SHA" && -n "$DAEMON_PATH" && -n "$DAEMON_SHA" && -n "$NODE_PATH" && -n "$NODE_SHA" ]]
 }
 
 install_release() {
   local target="$1"
   local version_dir="$target/versions/$VERSION"
-  if [[ -x "$version_dir/node/bin/node" && -f "$version_dir/worker.mjs" ]]; then
+  if [[ -x "$version_dir/node/bin/node" && -f "$version_dir/worker.mjs" && -f "$version_dir/manager.mjs" ]]; then
     return
   fi
   STAGING="$(mktemp -d -t lark-agent-runner-release)"
   info "下载 Runner $VERSION（$ARCH）"
   curl -fsSL --retry 2 --connect-timeout 8 "$ARTIFACT_BASE/runner/$WORKER_PATH" -o "$STAGING/worker.mjs"
+  curl -fsSL --retry 2 --connect-timeout 8 "$ARTIFACT_BASE/runner/$DAEMON_PATH" -o "$STAGING/manager.mjs"
   curl -fsSL --retry 2 --connect-timeout 8 "$ARTIFACT_BASE/runner/$NODE_PATH" -o "$STAGING/node.tar.gz"
   [[ "$(sha256_file "$STAGING/worker.mjs")" == "$WORKER_SHA" ]] || fail "Worker 文件校验失败"
+  [[ "$(sha256_file "$STAGING/manager.mjs")" == "$DAEMON_SHA" ]] || fail "设备管理进程文件校验失败"
   [[ "$(sha256_file "$STAGING/node.tar.gz")" == "$NODE_SHA" ]] || fail "Node 运行时校验失败"
   mkdir -p "$STAGING/release/node" "$target/versions"
   tar -xzf "$STAGING/node.tar.gz" --strip-components 1 -C "$STAGING/release/node"
   mv "$STAGING/worker.mjs" "$STAGING/release/worker.mjs"
+  mv "$STAGING/manager.mjs" "$STAGING/release/manager.mjs"
   print -r -- "$VERSION" > "$STAGING/release/VERSION"
   rm -rf "$version_dir"
   mv "$STAGING/release" "$version_dir"
@@ -134,6 +139,47 @@ restart_service() {
   done
   launchctl bootstrap "gui/$UID" "$plist"
   launchctl kickstart -k "gui/$UID/$label"
+}
+
+install_device_manager_service() {
+  local label_xml node_xml node_dir_xml manager_xml config_xml worker_label_xml worker_plist_xml log_dir_xml version_xml
+  MANAGER_LAUNCHD_LABEL="${MANAGER_LAUNCHD_LABEL:-io.github.lark-agent.manager.$EXECUTOR_ID}"
+  MANAGER_PLIST_PATH="${MANAGER_PLIST_PATH:-$HOME/Library/LaunchAgents/$MANAGER_LAUNCHD_LABEL.plist}"
+  CONFIG_FILE="${CONFIG_FILE:-$INSTALL_DIR/config.yaml}"
+  LOG_DIR="${LOG_DIR:-$INSTALL_DIR/logs}"
+  label_xml="$(xml_escape "$MANAGER_LAUNCHD_LABEL")"
+  node_xml="$(xml_escape "$INSTALL_DIR/current/node/bin/node")"
+  node_dir_xml="$(xml_escape "$INSTALL_DIR/current/node/bin")"
+  manager_xml="$(xml_escape "$INSTALL_DIR/current/manager.mjs")"
+  config_xml="$(xml_escape "$CONFIG_FILE")"
+  worker_label_xml="$(xml_escape "$LAUNCHD_LABEL")"
+  worker_plist_xml="$(xml_escape "$PLIST_PATH")"
+  log_dir_xml="$(xml_escape "$LOG_DIR")"
+  version_xml="$(xml_escape "$VERSION")"
+  cat > "$MANAGER_PLIST_PATH" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$label_xml</string>
+  <key>ProgramArguments</key><array><string>$node_xml</string><string>$manager_xml</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>WORKER_CONFIG_FILE</key><string>$config_xml</string>
+    <key>WORKER_LAUNCHD_LABEL</key><string>$worker_label_xml</string>
+    <key>WORKER_PLIST_PATH</key><string>$worker_plist_xml</string>
+    <key>WORKER_LOG_DIR</key><string>$log_dir_xml</string>
+    <key>RUNNER_MANAGER_VERSION</key><string>$version_xml</string>
+    <key>PATH</key><string>$node_dir_xml:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>StandardOutPath</key><string>$log_dir_xml/manager.log</string>
+  <key>StandardErrorPath</key><string>$log_dir_xml/manager.err.log</string>
+</dict></plist>
+EOF
+  chmod 600 "$MANAGER_PLIST_PATH"
+  /usr/bin/plutil -lint "$MANAGER_PLIST_PATH" >/dev/null || fail "设备管理进程 launchd 配置生成失败"
+  restart_service "$MANAGER_LAUNCHD_LABEL" "$MANAGER_PLIST_PATH"
 }
 
 wait_online() {
@@ -233,6 +279,8 @@ if [[ "$UPGRADE" == true ]]; then
   fi
   [[ -f "$INSTALL_DIR/installation.env" && -f "$INSTALL_DIR/credentials" ]] || fail "安装目录不完整：$INSTALL_DIR"
   source "$INSTALL_DIR/installation.env"
+  MANAGER_LAUNCHD_LABEL="${MANAGER_LAUNCHD_LABEL:-io.github.lark-agent.manager.$EXECUTOR_ID}"
+  MANAGER_PLIST_PATH="${MANAGER_PLIST_PATH:-$HOME/Library/LaunchAgents/$MANAGER_LAUNCHD_LABEL.plist}"
   CREDENTIAL_FILE="$INSTALL_DIR/credentials"
   CREDENTIAL="$(<"$CREDENTIAL_FILE")"
   ENROLLED=true
@@ -251,10 +299,12 @@ if [[ "$UPGRADE" == true ]]; then
   update_config_runner_version "$INSTALL_DIR/config.yaml" "$VERSION"
   PREVIOUS="$(readlink "$INSTALL_DIR/current" 2>/dev/null || true)"
   ln -sfn "versions/$VERSION" "$INSTALL_DIR/current"
+  install_device_manager_service
   if ! restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || ! wait_online "$CONTROL_PLANE_URL" "$EXECUTOR_ID" "$CREDENTIAL" "$VERSION"; then
     [[ -z "$PREVIOUS" ]] || ln -sfn "$PREVIOUS" "$INSTALL_DIR/current"
     [[ -z "$PREVIOUS_RUNNER_VERSION" ]] || update_config_runner_version "$INSTALL_DIR/config.yaml" "$PREVIOUS_RUNNER_VERSION"
     restart_service "$LAUNCHD_LABEL" "$PLIST_PATH" || true
+    restart_service "$MANAGER_LAUNCHD_LABEL" "$MANAGER_PLIST_PATH" || true
     fail "新版本启动失败，已回滚到上一版本；请查看 $INSTALL_DIR/logs/worker.err.log"
   fi
   end_upgrade_drain || fail "Runner 已升级并上线，但控制面升级排空状态解除失败；执行器会保持维护模式，请在后台核查后重新启用"
@@ -322,6 +372,8 @@ CONFIG_FILE="$INSTALL_DIR/config.yaml"
 LOG_DIR="$INSTALL_DIR/logs"
 LAUNCHD_LABEL="io.github.lark-agent.runner.$EXECUTOR_ID"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
+MANAGER_LAUNCHD_LABEL="io.github.lark-agent.manager.$EXECUTOR_ID"
+MANAGER_PLIST_PATH="$HOME/Library/LaunchAgents/$MANAGER_LAUNCHD_LABEL.plist"
 mkdir -p "$INSTALL_DIR" "$LOG_DIR" "$HOME/Library/LaunchAgents"
 chmod 700 "$INSTALL_DIR"
 load_manifest || fail "Runner 发布清单无法读取或字段不完整"
@@ -395,6 +447,8 @@ ENROLLED=true
   print -r -- "EXECUTOR_ID=${(q)EXECUTOR_ID}"
   print -r -- "LAUNCHD_LABEL=${(q)LAUNCHD_LABEL}"
   print -r -- "PLIST_PATH=${(q)PLIST_PATH}"
+  print -r -- "MANAGER_LAUNCHD_LABEL=${(q)MANAGER_LAUNCHD_LABEL}"
+  print -r -- "MANAGER_PLIST_PATH=${(q)MANAGER_PLIST_PATH}"
 } > "$INSTALL_DIR/installation.env"
 chmod 600 "$INSTALL_DIR/installation.env"
 
@@ -433,6 +487,8 @@ restart_service "$LAUNCHD_LABEL" "$PLIST_PATH"
 if ! wait_online "$SERVER" "$EXECUTOR_ID" "$CREDENTIAL" "$VERSION"; then
   fail "执行器未在 30 秒内上线，请查看 $LOG_DIR/worker.err.log"
 fi
+info "启动常驻设备管理进程"
+install_device_manager_service
 print -- ""
 print -- "执行器安装完成"
 print -- ""

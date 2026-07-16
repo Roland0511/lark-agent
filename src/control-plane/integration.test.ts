@@ -138,6 +138,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextIdentitySql = await readFile(fileURLToPath(new URL("../db/migrations/021_chat_context_identity.sql", import.meta.url)), "utf8");
     const chatThreadSnapshotsSql = await readFile(fileURLToPath(new URL("../db/migrations/022_chat_thread_snapshots.sql", import.meta.url)), "utf8");
     const chatThreadTurnSummariesSql = await readFile(fileURLToPath(new URL("../db/migrations/023_chat_thread_turn_summaries.sql", import.meta.url)), "utf8");
+    const deviceCommandsSql = await readFile(fileURLToPath(new URL("../db/migrations/024_device_commands_and_profile_migrations.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -171,6 +172,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     if (chatContextIdentityApplied.rowCount === 0) await client.query(chatContextIdentitySql);
     await client.query(chatThreadSnapshotsSql);
     await client.query(chatThreadTurnSummariesSql);
+    await client.query(deviceCommandsSql);
     await client.end();
   });
 
@@ -199,6 +201,9 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("drafts").execute();
     await db.deleteFrom("approvals").execute();
     await db.deleteFrom("task_events").execute();
+    await db.deleteFrom("profile_switch_contexts").execute();
+    await db.deleteFrom("profile_switch_migrations").execute();
+    await db.deleteFrom("device_commands").execute();
     await db.deleteFrom("chat_thread_snapshot_jobs").execute();
     await db.deleteFrom("chat_context_recovery_attempts").execute();
     await db.deleteFrom("chat_context_compactions").execute();
@@ -806,6 +811,152 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(worker).toEqual({ status: "offline", operational_mode: "disabled" });
     expect((await db.selectFrom("worker_device_credentials").select("revoked_at").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).revoked_at).not.toBeNull();
     expect((await app.inject({ method: "DELETE", url: "/v1/runner/credentials/current", headers: { authorization: `Bearer ${deviceToken}` } })).statusCode).toBe(401);
+  });
+
+  it("runs only allowlisted device commands with a leased manager claim", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-manager-status";
+    await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).execute();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-device-command"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "device-command-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const managerHeaders = { authorization: `Bearer ${deviceToken}` };
+    const adminHeaders = { cookie: "lark_agent_admin_session=owner-device-command", "x-csrf-token": "device-command-csrf" };
+    const heartbeat = await app.inject({
+      method: "PUT", url: "/v1/runner/device-manager/worker-a/heartbeat", headers: managerHeaders,
+      payload: {
+        version: "0.5.0", localState: "running", activeProfile: "lark-agent",
+        profiles: [
+          { name: "lark-agent", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() },
+          { name: "seed", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() }
+        ]
+      }
+    });
+    expect(heartbeat.statusCode).toBe(200);
+    expect((await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "shell", command: "rm -rf /" }
+    })).statusCode).toBe(400);
+
+    const queued = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "status" }
+    });
+    expect(queued.statusCode).toBe(200);
+    expect(queued.json()).toMatchObject({ executorId: "worker-a", type: "status", state: "queued" });
+    const commandId = queued.json<{ id: string }>().id;
+    const claimed = await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    });
+    expect(claimed.statusCode).toBe(200);
+    expect(claimed.json()).toMatchObject({ id: commandId, type: "status", parameters: {} });
+    expect((await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    })).statusCode).toBe(204);
+    const leaseToken = claimed.json<{ leaseToken: string }>().leaseToken;
+    expect((await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${commandId}/complete`, headers: managerHeaders,
+      payload: { leaseToken, result: { localState: "running" } }
+    })).statusCode).toBe(200);
+    const completed = await app.inject({
+      method: "GET", url: `/v1/admin/workers/worker-a/device-commands/${commandId}`, headers: adminHeaders
+    });
+    expect(completed.json()).toMatchObject({ state: "succeeded", result: { localState: "running" }, error: null });
+
+    const expiring = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "restart" }
+    });
+    const expiringId = expiring.json<{ id: string }>().id;
+    expect((await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    })).statusCode).toBe(200);
+    await db.updateTable("device_commands").set({ lease_expires_at: new Date(Date.now() - 1_000) }).where("id", "=", expiringId).execute();
+    const expired = await app.inject({
+      method: "GET", url: `/v1/admin/workers/worker-a/device-commands/${expiringId}`, headers: adminHeaders
+    });
+    expect(expired.json()).toMatchObject({ state: "expired" });
+  });
+
+  it("rolls back a failed Profile switch and atomically completes a no-context retry", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-manager-profile";
+    await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).execute();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-profile-command"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "profile-command-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const managerHeaders = { authorization: `Bearer ${deviceToken}` };
+    const adminHeaders = { cookie: "lark_agent_admin_session=owner-profile-command", "x-csrf-token": "profile-command-csrf" };
+    const heartbeatPayload = {
+      version: "0.5.0", localState: "running", activeProfile: "lark-agent",
+      profiles: [
+        { name: "lark-agent", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() },
+        { name: "seed", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() }
+      ]
+    };
+    expect((await app.inject({
+      method: "PUT", url: "/v1/runner/device-manager/worker-a/heartbeat", headers: managerHeaders, payload: heartbeatPayload
+    })).statusCode).toBe(200);
+
+    const first = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "switch_profile", targetProfile: "seed" }
+    });
+    const firstId = first.json<{ id: string }>().id;
+    expect((await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow()).operational_mode)
+      .toBe("maintenance");
+    const firstClaim = await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    });
+    const firstLease = firstClaim.json<{ leaseToken: string }>().leaseToken;
+    expect((await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${firstId}/fail`, headers: managerHeaders,
+      payload: { leaseToken: firstLease, error: "目标 Worker 启动失败", rollbackSucceeded: true }
+    })).statusCode).toBe(200);
+    expect(await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow())
+      .toEqual({ operational_mode: "enabled" });
+    expect(await db.selectFrom("profile_switch_migrations").select(["state", "last_error"]).where("command_id", "=", firstId).executeTakeFirstOrThrow())
+      .toEqual({ state: "rolled_back", last_error: "目标 Worker 启动失败" });
+
+    const retry = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "switch_profile", targetProfile: "seed" }
+    });
+    const retryId = retry.json<{ id: string }>().id;
+    const retryClaim = await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    });
+    const retryLease = retryClaim.json<{ leaseToken: string }>().leaseToken;
+    const prepared = await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${retryId}/profile-prepare`, headers: managerHeaders,
+      payload: { leaseToken: retryLease }
+    });
+    expect(prepared.json()).toMatchObject({ state: "ready", contexts: [] });
+    const targetFingerprint = "b".repeat(64);
+    const targetWorkspaceFingerprint = "d".repeat(64);
+    await db.updateTable("workers").set({
+      codex_profile: "seed", config_fingerprint: targetFingerprint,
+      workspace_mapping_fingerprint: targetWorkspaceFingerprint, codex_version: "target-codex", updated_at: new Date()
+    }).where("executor_id", "=", "worker-a").execute();
+    expect((await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${retryId}/complete`, headers: managerHeaders,
+      payload: {
+        leaseToken: retryLease, result: { restarted: true }, targetProfile: "seed",
+        targetConfigFingerprint: targetFingerprint, targetWorkspaceMappingFingerprint: targetWorkspaceFingerprint,
+        targetCodexVersion: "target-codex", targetHomeRef: "worker-a:home", contexts: []
+      }
+    })).statusCode).toBe(200);
+    expect(await db.selectFrom("profile_switch_migrations").select(["state", "target_config_fingerprint"])
+      .where("command_id", "=", retryId).executeTakeFirstOrThrow())
+      .toEqual({ state: "succeeded", target_config_fingerprint: targetFingerprint });
+    expect(await db.selectFrom("workers").select("operational_mode").where("executor_id", "=", "worker-a").executeTakeFirstOrThrow())
+      .toEqual({ operational_mode: "enabled" });
   });
 
   it("reports active Thread snapshots and refuses upgrade drain until their lease expires", async () => {
