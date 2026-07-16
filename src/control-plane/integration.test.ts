@@ -1481,17 +1481,26 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await outputs.streamCommentary(task.id, { itemId: "comment_1", phase: "commentary", text: "正在查询…", ordinal: 1, baseRoomSeq: 1 });
     await outputs.streamCommentary(task.id, { itemId: "comment_1", phase: "commentary", text: "重复", ordinal: 1, baseRoomSeq: 1 });
     await outputs.streamCommentary(task.id, { itemId: "comment_2", phase: "commentary", text: "新的回合", ordinal: 1, baseRoomSeq: 1 });
+    await expect(outputs.streamCommentary(task.id, {
+      itemId: "misphased_final", phase: "commentary", text: '{"disposition":"awaiting_followup"', ordinal: 2, baseRoomSeq: 1
+    })).resolves.toEqual({ messageId: "om_one", ignored: true });
+    await outputs.streamCommentary(task.id, {
+      itemId: "misphased_final", phase: "commentary",
+      text: JSON.stringify({ disposition: "awaiting_followup", rationale: "等待后续输入", reply: "只展示 reply" }),
+      ordinal: 3, baseRoomSeq: 1
+    });
     const final = await outputs.finalize(task.id, "最终答案", "draft-key");
 
     expect(final).toEqual({ messageId: "om_one", transport: "cardkit" });
     expect(calls).toEqual([
       { kind: "create_stream", content: "正在查询…" }, { kind: "send" },
       { kind: "update", sequence: 1, content: "新的回合" },
-      { kind: "update", sequence: 2, content: "最终答案" }, { kind: "close", sequence: 3 }
+      { kind: "update", sequence: 2, content: "只展示 reply" },
+      { kind: "update", sequence: 3, content: "最终答案" }, { kind: "close", sequence: 4 }
     ]);
     const output = await db.selectFrom("task_outputs").selectAll().where("task_id", "=", task.id).executeTakeFirstOrThrow();
-    expect(output).toMatchObject({ card_id: "card_one", message_id: "om_one", sequence: 3, state: "completed", visible_phase: "final", last_item_id: "comment_2" });
-    expect(await db.selectFrom("task_output_updates").selectAll().where("task_id", "=", task.id).execute()).toHaveLength(5);
+    expect(output).toMatchObject({ card_id: "card_one", message_id: "om_one", sequence: 4, state: "completed", visible_phase: "final", last_item_id: "misphased_final" });
+    expect(await db.selectFrom("task_output_updates").selectAll().where("task_id", "=", task.id).execute()).toHaveLength(6);
   });
 
   it("anchors a group CardKit reply to the activating message without sending directly to the chat", async () => {

@@ -5,7 +5,7 @@ import type { ControlPlaneConfig } from "./config.js";
 import { LarkGateway, previewSummary } from "../lark/gateway.js";
 import { AppError, errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
-import type { CommentaryStreamUpdate } from "../shared/contracts.js";
+import { taskTurnResultSchema, type CommentaryStreamUpdate } from "../shared/contracts.js";
 import { BotGatewayRegistry } from "./bot-runtime.js";
 
 type OutputRow = Awaited<ReturnType<TaskOutputService["getOutput"]>>;
@@ -23,13 +23,15 @@ export class TaskOutputService {
     return this.serialized(taskId, async () => {
       const existing = await this.getOutput(taskId);
       if (existing?.last_item_id === update.itemId && update.ordinal <= existing.last_ordinal) return { messageId: existing.message_id, ignored: true };
-      const output = existing?.message_id ? existing : await this.openCard(taskId, update.text, true);
+      const visibleText = visibleStreamText(update.text);
+      if (visibleText === null) return { messageId: existing?.message_id ?? null, ignored: true };
+      const output = existing?.message_id ? existing : await this.openCard(taskId, visibleText, true);
       if (!output.message_id || !output.card_id) return { messageId: output.message_id, ignored: false };
       if (!existing?.message_id) {
         await this.db.updateTable("task_outputs").set({ last_item_id: update.itemId, last_ordinal: update.ordinal, visible_phase: "commentary", updated_at: new Date() }).where("task_id", "=", taskId).execute();
         return { messageId: output.message_id, ignored: false };
       }
-      await this.updateContent(output, update.text, "commentary", update.ordinal, update.itemId);
+      await this.updateContent(output, visibleText, "commentary", update.ordinal, update.itemId);
       return { messageId: output.message_id, ignored: false };
     });
   }
@@ -228,6 +230,27 @@ export class TaskOutputService {
     });
     this.queues.set(taskId, tracked);
     return tracked;
+  }
+}
+
+/**
+ * App Server versions may briefly label the structured final answer as
+ * commentary while streaming it. Keep lifecycle metadata out of the user-facing
+ * card: incomplete JSON is buffered, and a complete task result exposes only
+ * its reply field. Ordinary commentary remains unchanged.
+ */
+export function visibleStreamText(text: string): string | null {
+  const trimmed = text.trim();
+  const fencedJson = /^```(?:json)?(?:\s|$)/i.test(trimmed);
+  const jsonCandidate = fencedJson
+    ? trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim()
+    : trimmed;
+  if (!jsonCandidate.startsWith("{")) return fencedJson ? null : text;
+  try {
+    const result = taskTurnResultSchema.safeParse(JSON.parse(jsonCandidate));
+    return result.success ? result.data.reply : null;
+  } catch {
+    return null;
   }
 }
 
