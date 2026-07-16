@@ -1284,6 +1284,20 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(draft.state).toBe("held");
     expect(draft.observed_room_seq).toBe(2);
 
+    const replacementResponse = await app.inject({
+      method: "POST",
+      url: `/v1/tasks/${task.id}/drafts`,
+      headers: { authorization: `Bearer ${sessionToken}`, "x-lease-token": claim.leaseToken },
+      payload: { content: "fresh answer", baseRoomSeq: 2, force: false }
+    });
+    expect(replacementResponse.statusCode).toBe(200);
+    expect(replacementResponse.json<{ held: boolean; simulated: boolean }>()).toMatchObject({ held: false, simulated: true });
+    const replacementDrafts = await db.selectFrom("drafts").select(["content", "state"]).where("task_id", "=", task.id).orderBy("created_at").execute();
+    expect(replacementDrafts).toEqual([
+      { content: "stale answer", state: "discarded" },
+      { content: "fresh answer", state: "approved" }
+    ]);
+
     await db.updateTable("worker_device_credentials").set({ revoked_at: new Date() }).where("executor_id", "=", "worker-a").execute();
     const revokedSession = await app.inject({ method: "POST", url: "/v1/tasks/claim", headers: { authorization: `Bearer ${sessionToken}` } });
     expect(revokedSession.statusCode).toBe(401);

@@ -75,6 +75,8 @@ export class DraftService {
       await this.db.transaction().execute(async (trx) => {
         await trx.updateTable("outbox_messages").set({ state: "simulated", updated_at: new Date() }).where("id", "=", outbox.id).execute();
         await trx.updateTable("drafts").set({ state: "approved", updated_at: new Date() }).where("id", "=", draft.id).execute();
+        await trx.updateTable("drafts").set({ state: "discarded", updated_at: new Date() })
+          .where("task_id", "=", task.id).where("id", "!=", draft.id).where("state", "=", "held").execute();
       });
       return { draft: { ...draft, state: "approved" as const }, sent: false, held: false, simulated: true };
     }
@@ -85,6 +87,8 @@ export class DraftService {
       await this.db.transaction().execute(async (trx) => {
         await trx.updateTable("outbox_messages").set({ state: "sent", platform_message_id: platformMessageId, sent_at: now, updated_at: now, attempt: outbox.attempt + 1 }).where("id", "=", outbox.id).execute();
         await trx.updateTable("drafts").set({ state: "sent", sent_at: now, updated_at: now }).where("id", "=", draft.id).execute();
+        await trx.updateTable("drafts").set({ state: "discarded", updated_at: now })
+          .where("task_id", "=", task.id).where("id", "!=", draft.id).where("state", "=", "held").execute();
       });
       return { draft, sent: true, held: false, platformMessageId };
     } catch (error) {

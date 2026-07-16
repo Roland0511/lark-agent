@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { ClaimedTask, Signal, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, type ControlPlaneClient } from "./control-plane-client.js";
-import { buildTaskPrompt, codexCompactionFromActivity, TaskProcessor } from "./processor.js";
+import { buildTaskPrompt, codexCompactionFromActivity, shouldMergeCausalBotRevision, TaskProcessor } from "./processor.js";
 
 function startupProcessor(listSkills: () => Promise<never[]> = async () => []) {
   const logs: string[] = [];
@@ -160,6 +160,28 @@ describe("TaskProcessor attachments", () => {
     expect(limits).toEqual([5, 3]);
     expect(events.map((item) => item.type)).toEqual(["attachment.downloaded", "attachment.failed"]);
     expect(events[1]?.payload.reason).toBe("task_limit");
+  });
+});
+
+describe("TaskProcessor stale draft revision", () => {
+  it("merges a registered bot reply from the same causal chain deterministically", () => {
+    const botSignal: Signal = {
+      ...signal("99999999-9999-4999-8999-999999999999", []),
+      senderId: "cli_peer",
+      senderType: "bot",
+      senderBotId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      senderDisplayName: "Peer Bot",
+      originMessageId: "om_signal",
+      messageId: "om_peer_reply",
+      content: "1",
+      preview: "1",
+      decision: "pending"
+    };
+
+    expect(shouldMergeCausalBotRevision({ ...task, signals: [signal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab", [])] }, botSignal, true)).toBe(true);
+    expect(shouldMergeCausalBotRevision({ ...task, signals: [signal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab", [])] }, botSignal, false)).toBe(false);
+    expect(shouldMergeCausalBotRevision({ ...task, signals: [signal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab", [])] }, { ...botSignal, originMessageId: "om_other" }, true)).toBe(false);
+    expect(shouldMergeCausalBotRevision({ ...task, signals: [signal("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaab", [])] }, { ...botSignal, senderType: "user" }, true)).toBe(false);
   });
 });
 

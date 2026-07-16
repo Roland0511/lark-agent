@@ -209,7 +209,20 @@ export class TaskProcessor {
         let hasDeferred = false;
         for (const signal of signals) {
           let decision = signal.decision;
-          if (decision === "pending") {
+          if (decision === "pending" && shouldMergeCausalBotRevision(task, signal, revision > 0)) {
+            const attention: AttentionResult = {
+              decision: "merge",
+              priority: 100,
+              rationale: "先前草稿尚未发送；同一因果链中的机器人新回复必须合并，以便按当前可见进度改写。"
+            };
+            await this.client.decideSignal(task.id, signal.id, task.leaseToken, attention);
+            await this.client.event(task.id, task.leaseToken, "attention.completed", "同一因果链的机器人消息已合并到草稿重写", {
+              decision: attention.decision,
+              priority: attention.priority,
+              policy: "causal_bot_revision"
+            });
+            decision = attention.decision;
+          } else if (decision === "pending") {
             this.currentCodexStage = "attention";
             this.latestTokenUsage = null;
             await this.client.event(task.id, task.leaseToken, "attention.started", "开始注意力判断", this.observedModelPolicy(task.attentionModel, task.attentionReasoningEffort));
@@ -831,6 +844,11 @@ export function buildTaskPrompt(task: ClaimedTask, signals: Signal[], revision: 
     "最终必须按结构化 schema 返回 reply、disposition 和 rationale。reply 是适合直接回复飞书的简洁正文；不要重复 commentary，完整执行日志不要复制到回复中。",
     "若请求已完整完成且不期待对方继续，disposition=complete；若当前回复明确期待下一条输入、接龙、确认或后续步骤，disposition=awaiting_followup。数数到目标值前必须等待，达到目标值时完成。"
   ].join("\n");
+}
+
+export function shouldMergeCausalBotRevision(task: ClaimedTask, signal: Signal, revision: boolean): boolean {
+  return revision && signal.decision === "pending" && signal.senderType === "bot" &&
+    task.signals.some((initial) => initial.originMessageId === signal.originMessageId);
 }
 
 function dedupeLocal(items: LocalAttachment[]): LocalAttachment[] {
