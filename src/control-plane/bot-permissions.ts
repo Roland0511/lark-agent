@@ -1,6 +1,7 @@
 import { errorMessage } from "../shared/errors.js";
 
 export type BotPermissionState = "unchecked" | "valid" | "missing" | "error";
+export const botPermissionPolicyVersion = 2;
 
 export interface BotPermissionRequirement {
   key: string;
@@ -15,6 +16,7 @@ export interface BotPermissionItem extends BotPermissionRequirement {
 }
 
 export interface BotPermissionCheck {
+  policyVersion: number;
   state: Exclude<BotPermissionState, "unchecked">;
   ok: boolean;
   checkedAt: string;
@@ -68,6 +70,15 @@ export const requiredBotPermissions: BotPermissionRequirement[] = [
     alternatives: [["im:chat:read"], ["im:chat:readonly"], ["im:chat"]]
   },
   {
+    key: "p2p_identity",
+    label: "识别私聊联系人",
+    description: "用于在聊天记忆、技能管理与任务中心显示私聊对象姓名。",
+    alternatives: [
+      ["contact:contact.base:readonly", "contact:user.base:readonly"],
+      ["contact:contact:readonly_as_app", "contact:user.base:readonly"]
+    ]
+  },
+  {
     key: "cardkit_write",
     label: "创建和更新 CardKit 卡片",
     description: "用于单消息流式回复和最终结果原位更新。",
@@ -83,6 +94,7 @@ export function evaluateBotPermissions(scopes: Iterable<string>, checkedAt = new
   });
   const missingScopes = [...new Set(items.filter((item) => item.status === "missing").flatMap((item) => item.alternatives[0] ?? []))];
   return {
+    policyVersion: botPermissionPolicyVersion,
     state: missingScopes.length ? "missing" : "valid",
     ok: missingScopes.length === 0,
     checkedAt: checkedAt.toISOString(),
@@ -102,6 +114,7 @@ export class BotPermissionService {
       return evaluateBotPermissions(await this.listGrantedScopes(profileName), checkedAt);
     } catch (error) {
       return {
+        policyVersion: botPermissionPolicyVersion,
         state: "error",
         ok: false,
         checkedAt: checkedAt.toISOString(),

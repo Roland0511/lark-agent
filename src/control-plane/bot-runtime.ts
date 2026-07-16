@@ -16,6 +16,7 @@ import type { AdminEventBus } from "./admin-events.js";
 import { legacyBotId, type BotRow } from "./bot-types.js";
 import { MessageRouter } from "./message-router.js";
 import type { BotDialogueGuardService } from "./bot-dialogue-guard.js";
+import type { ChatIdentityService } from "./chat-identity.js";
 
 const messageEventSchema = z.object({
   type: z.literal("im.message.receive_v1"), event_id: z.string(), timestamp: z.string(), message_id: z.string(), chat_id: z.string(),
@@ -162,12 +163,13 @@ export class BotRuntimeManager {
     private readonly events: AdminEventBus,
     private readonly log: { info(value: unknown, message: string): void; error(value: unknown, message: string): void },
     private readonly messageRouter = new MessageRouter(db),
-    private readonly dialogueGuard?: BotDialogueGuardService
+    private readonly dialogueGuard?: BotDialogueGuardService,
+    private readonly chatIdentity?: ChatIdentityService
   ) {}
 
   async startAll(): Promise<void> {
     const bots = await this.db.selectFrom("bots").selectAll().where("enabled", "=", true).where("credential_state", "=", "verified")
-      .where("permission_state", "in", ["unchecked", "valid"]).where("deleted_at", "is", null).execute();
+      .where("permission_state", "=", "valid").where("deleted_at", "is", null).execute();
     await Promise.all(bots.map((bot) => this.start(bot)));
   }
 
@@ -175,7 +177,7 @@ export class BotRuntimeManager {
     await this.stop(botId);
     this.gateways.invalidate(botId);
     const bot = await this.db.selectFrom("bots").selectAll().where("id", "=", botId).where("deleted_at", "is", null).executeTakeFirst();
-    if (bot?.enabled && bot.credential_state === "verified" && ["unchecked", "valid"].includes(bot.permission_state)) await this.start(bot);
+    if (bot?.enabled && bot.credential_state === "verified" && bot.permission_state === "valid") await this.start(bot);
   }
 
   async suspend(botId: string): Promise<void> {
@@ -195,7 +197,7 @@ export class BotRuntimeManager {
   private async start(bot: BotRow): Promise<void> {
     if (this.active.has(bot.id) || !this.config.larkEnabled) return;
     const gateway = await this.gateways.gateway(bot.id);
-    const router = new EventRouter(this.db, this.config, gateway, this.repository, bot, this.messageRouter, this.dialogueGuard);
+    const router = new EventRouter(this.db, this.config, gateway, this.repository, bot, this.messageRouter, this.dialogueGuard, this.chatIdentity);
     const consumers: NdjsonConsumer[] = [];
     const messageKey = `${bot.id}:message`;
     this.runtime.configure(messageKey, true, false);

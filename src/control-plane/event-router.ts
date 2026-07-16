@@ -12,6 +12,7 @@ import { MessageRouter } from "./message-router.js";
 import { botMessageContextForPlatformMessage } from "./bot-message-context.js";
 import type { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 import { extractLarkAttachments, safeMessageContent } from "../lark/attachments.js";
+import type { ChatIdentityService } from "./chat-identity.js";
 
 const helpCommands = new Set(["/help", "/帮助"]);
 
@@ -31,7 +32,8 @@ export class EventRouter {
       created_at: new Date(), updated_at: new Date()
     },
     private readonly messageRouter = new MessageRouter(db),
-    private readonly dialogueGuard?: BotDialogueGuardService
+    private readonly dialogueGuard?: BotDialogueGuardService,
+    private readonly chatIdentity?: ChatIdentityService
   ) {}
 
   async handleMessage(event: LarkMessageEvent): Promise<void> {
@@ -116,7 +118,7 @@ export class EventRouter {
       await this.markDiscarded(event.event_id, event.type);
       return;
     }
-    await this.messageRouter.route(this.bot, {
+    const routed = await this.messageRouter.route(this.bot, {
       eventId: event.event_id,
       eventType: event.type,
       messageId: event.message_id,
@@ -137,6 +139,9 @@ export class EventRouter {
       explicitlyActivated,
       receivedAt: new Date()
     });
+    if (event.chat_type === "p2p" && !senderBot && routed.chatContextId) {
+      void this.chatIdentity?.refresh(routed.chatContextId, this.lark).catch(() => undefined);
+    }
   }
 
   async handleCardAction(event: LarkCardActionEvent): Promise<void> {

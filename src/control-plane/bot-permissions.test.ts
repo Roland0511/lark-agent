@@ -9,6 +9,8 @@ const fullScopes = [
   "im:message.group_bot_msg:readonly",
   "im:message",
   "im:chat:readonly",
+  "contact:contact.base:readonly",
+  "contact:user.base:readonly",
   "cardkit:card:write"
 ];
 
@@ -30,6 +32,8 @@ describe("bot permission checks", () => {
       "im:message:readonly",
       "im:message:send_as_bot",
       "im:chat:read",
+      "contact:contact:readonly_as_app",
+      "contact:user.base:readonly",
       "cardkit:card:write"
     ]);
     expect(result.ok).toBe(true);

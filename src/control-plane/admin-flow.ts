@@ -7,6 +7,7 @@ import type { RuntimeStatus } from "./runtime-status.js";
 import { AppError } from "../shared/errors.js";
 import { publicAttachments } from "../lark/attachments.js";
 import { effectiveWorkerDisplayName } from "./worker-display-name.js";
+import { chatDisplayName } from "./chat-display-name.js";
 
 const flowStages = ["message", "inbox", "attention", "routing", "codex", "draft", "outbox", "reply"] as const;
 type FlowStage = (typeof flowStages)[number];
@@ -106,9 +107,26 @@ function redactSecrets(value: unknown): unknown {
   ]));
 }
 
-function publicTask(task: Task) {
+function publicTask<T extends Task>(task: T): Omit<T, "lease_token_hash" | "authorization_grant"> {
   const { lease_token_hash: _leaseTokenHash, authorization_grant: _authorizationGrant, ...safe } = task;
   return safe;
+}
+
+function withChatDisplay<T extends object>(row: T & { chat_type: string }): T & { chat_type: string; chat_display_name: string } {
+  const identity = row as T & {
+    chat_name?: string | null | undefined;
+    peer_open_id?: string | null | undefined;
+    peer_display_name?: string | null | undefined;
+  };
+  return {
+    ...row,
+    chat_display_name: chatDisplayName({
+      chatType: row.chat_type,
+      chatName: identity.chat_name ?? null,
+      peerOpenId: identity.peer_open_id ?? null,
+      peerDisplayName: identity.peer_display_name ?? null
+    })
+  };
 }
 
 function flowHealth(task: Task, signalDecisions: string[], draftState?: string, approvalState?: string, outputState?: string, outboxState?: string) {
@@ -181,8 +199,10 @@ export function registerAdminFlowRoutes(
     const start = since(request.query.range);
     if (view === "inbox") {
       let query = db.selectFrom("signals").innerJoin("tasks", "tasks.id", "signals.task_id").innerJoin("conversations", "conversations.id", "signals.conversation_id").innerJoin("bots", "bots.id", "signals.bot_id")
+        .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+        .leftJoin("bot_chat_bindings as flow_chat_bindings", (join) => join.onRef("flow_chat_bindings.bot_id", "=", "signals.bot_id").onRef("flow_chat_bindings.chat_id", "=", "conversations.chat_id"))
         .leftJoin("workers as task_workers", "task_workers.executor_id", "tasks.executor_id")
-        .select(["signals.id", "signals.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.sender_type", "signals.sender_bot_id", "signals.sender_display_name", "signals.ingress_source", "signals.origin_message_id", "signals.bot_dialogue_depth", "signals.message_type", "signals.content", "signals.attachments", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
+        .select(["signals.id", "signals.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "signals.conversation_id", "signals.task_id", "signals.event_id", "signals.seq", "signals.message_id", "signals.sender_id", "signals.sender_role", "signals.sender_type", "signals.sender_bot_id", "signals.sender_display_name", "signals.ingress_source", "signals.origin_message_id", "signals.bot_dialogue_depth", "signals.message_type", "signals.content", "signals.attachments", "signals.priority", "signals.decision", "signals.decision_rationale", "signals.created_at", "signals.decided_at", "tasks.turn_index", "tasks.state as task_state", "tasks.codex_thread_id", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "flow_chat_bindings.chat_name", "chat_contexts.peer_open_id", "chat_contexts.peer_display_name", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
         .orderBy(sql`CASE WHEN signals.decision IN ('pending','defer') THEN 0 ELSE 1 END`).orderBy("signals.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("signals.created_at", ">=", start);
       if (request.query.state) query = query.where("signals.decision", "=", request.query.state);
@@ -190,16 +210,26 @@ export function registerAdminFlowRoutes(
       if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
       if (request.query.workspace) query = query.where("tasks.resolved_workspace_alias", "=", request.query.workspace);
       if (request.query.bot) query = query.where("signals.bot_id", "=", request.query.bot);
-      if (request.query.q) query = query.where("signals.content", "ilike", `%${request.query.q.replace(/[%_]/g, "")}%`);
+      if (request.query.q) {
+        const contains = `%${request.query.q.replace(/[%_]/g, "")}%`;
+        query = query.where(sql<boolean>`(signals.content ILIKE ${contains}
+          OR COALESCE(tasks.codex_thread_id, '') ILIKE ${contains}
+          OR conversations.chat_id ILIKE ${contains}
+          OR COALESCE(flow_chat_bindings.chat_name, '') ILIKE ${contains}
+          OR COALESCE(chat_contexts.peer_display_name, '') ILIKE ${contains}
+          OR COALESCE(chat_contexts.peer_open_id, '') ILIKE ${contains})`);
+      }
       if (request.query.before) query = query.where("signals.created_at", "<", new Date(request.query.before));
       const rows = await query.execute();
-      return { items: rows.slice(0, limit).map((row) => ({ ...row, attachments: publicAttachments(row.attachments), created_at: iso(row.created_at), decided_at: iso(row.decided_at), decisionSeconds: elapsed(row.created_at, row.decided_at), enteredCodex: Boolean(row.codex_thread_id) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
+      return { items: rows.slice(0, limit).map((row) => withChatDisplay({ ...row, attachments: publicAttachments(row.attachments), created_at: iso(row.created_at), decided_at: iso(row.decided_at), decisionSeconds: elapsed(row.created_at, row.decided_at), enteredCodex: Boolean(row.codex_thread_id) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
     if (view === "outbox") {
       let query = db.selectFrom("outbox_messages").innerJoin("tasks", "tasks.id", "outbox_messages.task_id").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
+        .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+        .leftJoin("bot_chat_bindings as flow_chat_bindings", (join) => join.onRef("flow_chat_bindings.bot_id", "=", "tasks.bot_id").onRef("flow_chat_bindings.chat_id", "=", "conversations.chat_id"))
         .leftJoin("workers as task_workers", "task_workers.executor_id", "tasks.executor_id")
         .leftJoin("drafts", "drafts.id", "outbox_messages.draft_id").leftJoin("task_outputs", "task_outputs.task_id", "tasks.id")
-        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
+        .select(["outbox_messages.id", "outbox_messages.task_id", "outbox_messages.draft_id", "outbox_messages.target_message_id", "outbox_messages.content", "outbox_messages.idempotency_key", "outbox_messages.operation_kind", "outbox_messages.state", "outbox_messages.platform_message_id", "outbox_messages.attempt", "outbox_messages.last_error", "outbox_messages.created_at", "outbox_messages.updated_at", "outbox_messages.sent_at", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "tasks.turn_index", "tasks.trigger_message_id", "tasks.state as task_state", "tasks.executor_id", "tasks.resolved_workspace_alias", "conversations.chat_id", "conversations.chat_type", "flow_chat_bindings.chat_name", "chat_contexts.peer_open_id", "chat_contexts.peer_display_name", "drafts.base_room_seq", "drafts.observed_room_seq", "drafts.hold_count", "task_outputs.transport", "task_outputs.state as output_state", "task_outputs.sequence", "task_outputs.card_id", "task_outputs.message_id as output_message_id", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
         .orderBy(sql`CASE WHEN outbox_messages.state IN ('unknown','pending') THEN 0 ELSE 1 END`).orderBy("outbox_messages.created_at", "desc").limit(limit + 1);
       if (start) query = query.where("outbox_messages.created_at", ">=", start);
       if (request.query.state) query = query.where("outbox_messages.state", "=", request.query.state);
@@ -207,16 +237,25 @@ export function registerAdminFlowRoutes(
       if (request.query.executor) query = query.where("tasks.executor_id", "=", request.query.executor);
       if (request.query.workspace) query = query.where("tasks.resolved_workspace_alias", "=", request.query.workspace);
       if (request.query.bot) query = query.where("tasks.bot_id", "=", request.query.bot);
-      if (request.query.q) query = query.where("outbox_messages.content", "ilike", `%${request.query.q.replace(/[%_]/g, "")}%`);
+      if (request.query.q) {
+        const contains = `%${request.query.q.replace(/[%_]/g, "")}%`;
+        query = query.where(sql<boolean>`(outbox_messages.content ILIKE ${contains}
+          OR COALESCE(tasks.codex_thread_id, '') ILIKE ${contains}
+          OR conversations.chat_id ILIKE ${contains}
+          OR COALESCE(flow_chat_bindings.chat_name, '') ILIKE ${contains}
+          OR COALESCE(chat_contexts.peer_display_name, '') ILIKE ${contains}
+          OR COALESCE(chat_contexts.peer_open_id, '') ILIKE ${contains})`);
+      }
       if (request.query.before) query = query.where("outbox_messages.created_at", "<", new Date(request.query.before));
       const rows = await query.execute();
-      return { items: rows.slice(0, limit).map((row) => ({ ...row, created_at: iso(row.created_at), updated_at: iso(row.updated_at), sent_at: iso(row.sent_at), deliverySeconds: elapsed(row.created_at, row.sent_at) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
+      return { items: rows.slice(0, limit).map((row) => withChatDisplay({ ...row, created_at: iso(row.created_at), updated_at: iso(row.updated_at), sent_at: iso(row.sent_at), deliverySeconds: elapsed(row.created_at, row.sent_at) })), nextCursor: rows.length > limit ? iso(rows[limit - 1]?.created_at) : null };
     }
 
     let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
       .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+      .leftJoin("bot_chat_bindings as flow_chat_bindings", (join) => join.onRef("flow_chat_bindings.bot_id", "=", "tasks.bot_id").onRef("flow_chat_bindings.chat_id", "=", "conversations.chat_id"))
       .leftJoin("workers as task_workers", "task_workers.executor_id", "tasks.executor_id").selectAll("tasks")
-      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at", "chat_contexts.state as chat_context_state", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
+      .select(["bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.active as conversation_active", "conversations.followup_expires_at", "chat_contexts.state as chat_context_state", "flow_chat_bindings.chat_name", "chat_contexts.peer_open_id", "chat_contexts.peer_display_name", sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name")])
       .orderBy(sql`CASE WHEN tasks.state IN ('completed','cancelled') THEN 1 ELSE 0 END`).orderBy("tasks.created_at", "desc").limit(limit + 1);
     if (start) query = query.where("tasks.created_at", ">=", start);
     if (request.query.state) query = query.where("tasks.state", "=", request.query.state as Task["state"]);
@@ -228,6 +267,11 @@ export function registerAdminFlowRoutes(
       const prefix = `${request.query.q.replace(/[%_]/g, "")}%`;
       const contains = `%${request.query.q.replace(/[%_]/g, "")}%`;
       query = query.where(sql<boolean>`(tasks.id::text ILIKE ${prefix} OR tasks.conversation_id::text ILIKE ${prefix}
+        OR COALESCE(tasks.codex_thread_id, '') ILIKE ${contains}
+        OR conversations.chat_id ILIKE ${contains}
+        OR COALESCE(flow_chat_bindings.chat_name, '') ILIKE ${contains}
+        OR COALESCE(chat_contexts.peer_display_name, '') ILIKE ${contains}
+        OR COALESCE(chat_contexts.peer_open_id, '') ILIKE ${contains}
         OR EXISTS (SELECT 1 FROM signals flow_signal WHERE flow_signal.task_id = tasks.id AND flow_signal.content ILIKE ${contains})
         OR EXISTS (SELECT 1 FROM drafts flow_draft WHERE flow_draft.task_id = tasks.id AND flow_draft.content ILIKE ${contains})
         OR EXISTS (SELECT 1 FROM outbox_messages flow_outbox WHERE flow_outbox.task_id = tasks.id AND flow_outbox.content ILIKE ${contains}))`);
@@ -256,7 +300,7 @@ export function registerAdminFlowRoutes(
       const stage = currentStage(task, decisions, taskDraft?.state, taskApproval?.state, taskOutput?.state, taskOutbox?.state, task.chat_context_state);
       const latency = buildStageTimings(taskEvents);
       const codexEvent = taskEvents.find((event) => event.event_type === "codex.thread.ready" || event.event_type === "codex.thread");
-      return {
+      return withChatDisplay({
         ...publicTask(task),
         executor_display_name: task.executor_display_name,
         created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), followup_expires_at: iso(task.followup_expires_at),
@@ -270,7 +314,7 @@ export function registerAdminFlowRoutes(
         approval: taskApproval ? { ...taskApproval, created_at: iso(taskApproval.created_at), decided_at: iso(taskApproval.decided_at) } : null,
         output: taskOutput ? { ...taskOutput, created_at: iso(taskOutput.created_at), opened_at: iso(taskOutput.opened_at), closed_at: iso(taskOutput.closed_at) } : null,
         outbox: taskOutbox ? { ...taskOutbox, created_at: iso(taskOutbox.created_at), sent_at: iso(taskOutbox.sent_at) } : null
-      };
+      });
     }).filter((item) => !request.query.stage || item.currentStage === request.query.stage);
     return { items, nextCursor: rows.length > limit ? iso(page.at(-1)?.created_at) : null };
   });

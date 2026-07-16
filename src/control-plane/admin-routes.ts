@@ -13,6 +13,7 @@ import type { BotGatewayRegistry } from "./bot-runtime.js";
 import { publicAttachments } from "../lark/attachments.js";
 import { effectiveWorkerDisplayName, publicWorkerDisplayName } from "./worker-display-name.js";
 import { lockExecutorClaim } from "./executor-claim-lock.js";
+import { chatDisplayName } from "./chat-display-name.js";
 
 const commandSchema = z.object({
   command: z.enum(["retry", "cancel", "handoff", "return_agent", "mark_completed"]),
@@ -157,11 +158,14 @@ export function registerAdminRoutes(
     await requireAdmin(db, config, request);
     const limit = Math.min(Math.max(Number(request.query.limit ?? 30), 1), 100);
     let query = db.selectFrom("tasks").innerJoin("conversations", "conversations.id", "tasks.conversation_id").innerJoin("bots", "bots.id", "tasks.bot_id")
+      .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+      .leftJoin("bot_chat_bindings as task_chat_bindings", (join) => join.onRef("task_chat_bindings.bot_id", "=", "tasks.bot_id").onRef("task_chat_bindings.chat_id", "=", "conversations.chat_id"))
       .leftJoin("workers as task_workers", "task_workers.executor_id", "tasks.executor_id").select([
       "tasks.id", "tasks.state", "tasks.revision", "tasks.executor_id", "tasks.requested_workspace_alias", "tasks.resolved_workspace_alias", "tasks.requester_id",
       "tasks.requester_role", "tasks.attempt", "tasks.summary", "tasks.created_at", "tasks.updated_at", "tasks.completed_at", "tasks.conversation_id",
       "tasks.turn_index", "tasks.conversation_disposition", "tasks.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name",
-      "conversations.chat_context_id", "conversations.chat_type", "conversations.room_seq",
+      "conversations.chat_context_id", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq",
+      "task_chat_bindings.chat_name", "chat_contexts.peer_open_id", "chat_contexts.peer_display_name",
       sql<string | null>`coalesce(task_workers.display_alias, task_workers.display_name)`.as("executor_display_name"),
       sql<string | null>`(select signals.content from signals where signals.task_id = tasks.id order by signals.seq desc limit 1)`.as("latest_signal_content")
     ]).orderBy("tasks.created_at", "desc").orderBy("tasks.id", "desc").limit(limit + 1);
@@ -179,14 +183,24 @@ export function registerAdminRoutes(
     ]));
     if (request.query.q) {
       const prefix = `${request.query.q.replace(/[%_]/g, "")}%`;
-      query = query.where(sql<boolean>`(tasks.id::text ILIKE ${prefix} OR tasks.conversation_id::text ILIKE ${prefix})`);
+      const contains = `%${request.query.q.replace(/[%_]/g, "")}%`;
+      query = query.where(sql<boolean>`(tasks.id::text ILIKE ${prefix} OR tasks.conversation_id::text ILIKE ${prefix}
+        OR COALESCE(tasks.codex_thread_id, '') ILIKE ${contains}
+        OR conversations.chat_id ILIKE ${contains}
+        OR COALESCE(task_chat_bindings.chat_name, '') ILIKE ${contains}
+        OR COALESCE(chat_contexts.peer_display_name, '') ILIKE ${contains}
+        OR COALESCE(chat_contexts.peer_open_id, '') ILIKE ${contains})`);
     }
     if (request.query.before) query = query.where("tasks.created_at", "<", new Date(request.query.before));
     const rows = await query.execute();
     const hasMore = rows.length > limit;
     const page = rows.slice(0, limit);
     return {
-      items: page.map((task) => ({ ...task, requester_id: masked(task.requester_id), created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), summaryAvailable: true })),
+      items: page.map((task) => ({
+        ...task,
+        chat_display_name: chatDisplayName({ chatType: task.chat_type, chatName: task.chat_name, peerOpenId: task.peer_open_id, peerDisplayName: task.peer_display_name }),
+        requester_id: masked(task.requester_id), created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), summaryAvailable: true
+      })),
       nextCursor: hasMore ? iso(page.at(-1)?.created_at ?? null) : null
     };
   });
@@ -197,23 +211,26 @@ export function registerAdminRoutes(
       .innerJoin("conversations", "conversations.id", "tasks.conversation_id")
       .innerJoin("bots", "bots.id", "tasks.bot_id")
       .leftJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
+      .leftJoin("bot_chat_bindings as task_chat_bindings", (join) => join.onRef("task_chat_bindings.bot_id", "=", "tasks.bot_id").onRef("task_chat_bindings.chat_id", "=", "conversations.chat_id"))
       .selectAll("tasks")
       .select([
         "bots.app_id as bot_app_id", "bots.display_name as bot_display_name", "bots.default_executor_id as bot_default_executor_id",
         "conversations.chat_context_id", "conversations.chat_id", "conversations.chat_type", "conversations.room_seq", "conversations.thread_id",
         "conversations.followup_expires_at", "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot",
         "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot",
-        "chat_contexts.codex_thread_id as chat_context_thread_id", "chat_contexts.state as chat_context_state"
+        "chat_contexts.codex_thread_id as chat_context_thread_id", "chat_contexts.state as chat_context_state",
+        "chat_contexts.peer_open_id", "chat_contexts.peer_display_name", "task_chat_bindings.chat_name as stored_chat_name"
       ])
       .where("tasks.id", "=", request.params.id).executeTakeFirst();
     if (!task) throw new AppError("任务不存在", 404, "not_found");
     const worker = task.executor_id ? await db.selectFrom("workers").select(["display_name", "display_alias", "capabilities", "last_seen_at", "operational_mode"]).where("executor_id", "=", task.executor_id).executeTakeFirst() : null;
-    const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => null) : null;
+    const chatName = config.larkEnabled && task.chat_type === "group" ? await (await gateways.gateway(task.bot_id)).getChatName(task.chat_id).catch(() => task.stored_chat_name) : task.stored_chat_name;
     const conversationTurns = await db.selectFrom("tasks").select(["id", "turn_index", "state", "conversation_disposition", "created_at", "completed_at"])
       .where("conversation_id", "=", task.conversation_id).orderBy("turn_index").execute();
     return {
       ...task, requester_id: masked(task.requester_id), summary: undefined, authorization_grant: undefined,
       chat_name: chatName,
+      chat_display_name: chatDisplayName({ chatType: task.chat_type, chatName, peerOpenId: task.peer_open_id, peerDisplayName: task.peer_display_name }),
       created_at: iso(task.created_at), updated_at: iso(task.updated_at), completed_at: iso(task.completed_at), lease_expires_at: iso(task.lease_expires_at),
       followup_expires_at: iso(task.followup_expires_at),
       executor_display_name: worker ? effectiveWorkerDisplayName(worker) : null,

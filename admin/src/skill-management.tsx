@@ -2,9 +2,10 @@ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, FileClock, Folder, Globe2, KeyRound, Layers3,
-  LockKeyhole, MessageSquare, MoreHorizontal, Plus, RefreshCw, Search, Server, ShieldCheck, Sparkles, Trash2, Upload, X
+  LockKeyhole, MessageSquare, MessagesSquare, MoreHorizontal, Plus, RefreshCw, Search, Server, ShieldCheck, Sparkles, Trash2, Upload, UserRound, X
 } from "lucide-react";
 import { api, relativeTime, type AdminUser } from "./api";
+import { chatDisplayName, chatDisplayNames } from "./chat-display-name";
 
 type AnyRecord = Record<string, any>;
 
@@ -17,6 +18,9 @@ export type SkillBindingView = {
   scope: "bot" | "chat_context";
   chatContextId: string | null;
   chatName: string | null;
+  chatDisplayName?: string | null;
+  peerOpenId?: string | null;
+  peerDisplayName?: string | null;
   syncStatus: string;
   updatedAt: string | null;
   environmentCount: number;
@@ -116,6 +120,9 @@ export function normalizeSkillBindings(payload: AnyRecord | undefined): SkillBin
       scope: rawScope === "chat_context" || rawScope === "thread" || Boolean(chatContextId) ? "chat_context" : "bot",
       chatContextId,
       chatName: firstString(item.chatName, item.chat_name),
+      chatDisplayName: firstString(item.chatDisplayName, item.chat_display_name),
+      peerOpenId: firstString(item.peerOpenId, item.peer_open_id),
+      peerDisplayName: firstString(item.peerDisplayName, item.peer_display_name),
       syncStatus: firstString(item.syncStatus, item.sync_status, item.state) ?? "configured",
       updatedAt: firstString(item.updatedAt, item.updated_at),
       environmentCount: numberValue(item.environmentCount, item.environment_count, item.runtimeConfigSummary?.environmentCount),
@@ -170,7 +177,7 @@ function formatSize(value: number | null): string {
 }
 
 function contextTitle(context: AnyRecord): string {
-  return firstString(context.chatName, context.chat_name) ?? (firstString(context.chatType, context.chat_type) === "group" ? "未命名群聊" : "私聊");
+  return chatDisplayName(context);
 }
 
 function contextsFrom(payload: AnyRecord | undefined): AnyRecord[] {
@@ -305,6 +312,12 @@ export function SkillManagerDialog({ bot, workers, user, onClose }: { bot: AnyRe
   const items = normalizeSkillBindings(skills.data);
   const selectedBinding = items.find((item) => item.id === runtimeBindingId) ?? null;
   const contextItems = contextsFrom(contexts.data);
+  const contextTitles = chatDisplayNames(contextItems);
+  const titledContext = (context: AnyRecord): string => contextTitles.get(firstString(context.id) ?? "") ?? contextTitle(context);
+  const bindingContextTitle = (binding: SkillBindingView): string => {
+    const context = contextItems.find((item) => firstString(item.id) === binding.chatContextId);
+    return context ? titledContext(context) : binding.chatDisplayName ?? chatDisplayName(binding as unknown as AnyRecord);
+  };
   const runnerIds = [...new Set([firstString(bot.defaultExecutorId, bot.default_executor_id), ...contextItems.map((item) => firstString(item.executorId, item.executor_id))].filter((value): value is string => Boolean(value)))];
   const relevantWorkers = runnerIds.length ? workers.filter((worker) => runnerIds.includes(firstString(worker.executor_id, worker.executorId, worker.id) ?? "")) : workers;
   const runnerQueries = useQueries({
@@ -370,7 +383,7 @@ export function SkillManagerDialog({ bot, workers, user, onClose }: { bot: AnyRe
   const pageCount = Math.max(1, Math.ceil(filteredEntries.length / pageSize));
   const visibleEntries = filteredEntries.slice((Math.min(page, pageCount) - 1) * pageSize, Math.min(page, pageCount) * pageSize);
   const hasProblems = items.some((item) => ["failed", "error", "drift", "conflict"].includes(item.syncStatus)) || runnerQueries.some((query) => query.error);
-  const viewTitle = view.kind === "overview" ? "所有对话" : view.kind === "runner" ? "环境继承" : view.kind === "bot" ? "机器人配置" : view.kind === "contexts" ? "聊天" : view.kind === "context" ? contextTitle(selectedContext ?? {}) : "运行依赖";
+  const viewTitle = view.kind === "overview" ? "所有对话" : view.kind === "runner" ? "环境继承" : view.kind === "bot" ? "机器人配置" : view.kind === "contexts" ? "聊天" : view.kind === "context" ? titledContext(selectedContext ?? {}) : "运行依赖";
   const viewSubtitle = view.kind === "overview" ? "共享给此机器人的全部聊天" : view.kind === "runner" ? "由执行环境提供，所有聊天可用" : view.kind === "bot" ? "由后台配置，所有聊天可用" : view.kind === "contexts" ? `${contextItems.length} 个聊天工作区` : view.kind === "context" ? `${listEntries.length} 个技能` : "为技能配置环境变量与工作区文件";
   const canAdd = view.kind === "overview" || view.kind === "bot" || view.kind === "context";
   const addScope = view.kind === "context" ? "chat_context" : "bot";
@@ -384,7 +397,8 @@ export function SkillManagerDialog({ bot, workers, user, onClose }: { bot: AnyRe
           <button className={["contexts", "context"].includes(view.kind) ? "parent-active" : ""} onClick={() => openView({ kind: "contexts" })}><ChevronDown size={14} /><Folder size={17} /><span>聊天</span></button>
           <div className="skill-context-tree">{contextItems.map((context) => {
             const id = firstString(context.id) ?? "";
-            return <button key={id} className={view.kind === "context" && view.contextId === id ? "active" : ""} onClick={() => openView({ kind: "context", contextId: id })}><MessageSquare size={16} /><span>{contextTitle(context)}</span></button>;
+            const isGroup = firstString(context.chatType, context.chat_type) === "group";
+            return <button key={id} className={view.kind === "context" && view.contextId === id ? "active" : ""} onClick={() => openView({ kind: "context", contextId: id })}>{isGroup ? <MessagesSquare size={16} /> : <UserRound size={16} />}<span>{titledContext(context)}</span></button>;
           })}</div>
         </div>
         <button className={`skill-runtime-link ${view.kind === "runtime" ? "active" : ""}`} onClick={() => openView({ kind: "runtime" })}><KeyRound size={16} /><span>运行依赖</span></button>
@@ -396,7 +410,7 @@ export function SkillManagerDialog({ bot, workers, user, onClose }: { bot: AnyRe
         </header>
         {addOpen && <section className="skill-manager-add-panel" aria-label="添加 SkillHub 技能">
           <div className="skill-add-panel-head"><div><strong>添加 SkillHub 技能</strong><small>添加时固定当前版本；环境继承技能不会被替换。</small></div><button className="icon-button" aria-label="关闭添加技能" onClick={() => setAddOpen(false)}><X size={17} /></button></div>
-          <div className="skill-add-form"><label><span>技能名称</span><div className="skill-coordinate-input"><Search size={16} /><input aria-label="技能名称" placeholder="例如 @sh01/git-commit" value={coordinate} onChange={(event) => setCoordinate(event.target.value)} /></div></label><label><span>配置范围</span><select aria-label="配置范围" value={scope} onChange={(event) => setScope(event.target.value as "bot" | "chat_context")}><option value="bot">机器人配置 · 所有聊天</option><option value="chat_context">聊天配置 · 当前聊天</option></select></label>{scope === "chat_context" && <label><span>聊天</span><select aria-label="聊天" value={chatContextId} onChange={(event) => setChatContextId(event.target.value)}><option value="">请选择聊天</option>{contextItems.map((context) => <option key={context.id} value={context.id}>{contextTitle(context)}</option>)}</select></label>}<button className="primary-button" disabled={!registryAvailable || !coordinate.trim() || (scope === "chat_context" && !chatContextId) || add.isPending} onClick={() => add.mutate()}><Plus size={15} />{add.isPending ? "正在固定版本…" : "添加技能"}</button></div>
+          <div className="skill-add-form"><label><span>技能名称</span><div className="skill-coordinate-input"><Search size={16} /><input aria-label="技能名称" placeholder="例如 @sh01/git-commit" value={coordinate} onChange={(event) => setCoordinate(event.target.value)} /></div></label><label><span>配置范围</span><select aria-label="配置范围" value={scope} onChange={(event) => setScope(event.target.value as "bot" | "chat_context")}><option value="bot">机器人配置 · 所有聊天</option><option value="chat_context">聊天配置 · 当前聊天</option></select></label>{scope === "chat_context" && <label><span>聊天</span><select aria-label="聊天" value={chatContextId} onChange={(event) => setChatContextId(event.target.value)}><option value="">请选择聊天</option>{contextItems.map((context) => <option key={context.id} value={context.id}>{titledContext(context)}</option>)}</select></label>}<button className="primary-button" disabled={!registryAvailable || !coordinate.trim() || (scope === "chat_context" && !chatContextId) || add.isPending} onClick={() => add.mutate()}><Plus size={15} />{add.isPending ? "正在固定版本…" : "添加技能"}</button></div>
           <div className="skill-search-row"><input aria-label="搜索 SkillHub" placeholder="不确定名称？搜索 SkillHub" value={searchTerm} onChange={(event) => setSearchTerm(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") setSearchQuery(searchTerm.trim()); }} /><button className="ghost-button" disabled={!searchTerm.trim()} onClick={() => setSearchQuery(searchTerm.trim())}>查找</button></div>
           {search.isFetching && <InlineLoading text="正在搜索 SkillHub…" />}{search.error && <QueryError error={search.error} />}{search.data && <div className="skill-search-results">{records(search.data.items ?? search.data.results).length ? records(search.data.items ?? search.data.results).map((result, index) => { const resultCoordinate = firstString(result.coordinate) ?? (result.namespace && result.slug ? `@${result.namespace}/${result.slug}` : ""); return <button key={resultCoordinate || index} onClick={() => setCoordinate(resultCoordinate)}><span><strong>{resultCoordinate}</strong><small>{firstString(result.description) ?? "暂无技能说明"}</small></span><span>选择</span></button>; }) : <small>没有匹配的技能。</small>}</div>}{add.error && <QueryError error={add.error} />}
         </section>}
@@ -405,18 +419,18 @@ export function SkillManagerDialog({ bot, workers, user, onClose }: { bot: AnyRe
           <section><h4>聊天工作区</h4><button className="skill-context-overview-row" onClick={() => openView({ kind: "contexts" })}><span className="scope-row-icon"><MessageSquare size={18} /></span><strong>聊天</strong><b>{contextItems.length}</b><span>{configuredContextCount} 个有本地配置</span><ChevronRight size={17} /></button></section>
           <section className="skill-attention"><h4>需要关注</h4>{hasProblems ? <button onClick={() => openView({ kind: "bot" })}><AlertTriangle size={16} /><span>发现需要处理的技能状态</span><ChevronRight size={16} /></button> : <p><CheckCircle2 size={16} />暂无需要处理的问题</p>}</section>
         </div>}
-        {!addOpen && view.kind === "contexts" && <div className="skill-context-list">{contextItems.length ? contextItems.map((context) => { const id = firstString(context.id) ?? ""; const localCount = localItems.filter((item) => item.chatContextId === id).length; return <button key={id} onClick={() => openView({ kind: "context", contextId: id })}><MessageSquare size={18} /><span><strong>{contextTitle(context)}</strong><small>{localCount ? `${localCount} 个聊天配置` : "无聊天配置"}</small></span><ChevronRight size={17} /></button>; }) : <SkillEmpty icon={<MessageSquare />} title="暂无聊天" text="完成首次聊天后，这里会显示对应的技能工作区。" />}</div>}
+        {!addOpen && view.kind === "contexts" && <div className="skill-context-list">{contextItems.length ? contextItems.map((context) => { const id = firstString(context.id) ?? ""; const localCount = localItems.filter((item) => item.chatContextId === id).length; const isGroup = firstString(context.chatType, context.chat_type) === "group"; return <button key={id} onClick={() => openView({ kind: "context", contextId: id })}>{isGroup ? <MessagesSquare size={18} /> : <UserRound size={18} />}<span><strong>{titledContext(context)}</strong><small>{localCount ? `${localCount} 个聊天配置` : "无聊天配置"}</small></span><ChevronRight size={17} /></button>; }) : <SkillEmpty icon={<MessageSquare />} title="暂无聊天" text="完成首次聊天后，这里会显示对应的技能工作区。" />}</div>}
         {!addOpen && ["runner", "bot", "context"].includes(view.kind) && <div className="skill-list-view">
           <div className="skill-list-toolbar"><div className="skill-list-search"><Search size={16} /><input aria-label="搜索技能" placeholder="搜索技能" value={listSearch} onChange={(event) => { setListSearch(event.target.value); setPage(1); }} /></div></div>
           <div className="skill-manager-table" role="table" aria-label={`${viewTitle}技能列表`}><div className="skill-manager-table-head" role="row"><span>技能</span><span>来源与范围</span><span>状态</span><span /></div>{skills.isLoading || runnerQueries.some((query) => query.isLoading) ? <InlineLoading /> : visibleEntries.length ? visibleEntries.map((entry) => <button type="button" role="row" key={entry.key} className={selectedSkill?.key === entry.key ? "selected" : ""} onClick={() => setSelectedSkill(entry)}><span><span className="skill-row-icon"><ManagerSkillIcon source={entry.source} /></span><strong>{entry.coordinate}</strong></span><span>{entry.sourceLabel}</span><StatusPill status={entry.status} label={statusTone(entry.status) === "success" ? "已生效" : undefined} /><ChevronRight size={17} /></button>) : <div className="skill-empty-row">没有匹配的技能</div>}</div>
           <footer className="skill-list-footer"><span>共 {filteredEntries.length} 项</span><div><button disabled={page <= 1} aria-label="上一页" onClick={() => setPage((current) => Math.max(1, current - 1))}><ChevronRight className="flip" size={16} /></button><span>{Math.min(page, pageCount)} / {pageCount}</span><button disabled={page >= pageCount} aria-label="下一页" onClick={() => setPage((current) => Math.min(pageCount, current + 1))}><ChevronRight size={16} /></button></div></footer>
         </div>}
-        {!addOpen && view.kind === "runtime" && <div className="skill-runtime-workspace">{items.length ? <><div className="runtime-binding-picker"><label>配置哪个技能<select aria-label="配置哪个技能" value={runtimeBindingId ?? ""} onChange={(event) => setRuntimeBindingId(event.target.value || null)}><option value="">请选择技能</option>{items.map((item) => <option key={item.id} value={item.id}>{item.coordinate} · {item.scope === "bot" ? "机器人配置 · 所有聊天" : `聊天配置 · ${item.chatName ?? "指定聊天"}`}</option>)}</select></label><div className="skill-callout neutral"><LockKeyhole size={16} />敏感值写入后不可回读。聊天范围不是同一执行环境内的系统级隔离；高敏凭证请使用独立执行环境。</div></div>{selectedBinding ? <RuntimeConfigPanel botId={bot.id} binding={selectedBinding} contexts={contextItems} user={user} /> : <SkillEmpty icon={<KeyRound />} title="选择一个技能" text="选择技能后，可配置环境变量和持续保留在工作区的文本文件。" />}</> : <SkillEmpty icon={<Sparkles />} title="还没有可配置的技能" text="先添加一个 SkillHub 技能，再为它准备运行依赖。" />}</div>}
+        {!addOpen && view.kind === "runtime" && <div className="skill-runtime-workspace">{items.length ? <><div className="runtime-binding-picker"><label>配置哪个技能<select aria-label="配置哪个技能" value={runtimeBindingId ?? ""} onChange={(event) => setRuntimeBindingId(event.target.value || null)}><option value="">请选择技能</option>{items.map((item) => <option key={item.id} value={item.id}>{item.coordinate} · {item.scope === "bot" ? "机器人配置 · 所有聊天" : `聊天配置 · ${bindingContextTitle(item)}`}</option>)}</select></label><div className="skill-callout neutral"><LockKeyhole size={16} />敏感值写入后不可回读。聊天范围不是同一执行环境内的系统级隔离；高敏凭证请使用独立执行环境。</div></div>{selectedBinding ? <RuntimeConfigPanel botId={bot.id} binding={selectedBinding} contexts={contextItems} user={user} /> : <SkillEmpty icon={<KeyRound />} title="选择一个技能" text="选择技能后，可配置环境变量和持续保留在工作区的文本文件。" />}</> : <SkillEmpty icon={<Sparkles />} title="还没有可配置的技能" text="先添加一个 SkillHub 技能，再为它准备运行依赖。" />}</div>}
         {(skills.error || update.error || remove.error) && <QueryError error={skills.error ?? update.error ?? remove.error} />}
       </main>
       {selectedSkill && <aside className="skill-detail-drawer" aria-label={`${selectedSkill.coordinate} 技能详情`}>
         <header><div><span className="skill-row-icon"><ManagerSkillIcon source={selectedSkill.source} /></span><span><strong>{selectedSkill.coordinate}</strong><StatusPill status={selectedSkill.status} label={statusTone(selectedSkill.status) === "success" ? "已生效" : undefined} /></span></div><button className="icon-button" aria-label="关闭技能详情" onClick={() => setSelectedSkill(null)}><X size={18} /></button></header>
-        <p className="skill-detail-source"><ManagerSkillIcon source={selectedSkill.source} />{selectedSkill.sourceLabel}{selectedSkill.source === "chat" && selectedSkill.binding?.chatName ? ` · ${selectedSkill.binding.chatName}` : ""}</p>
+        <p className="skill-detail-source"><ManagerSkillIcon source={selectedSkill.source} />{selectedSkill.sourceLabel}{selectedSkill.source === "chat" && selectedSkill.binding ? ` · ${bindingContextTitle(selectedSkill.binding)}` : ""}</p>
         {selectedSkill.binding && <div className="skill-detail-actions"><button className="primary-button" onClick={() => pickRuntime(selectedSkill.binding!)}>配置依赖</button><button className="secondary-button" disabled={update.isPending} onClick={() => update.mutate(selectedSkill.binding!)}>检查升级</button><details><summary aria-label="更多操作"><MoreHorizontal size={18} /></summary><button className="text-danger" disabled={remove.isPending} onClick={() => window.confirm(`确认移除 ${selectedSkill.coordinate}？`) && remove.mutate(selectedSkill.binding!)}><Trash2 size={14} />移除技能</button></details></div>}
         <section><h4>基本信息</h4><dl><div><dt>固定版本</dt><dd>{selectedSkill.version}</dd></div><div><dt>作用范围</dt><dd>{selectedSkill.source === "chat" ? "当前聊天" : "所有聊天"}</dd></div><div><dt>管理方式</dt><dd>{selectedSkill.source === "runner" ? "只读" : "可配置"}</dd></div></dl></section>
         <section><h4>运行依赖</h4>{selectedSkill.binding ? <button className="skill-runtime-summary" onClick={() => pickRuntime(selectedSkill.binding!)}><span>环境变量 {selectedSkill.environmentCount} · 工作区文件 {selectedSkill.fileCount}</span><ChevronRight size={17} /></button> : <p className="skill-detail-readonly"><LockKeyhole size={15} />由执行环境提供，后台不修改其运行依赖。</p>}</section>

@@ -39,6 +39,7 @@ export interface RoutedMessageResult {
   taskId: string | null;
   signalId: string | null;
   status: "routed" | "duplicate" | "inactive" | "unbound";
+  chatContextId?: string;
 }
 
 export class MessageRouter {
@@ -101,6 +102,9 @@ export class MessageRouter {
           bot_id: bot.id,
           chat_id: message.chatId,
           chat_type: message.chatType,
+          peer_open_id: message.chatType === "p2p" && message.senderType === "user" ? message.senderId : null,
+          peer_display_name: message.chatType === "p2p" && message.senderType === "user" ? message.senderDisplayName : null,
+          peer_identity_checked_at: message.chatType === "p2p" && message.senderType === "user" && message.senderDisplayName ? now : null,
           codex_thread_id: null,
           executor_id: null,
           executor_home_ref: null,
@@ -119,7 +123,13 @@ export class MessageRouter {
           updated_at: now
         })).returningAll().executeTakeFirstOrThrow();
       } else {
-        await trx.updateTable("chat_contexts").set({ last_activity_at: now, updated_at: now }).where("id", "=", chatContext.id).execute();
+        const peerIdentity = message.chatType === "p2p" && message.senderType === "user"
+          ? {
+              peer_open_id: chatContext.peer_open_id ?? message.senderId,
+              ...(message.senderDisplayName ? { peer_display_name: message.senderDisplayName, peer_identity_checked_at: now } : {})
+            }
+          : {};
+        await trx.updateTable("chat_contexts").set({ ...peerIdentity, last_activity_at: now, updated_at: now }).where("id", "=", chatContext.id).execute();
       }
 
       if (!conversation) {
@@ -306,7 +316,7 @@ export class MessageRouter {
         }),
         created_at: message.receivedAt ?? new Date()
       }).execute();
-      return { taskId: task.id, signalId: signal.id, status: "routed" };
+      return { taskId: task.id, signalId: signal.id, status: "routed", chatContextId: chatContext.id };
     });
   }
 }

@@ -9,7 +9,7 @@ import { sanitizeAttachmentFileName } from "./attachments.js";
 import { runCommand, runJsonCommand, type CommandResult } from "./cli.js";
 
 interface LarkEnvelope {
-  data?: { items?: unknown[]; messages?: unknown[]; scopes?: unknown[]; message_id?: string; card_id?: string; has_more?: boolean; page_token?: string; name?: string };
+  data?: { items?: unknown[]; messages?: unknown[]; scopes?: unknown[]; message_id?: string; card_id?: string; has_more?: boolean; page_token?: string; name?: string; user?: unknown };
   items?: unknown[];
   messages?: unknown[];
   message_id?: string;
@@ -111,6 +111,17 @@ export class LarkGateway {
     const message = messagesFromEnvelope(envelope)[0];
     if (!message) throw new Error(`message ${messageId} was not returned by Lark`);
     return message;
+  }
+
+  async getUserDisplayName(openId: string): Promise<string | null> {
+    const envelope = (await this.invoke([
+      "api", "GET", `/open-apis/contact/v3/users/${encodeURIComponent(openId)}`,
+      "--as", "bot", "--params", JSON.stringify({ user_id_type: "open_id" }), "--format", "json"
+    ])) as LarkEnvelope;
+    const user = envelope.data?.user;
+    if (!user || typeof user !== "object") return null;
+    const name = (user as Record<string, unknown>).name;
+    return typeof name === "string" && name.trim() ? name.trim() : null;
   }
 
   async downloadMessageResource(

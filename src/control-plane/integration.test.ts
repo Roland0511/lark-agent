@@ -30,6 +30,7 @@ import { RetentionService } from "./retention.js";
 import { SkillRuntimeService } from "./skill-runtime-service.js";
 import { inspectSkillArchive, SkillHubService } from "./skillhub-service.js";
 import { issueWorkerSession } from "./auth.js";
+import { ChatIdentityService } from "./chat-identity.js";
 
 const databaseUrl = process.env.TEST_DATABASE_URL;
 
@@ -72,7 +73,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
   let grantedBotScopes = [
     "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message.group_msg",
     "im:message.group_at_msg.include_bot:readonly", "im:message.group_bot_msg:readonly",
-    "im:message", "im:chat:readonly", "cardkit:card:write"
+    "im:message", "im:chat:readonly", "contact:contact.base:readonly",
+    "contact:user.base:readonly", "cardkit:card:write"
   ];
   registerBotAdminRoutes(app, db, config, {
     gateways: services.gateways,
@@ -133,6 +135,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatContextRebindSql = await readFile(fileURLToPath(new URL("../db/migrations/018_rebind_chat_context_fingerprints.sql", import.meta.url)), "utf8");
     const workerDisplayAliasSql = await readFile(fileURLToPath(new URL("../db/migrations/019_worker_display_alias.sql", import.meta.url)), "utf8");
     const skillhubRuntimeSql = await readFile(fileURLToPath(new URL("../db/migrations/020_skillhub_runtime.sql", import.meta.url)), "utf8");
+    const chatContextIdentitySql = await readFile(fileURLToPath(new URL("../db/migrations/021_chat_context_identity.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -162,6 +165,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await client.query(chatContextRebindSql);
     await client.query(workerDisplayAliasSql);
     await client.query(skillhubRuntimeSql);
+    const chatContextIdentityApplied = await client.query("SELECT 1 FROM information_schema.columns WHERE table_name = 'chat_contexts' AND column_name = 'peer_open_id'");
+    if (chatContextIdentityApplied.rowCount === 0) await client.query(chatContextIdentitySql);
     await client.end();
   });
 
@@ -170,7 +175,8 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     grantedBotScopes = [
       "im:message.p2p_msg:readonly", "im:message.group_at_msg:readonly", "im:message.group_msg",
       "im:message.group_at_msg.include_bot:readonly", "im:message.group_bot_msg:readonly",
-      "im:message", "im:chat:readonly", "cardkit:card:write"
+      "im:message", "im:chat:readonly", "contact:contact.base:readonly",
+      "contact:user.base:readonly", "cardkit:card:write"
     ];
     await db.deleteFrom("admin_sessions").execute();
     await db.deleteFrom("admin_login_tokens").execute();
@@ -1768,6 +1774,89 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(await db.selectFrom("conversations").selectAll().execute()).toHaveLength(1);
     expect(await db.selectFrom("tasks").selectAll().execute()).toHaveLength(1);
     expect(await db.selectFrom("signals").selectAll().execute()).toHaveLength(2);
+  });
+
+  it("keeps different private peers isolated and exposes one canonical display name", async () => {
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const router = new MessageRouter(db);
+    const route = (suffix: string, peerId: string, peerName: string) => router.route(bot, {
+      eventId: `ev_private_peer_${suffix}`, eventType: "im.message.receive_v1", messageId: `om_private_peer_${suffix}`,
+      chatId: `oc_private_peer_${suffix}`, chatType: "p2p", rootMessageId: `om_private_peer_${suffix}`,
+      senderId: peerId, senderRole: "member", senderType: "user", senderBotId: null, senderDisplayName: peerName,
+      ingressSource: "lark", originMessageId: `om_private_peer_${suffix}`, botDialogueDepth: 0,
+      messageType: "text", content: suffix, explicitlyActivated: true
+    });
+    await route("zhang", "ou_peer_zhang", "张三");
+    await route("li", "ou_peer_li", "李四");
+
+    const contexts = await db.selectFrom("chat_contexts").select(["id", "chat_id", "peer_open_id", "peer_display_name"]).orderBy("chat_id").execute();
+    expect(contexts).toHaveLength(2);
+    expect(new Set(contexts.map((item) => item.peer_open_id))).toEqual(new Set(["ou_peer_zhang", "ou_peer_li"]));
+
+    const now = new Date();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("private-peer-owner"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "private-peer-csrf",
+      last_seen_at: now, expires_at: new Date(now.getTime() + 3_600_000)
+    }).execute();
+    const headers = { cookie: "lark_agent_admin_session=private-peer-owner" };
+    const list = await app.inject({ method: "GET", url: "/v1/admin/chat-contexts?q=李四", headers });
+    expect(list.statusCode).toBe(200);
+    expect(list.json<{ items: Array<{ chatDisplayName: string; peerDisplayName: string; peerOpenId: string }> }>().items).toEqual([
+      expect.objectContaining({ chatDisplayName: "与李四的私聊", peerDisplayName: "李四", peerOpenId: "ou_peer_li" })
+    ]);
+  });
+
+  it("backfills historical private peer ids and invalidates the old permission policy cache", async () => {
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_private_migration", eventType: "im.message.receive_v1", messageId: "om_private_migration",
+      chatId: "oc_private_migration", chatType: "p2p", rootMessageId: "om_private_migration",
+      senderId: "ou_historical_peer", senderRole: "member", senderType: "user", senderBotId: null, senderDisplayName: null,
+      ingressSource: "lark", originMessageId: "om_private_migration", botDialogueDepth: 0,
+      messageType: "text", content: "migration", explicitlyActivated: true
+    });
+    const contextId = routed.chatContextId as string;
+    await db.updateTable("chat_contexts").set({ peer_open_id: null, peer_identity_checked_at: null }).where("id", "=", contextId).execute();
+    await db.updateTable("bots").set({ permission_state: "valid", permission_check: JSON.stringify({ policyVersion: 1 }), permission_checked_at: new Date() }).where("id", "=", bot.id).execute();
+
+    const migration = await readFile(fileURLToPath(new URL("../db/migrations/021_chat_context_identity.sql", import.meta.url)), "utf8");
+    const client = new pg.Client({ connectionString: databaseUrl });
+    await client.connect();
+    await client.query(migration);
+    await client.end();
+
+    expect((await db.selectFrom("chat_contexts").select("peer_open_id").where("id", "=", contextId).executeTakeFirstOrThrow()).peer_open_id).toBe("ou_historical_peer");
+    expect(await db.selectFrom("bots").select(["permission_state", "permission_check", "permission_checked_at"]).where("id", "=", bot.id).executeTakeFirstOrThrow())
+      .toEqual({ permission_state: "unchecked", permission_check: null, permission_checked_at: null });
+  });
+
+  it("caches resolved peer names and keeps lookup failures non-blocking", async () => {
+    const success = await insertSkillContext("oc_identity_success");
+    const failed = await insertSkillContext("oc_identity_failure");
+    await db.updateTable("chat_contexts").set({ peer_open_id: "ou_identity_success" }).where("id", "=", success.id).execute();
+    await db.updateTable("chat_contexts").set({ peer_open_id: "ou_identity_failure" }).where("id", "=", failed.id).execute();
+    const gateway = {
+      getUserDisplayName: vi.fn(async (peerId: string) => {
+        if (peerId === "ou_identity_failure") throw new Error("temporary contact outage");
+        return "王五";
+      })
+    } as unknown as LarkGateway;
+    const service = new ChatIdentityService(
+      db,
+      { gateway: vi.fn(async () => gateway) } as unknown as BotGatewayRegistry,
+      new AdminEventBus(),
+      { info: vi.fn(), error: vi.fn() }
+    );
+
+    await service.refresh(success.id);
+    await service.refresh(success.id);
+    await expect(service.refresh(failed.id)).resolves.toBeUndefined();
+
+    expect(gateway.getUserDisplayName).toHaveBeenCalledTimes(2);
+    expect(await db.selectFrom("chat_contexts").select(["peer_display_name", "peer_identity_checked_at"]).where("id", "=", success.id).executeTakeFirstOrThrow())
+      .toEqual({ peer_display_name: "王五", peer_identity_checked_at: expect.any(Date) });
+    expect((await db.selectFrom("chat_contexts").select(["peer_display_name", "peer_identity_checked_at"]).where("id", "=", failed.id).executeTakeFirstOrThrow()).peer_identity_checked_at)
+      .toEqual(expect.any(Date));
   });
 
   it("reuses one private chat Thread across separate top-level conversations", async () => {

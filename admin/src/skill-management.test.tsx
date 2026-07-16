@@ -90,7 +90,10 @@ describe("机器人技能管理", () => {
         { id: "thread-1", coordinate: "@sh01/lark-doc", version: "2", scope: "chat_context", chatContextId: "context-1", chatName: "项目群", syncStatus: "pending" }
       ] });
       if (path === "/v1/admin/skillhub/status") return ok({ configured: true, authenticated: true, registryUrl: "https://skillhub.example.internal/" });
-      if (path.startsWith("/v1/admin/chat-contexts?")) return ok({ items: [{ id: "context-1", chatName: "项目群", chatType: "group", executorId: "runner-1" }] });
+      if (path.startsWith("/v1/admin/chat-contexts?")) return ok({ items: [
+        { id: "context-1", chatDisplayName: "项目群", chatName: "项目群", chatType: "group", executorId: "runner-1" },
+        { id: "context-2", chatDisplayName: "与张三的私聊", peerDisplayName: "张三", peerOpenId: "ou_peer_zhang", chatType: "p2p", executorId: "runner-1" }
+      ] });
       throw new Error(`unexpected fetch ${path}`);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -102,6 +105,7 @@ describe("机器人技能管理", () => {
     expect(await screen.findByRole("dialog", { name: "项目助理 · 技能管理" })).toBeTruthy();
     expect(screen.getByText("环境继承")).toBeTruthy();
     expect(screen.getAllByText("机器人配置").length).toBeGreaterThan(0);
+    expect(await screen.findByRole("button", { name: "与张三的私聊" })).toBeTruthy();
     fireEvent.click(await screen.findByRole("button", { name: "项目群" }));
     expect(await screen.findByText("来源与范围")).toBeTruthy();
     expect(screen.getByText("机器人配置 · 所有聊天")).toBeTruthy();
@@ -111,6 +115,7 @@ describe("机器人技能管理", () => {
     expect(screen.getByText("基本信息")).toBeTruthy();
     expect(screen.getAllByText("运行依赖").length).toBeGreaterThan(0);
     fireEvent.click(screen.getByRole("button", { name: "添加技能" }));
+    expect(screen.getByRole("option", { name: "与张三的私聊" })).toBeTruthy();
     fireEvent.change(screen.getByLabelText("技能名称"), { target: { value: "@sh01/database-guide" } });
     const addButtons = screen.getAllByRole("button", { name: "添加技能" });
     fireEvent.click(addButtons[addButtons.length - 1]!);

@@ -6,6 +6,9 @@ import { RuntimeStatus } from "./runtime-status.js";
 import { IncidentService } from "./incidents.js";
 import { bootstrapLegacyBot, BotRuntimeManager } from "./bot-runtime.js";
 import { registerBotAdminRoutes } from "./bot-admin-routes.js";
+import { BotPermissionService } from "./bot-permissions.js";
+import { LarkGateway } from "../lark/gateway.js";
+import { ChatIdentityService } from "./chat-identity.js";
 
 const config = loadControlPlaneConfig();
 const db = createDatabase(config.databaseUrl);
@@ -16,7 +19,21 @@ const { app, services } = buildControlPlane(db, config, undefined, {
   isLarkReady: () => botRuntime?.messageReady() ?? !config.larkEnabled,
   runtime
 });
-botRuntime = new BotRuntimeManager(db, config, services.repository, services.gateways, runtime, services.adminEvents, app.log, services.messageRouter, services.dialogueGuard);
+if (config.larkEnabled) {
+  const permissions = new BotPermissionService(async (profileName) => new LarkGateway(config.larkCliPath, undefined, profileName).listGrantedScopes());
+  const bots = await db.selectFrom("bots").select(["id", "profile_name"]).where("enabled", "=", true).where("credential_state", "=", "verified").where("deleted_at", "is", null).execute();
+  for (const bot of bots) {
+    const check = await permissions.check(bot.profile_name);
+    await db.updateTable("bots").set({
+      permission_state: check.state,
+      permission_check: JSON.stringify(check),
+      permission_checked_at: new Date(check.checkedAt),
+      updated_at: new Date()
+    }).where("id", "=", bot.id).execute();
+  }
+}
+const chatIdentity = new ChatIdentityService(db, services.gateways, services.adminEvents, app.log);
+botRuntime = new BotRuntimeManager(db, config, services.repository, services.gateways, runtime, services.adminEvents, app.log, services.messageRouter, services.dialogueGuard, chatIdentity);
 await botRuntime.startAll();
 registerBotAdminRoutes(app, db, config, { gateways: services.gateways, runtime, events: services.adminEvents, controller: botRuntime });
 
@@ -35,6 +52,7 @@ const incidentTimer = setInterval(() => void incidentService.evaluate().catch((e
 incidentTimer.unref();
 
 await app.listen({ host: config.host, port: config.port });
+void chatIdentity.backfill().catch((error) => app.log.error({ err: error }, "chat identity backfill failed"));
 
 async function shutdown(): Promise<void> {
   clearInterval(retentionTimer);

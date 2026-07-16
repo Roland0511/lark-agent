@@ -153,6 +153,17 @@ describe("LarkGateway main-chat messaging", () => {
     await expect(gateway.getChatName("oc_chat")).resolves.toBe("阿朱的测试群");
   });
 
+  it("resolves a private peer name with the bot application identity", async () => {
+    const gateway = new LarkGateway("lark-cli", async (_command, args) => {
+      expect(args).toEqual([
+        "api", "GET", "/open-apis/contact/v3/users/ou_peer%2F1", "--as", "bot",
+        "--params", JSON.stringify({ user_id_type: "open_id" }), "--format", "json"
+      ]);
+      return { data: { user: { name: " 张三 " } } };
+    });
+    await expect(gateway.getUserDisplayName("ou_peer/1")).resolves.toBe("张三");
+  });
+
   it("creates, sends, streams and closes one CardKit entity", async () => {
     const calls: string[][] = [];
     const gateway = new LarkGateway("lark-cli", async (_command, args) => {

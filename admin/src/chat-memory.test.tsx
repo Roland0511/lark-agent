@@ -26,7 +26,7 @@ describe("聊天记忆列表", () => {
     }]} onOpen={onOpen} />);
 
     expect(screen.getByText("项目助理")).toBeTruthy();
-    expect(screen.getByText("群聊 · 群聊 A")).toBeTruthy();
+    expect(screen.getByText("群聊 A")).toBeTruthy();
     expect(screen.getByText("已绑定")).toBeTruthy();
     expect(screen.getByText("阿朱 SH01")).toBeTruthy();
     expect(screen.getByText("runner-sh01")).toBeTruthy();
@@ -36,6 +36,18 @@ describe("聊天记忆列表", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "查看 群聊 A 的聊天记忆" }));
     expect(onOpen).toHaveBeenCalledWith("018f90b0-b30c-7a11-a523-5d303ef41234");
+  });
+
+  it("用私聊对象区分不同聊天，并仅在重名时追加脱敏 ID", () => {
+    render(<ChatMemoryTable items={[
+      { id: "context-a", botDisplayName: "项目助理", chatType: "p2p", peerDisplayName: "张三", peerOpenId: "peer_123456789xyz", chatId: "oc_a", state: "ready", lastActivityAt: new Date().toISOString() },
+      { id: "context-b", botDisplayName: "项目助理", chatType: "p2p", peerDisplayName: "张三", peerOpenId: "peer_987654321abc", chatId: "oc_b", state: "ready", lastActivityAt: new Date().toISOString() },
+      { id: "context-c", botDisplayName: "项目助理", chatType: "p2p", peerDisplayName: "李四", peerOpenId: "peer_555555555def", chatId: "oc_c", state: "ready", lastActivityAt: new Date().toISOString() }
+    ]} onOpen={() => undefined} />);
+
+    expect(screen.getByText("与张三的私聊（peer_…xyz）")).toBeTruthy();
+    expect(screen.getByText("与张三的私聊（peer_…abc）")).toBeTruthy();
+    expect(screen.getByText("与李四的私聊")).toBeTruthy();
   });
 
   it("空列表说明首次有效消息后才建立绑定", () => {

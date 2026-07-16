@@ -9,6 +9,7 @@ import type { AdminEventBus } from "./admin-events.js";
 import { executorHasClaimCapacity, lockExecutorClaim } from "./executor-claim-lock.js";
 import { SkillSecretBox, type EncryptedSecret } from "./skill-runtime-crypto.js";
 import { normalizeDeclaredDependencies, SkillHubService, parseSkillCoordinate } from "./skillhub-service.js";
+import { chatDisplayName } from "./chat-display-name.js";
 
 const MAX_EFFECTIVE_SKILLS = 64;
 const MAX_ENV_PER_BINDING = 64;
@@ -234,6 +235,9 @@ export class SkillRuntimeService {
         "skillhub_packages.version", "skillhub_packages.registry_fingerprint", "skillhub_packages.archive_sha256",
         "skillhub_packages.skill_name", "skillhub_packages.description", "skillhub_packages.dependencies",
         sql<string | null>`(select binding.chat_name from chat_contexts context left join bot_chat_bindings binding on binding.bot_id = context.bot_id and binding.chat_id = context.chat_id where context.id = bot_skill_bindings.chat_context_id)`.as("chat_name"),
+        sql<string | null>`(select context.chat_type from chat_contexts context where context.id = bot_skill_bindings.chat_context_id)`.as("chat_type"),
+        sql<string | null>`(select context.peer_open_id from chat_contexts context where context.id = bot_skill_bindings.chat_context_id)`.as("peer_open_id"),
+        sql<string | null>`(select context.peer_display_name from chat_contexts context where context.id = bot_skill_bindings.chat_context_id)`.as("peer_display_name"),
         sql<number>`(select count(*)::int from skill_runtime_environment_revisions env where env.binding_id = bot_skill_bindings.id and env.superseded_at is null and env.desired_state = 'present')`.as("environment_count"),
         sql<number>`(select count(*)::int from skill_runtime_file_revisions file where file.binding_id = bot_skill_bindings.id and file.superseded_at is null and file.desired_state = 'present')`.as("file_count"),
         sql<string | null>`(select case when context.skills_sync_error is not null then 'error' when context.desired_skill_set_fingerprint is distinct from context.applied_skill_set_fingerprint then 'pending' when context.skills_synced_at is not null then 'applied' else 'unknown' end from chat_contexts context where context.id = bot_skill_bindings.chat_context_id)`.as("sync_status")
@@ -245,7 +249,10 @@ export class SkillRuntimeService {
       chatContextId: row.chat_context_id, version: row.version, registryFingerprint: row.registry_fingerprint,
       archiveSha256: row.archive_sha256, name: row.skill_name, description: row.description,
       declaredDependencies: normalizeDeclaredDependencies(row.dependencies),
-      chatName: row.chat_name, environmentCount: Number(row.environment_count), fileCount: Number(row.file_count),
+      chatName: row.chat_name,
+      chatDisplayName: row.chat_context_id ? chatDisplayName({ chatType: row.chat_type ?? "p2p", chatName: row.chat_name, peerOpenId: row.peer_open_id, peerDisplayName: row.peer_display_name }) : null,
+      peerOpenId: row.peer_open_id, peerDisplayName: row.peer_display_name,
+      environmentCount: Number(row.environment_count), fileCount: Number(row.file_count),
       syncStatus: row.chat_context_id ? row.sync_status : contexts.some((context) => context.skills_sync_error) ? "error"
         : contexts.some((context) => context.desired_skill_set_fingerprint !== context.applied_skill_set_fingerprint) ? "pending"
           : contexts.length && contexts.every((context) => context.skills_synced_at) ? "applied" : "unknown",

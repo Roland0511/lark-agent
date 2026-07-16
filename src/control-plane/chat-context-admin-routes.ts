@@ -7,6 +7,7 @@ import { AppError } from "../shared/errors.js";
 import { requireAdmin, requireCsrf } from "./admin-auth.js";
 import type { ControlPlaneConfig } from "./config.js";
 import type { AdminEventBus } from "./admin-events.js";
+import { publicChatIdentity } from "./chat-display-name.js";
 
 const listQuerySchema = z.object({
   // Keep legacy bootstrap IDs filterable even when their UUID version nibble is 0.
@@ -147,6 +148,9 @@ function publicContext(row: {
   chat_id: string;
   chat_type: string;
   chat_name: string | null;
+  peer_open_id: string | null;
+  peer_display_name: string | null;
+  peer_identity_checked_at: Date | string | null;
   codex_thread_id: string | null;
   executor_id: string | null;
   executor_display_name: string | null;
@@ -176,6 +180,8 @@ function publicContext(row: {
     chatId: row.chat_id,
     chatType: row.chat_type,
     chatName: row.chat_name,
+    ...publicChatIdentity({ chatType: row.chat_type, chatName: row.chat_name, peerOpenId: row.peer_open_id, peerDisplayName: row.peer_display_name }),
+    peerIdentityCheckedAt: iso(row.peer_identity_checked_at),
     threadId: row.codex_thread_id,
     executorId: row.executor_id,
     executorDisplayName: row.executor_display_name,
@@ -214,6 +220,7 @@ export function registerChatContextAdminRoutes(
     .select([
       "chat_contexts.id", "chat_contexts.bot_id", "bots.app_id as bot_app_id", "bots.display_name as bot_display_name",
       "chat_contexts.chat_id", "chat_contexts.chat_type", "bot_chat_bindings.chat_name",
+      "chat_contexts.peer_open_id", "chat_contexts.peer_display_name", "chat_contexts.peer_identity_checked_at",
       "chat_contexts.codex_thread_id", "chat_contexts.executor_id", "chat_contexts.executor_profile",
       sql<string | null>`coalesce(context_workers.display_alias, context_workers.display_name)`.as("executor_display_name"),
       "chat_contexts.executor_config_fingerprint", "chat_contexts.executor_workspace_mapping_fingerprint", "chat_contexts.codex_version", "chat_contexts.workspace_root_alias",
@@ -233,6 +240,8 @@ export function registerChatContextAdminRoutes(
       query = query.where(sql<boolean>`(
         chat_contexts.chat_id ILIKE ${needle}
         OR COALESCE(bot_chat_bindings.chat_name, '') ILIKE ${needle}
+        OR COALESCE(chat_contexts.peer_display_name, '') ILIKE ${needle}
+        OR COALESCE(chat_contexts.peer_open_id, '') ILIKE ${needle}
         OR COALESCE(chat_contexts.codex_thread_id, '') ILIKE ${needle}
         OR COALESCE(context_workers.display_alias, context_workers.display_name, '') ILIKE ${needle}
         OR COALESCE(chat_contexts.executor_id, '') ILIKE ${needle}

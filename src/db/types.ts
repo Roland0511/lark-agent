@@ -42,6 +42,9 @@ export interface ChatContextsTable {
   bot_id: string;
   chat_id: string;
   chat_type: "p2p" | "group";
+  peer_open_id: Generated<string | null>;
+  peer_display_name: Generated<string | null>;
+  peer_identity_checked_at: NullableTimestamp;
   codex_thread_id: string | null;
   executor_id: string | null;
   executor_home_ref: string | null;
