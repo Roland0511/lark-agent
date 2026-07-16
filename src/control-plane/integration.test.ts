@@ -975,6 +975,97 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       .toEqual({ operational_mode: "enabled" });
   });
 
+  it("rejects a partial multi-chat Profile migration before atomically rebinding every chat", async () => {
+    await insertWorker();
+    const deviceToken = "device-token-manager-atomic-profile";
+    await db.insertInto("worker_device_credentials").values({
+      executor_id: "worker-a", credential_hash: sha256(deviceToken), last_used_at: null, revoked_at: null
+    }).execute();
+    await db.insertInto("admin_sessions").values({
+      token_hash: sha256("owner-atomic-profile"), open_id: "ou_owner", display_name: "owner", role: "owner", csrf_token: "atomic-profile-csrf",
+      last_seen_at: new Date(), expires_at: new Date(Date.now() + 3_600_000)
+    }).execute();
+    const firstContext = await insertSkillContext("oc_atomic_profile_1", "worker-a");
+    const secondContext = await insertSkillContext("oc_atomic_profile_2", "worker-a");
+    await db.updateTable("chat_contexts").set({ codex_thread_id: "thread-source-1", state: "ready", updated_at: new Date() })
+      .where("id", "=", firstContext.id).execute();
+    await db.updateTable("chat_contexts").set({ codex_thread_id: "thread-source-2", state: "ready", updated_at: new Date() })
+      .where("id", "=", secondContext.id).execute();
+    const managerHeaders = { authorization: `Bearer ${deviceToken}` };
+    const adminHeaders = { cookie: "lark_agent_admin_session=owner-atomic-profile", "x-csrf-token": "atomic-profile-csrf" };
+    expect((await app.inject({
+      method: "PUT", url: "/v1/runner/device-manager/worker-a/heartbeat", headers: managerHeaders,
+      payload: {
+        version: "0.5.0", localState: "running", activeProfile: "lark-agent",
+        profiles: [
+          { name: "lark-agent", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() },
+          { name: "seed", model: "gpt-5.4", modelProvider: "he", modifiedAt: new Date().toISOString() }
+        ]
+      }
+    })).statusCode).toBe(200);
+    const queued = await app.inject({
+      method: "POST", url: "/v1/admin/workers/worker-a/device-commands", headers: adminHeaders,
+      payload: { type: "switch_profile", targetProfile: "seed" }
+    });
+    const commandId = queued.json<{ id: string }>().id;
+    const claimed = await app.inject({
+      method: "POST", url: "/v1/runner/device-manager/worker-a/commands/claim", headers: managerHeaders
+    });
+    const leaseToken = claimed.json<{ leaseToken: string }>().leaseToken;
+    const migration = await db.selectFrom("profile_switch_migrations").select("id").where("command_id", "=", commandId).executeTakeFirstOrThrow();
+    await db.updateTable("profile_switch_migrations").set({ state: "ready", context_count: 2, updated_at: new Date() })
+      .where("id", "=", migration.id).execute();
+    await db.insertInto("profile_switch_contexts").values([
+      {
+        migration_id: migration.id, chat_context_id: firstContext.id, bot_app_id: config.botAppId, workspace_root_alias: "repo",
+        source_thread_id: "thread-source-1", target_thread_id: "thread-target-1", snapshot_job_id: null,
+        migration_summary: "第一个聊天迁移摘要", summary_sha256: sha256("第一个聊天迁移摘要"), state: "ready", last_error: null, updated_at: new Date()
+      },
+      {
+        migration_id: migration.id, chat_context_id: secondContext.id, bot_app_id: config.botAppId, workspace_root_alias: "repo",
+        source_thread_id: "thread-source-2", target_thread_id: "thread-target-2", snapshot_job_id: null,
+        migration_summary: "第二个聊天迁移摘要", summary_sha256: sha256("第二个聊天迁移摘要"), state: "ready", last_error: null, updated_at: new Date()
+      }
+    ]).execute();
+    const targetFingerprint = "b".repeat(64);
+    const targetWorkspaceFingerprint = "d".repeat(64);
+    await db.updateTable("workers").set({
+      codex_profile: "seed", config_fingerprint: targetFingerprint,
+      workspace_mapping_fingerprint: targetWorkspaceFingerprint, codex_version: "target-codex", updated_at: new Date()
+    }).where("executor_id", "=", "worker-a").execute();
+    const resultIdentity = {
+      leaseToken, result: { migratedContexts: 2 }, targetProfile: "seed", targetConfigFingerprint: targetFingerprint,
+      targetWorkspaceMappingFingerprint: targetWorkspaceFingerprint, targetCodexVersion: "target-codex", targetHomeRef: "worker-a:home"
+    };
+    const partial = await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${commandId}/complete`, headers: managerHeaders,
+      payload: { ...resultIdentity, contexts: [{ chatContextId: firstContext.id, targetThreadId: "thread-target-1" }] }
+    });
+    expect(partial.statusCode).toBe(409);
+    expect(partial.json<{ error: { code: string } }>().error.code).toBe("profile_contexts_incomplete");
+    expect(await db.selectFrom("chat_contexts").select(["id", "codex_thread_id"]).where("id", "in", [firstContext.id, secondContext.id]).orderBy("id").execute())
+      .toEqual([
+        { id: [firstContext.id, secondContext.id].sort()[0], codex_thread_id: firstContext.id < secondContext.id ? "thread-source-1" : "thread-source-2" },
+        { id: [firstContext.id, secondContext.id].sort()[1], codex_thread_id: firstContext.id < secondContext.id ? "thread-source-2" : "thread-source-1" }
+      ]);
+    const complete = await app.inject({
+      method: "POST", url: `/v1/runner/device-manager/worker-a/commands/${commandId}/complete`, headers: managerHeaders,
+      payload: {
+        ...resultIdentity,
+        contexts: [
+          { chatContextId: firstContext.id, targetThreadId: "thread-target-1" },
+          { chatContextId: secondContext.id, targetThreadId: "thread-target-2" }
+        ]
+      }
+    });
+    expect(complete.statusCode).toBe(200);
+    expect(await db.selectFrom("chat_contexts").select(["id", "codex_thread_id"]).where("id", "in", [firstContext.id, secondContext.id]).orderBy("id").execute())
+      .toEqual([
+        { id: [firstContext.id, secondContext.id].sort()[0], codex_thread_id: firstContext.id < secondContext.id ? "thread-target-1" : "thread-target-2" },
+        { id: [firstContext.id, secondContext.id].sort()[1], codex_thread_id: firstContext.id < secondContext.id ? "thread-target-2" : "thread-target-1" }
+      ]);
+  });
+
   it("reports active Thread snapshots and refuses upgrade drain until their lease expires", async () => {
     await insertWorker();
     const deviceToken = "device-token-thread-snapshot-drain";
