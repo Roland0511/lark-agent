@@ -33,7 +33,13 @@ export function extractLarkAttachments(messageType: string, rawContent: string):
 
 export function safeMessageContent(messageType: string, rawContent: string, attachments: StoredAttachment[]): string {
   if (["audio", "media", "video", "sticker"].includes(messageType)) return `（暂不支持的飞书${unsupportedTypeName(messageType)}消息）`;
-  const text = messageType === "post" ? extractRichText(rawContent) : messageType === "text" ? sanitizeRenderedMarkers(parsePlainText(rawContent)) : "";
+  const text = messageType === "post"
+    ? extractRichText(rawContent)
+    : messageType === "text"
+      ? sanitizeRenderedMarkers(parsePlainText(rawContent))
+      : messageType === "interactive"
+        ? extractInteractiveText(rawContent)
+        : "";
   const summary = attachmentSummary(attachments);
   const safe = [text.trim(), summary].filter(Boolean).join("\n");
   if (safe) return safe;
@@ -131,6 +137,58 @@ function extractRichText(rawContent: string): string {
   };
   visit(parsed);
   return text.join("").trim();
+}
+
+function extractInteractiveText(rawContent: string): string {
+  const rendered = rawContent.trim().match(/^<card>\s*([\s\S]*?)\s*<\/card>$/i);
+  if (rendered?.[1]) return sanitizeRenderedMarkers(rendered[1]).trim();
+
+  const parsed = parseJson(rawContent);
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return rawContent;
+  const envelope = parsed as Record<string, unknown>;
+  const embedded = typeof envelope.json_card === "string" ? parseJson(envelope.json_card) : parsed;
+  if (!embedded || typeof embedded !== "object" || Array.isArray(embedded)) return rawContent;
+  const card = embedded as Record<string, unknown>;
+  const visible = uniqueText([
+    ...collectCardText(card.header),
+    ...collectCardText(card.body)
+  ]);
+  if (visible.length) return visible.join("\n");
+
+  const config = card.config && typeof card.config === "object" && !Array.isArray(card.config)
+    ? card.config as Record<string, unknown>
+    : null;
+  const summary = config?.summary && typeof config.summary === "object" && !Array.isArray(config.summary)
+    ? config.summary as Record<string, unknown>
+    : null;
+  const summaryText = typeof summary?.content === "string"
+    ? summary.content
+    : typeof summary?.text === "string" ? summary.text : "";
+  return summaryText.trim() ? sanitizeRenderedMarkers(summaryText).trim() : rawContent;
+}
+
+function collectCardText(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap(collectCardText);
+  if (!value || typeof value !== "object") return [];
+  const text: string[] = [];
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    if ((key === "content" || key === "text") && typeof nested === "string") {
+      const visible = sanitizeRenderedMarkers(nested).trim();
+      if (visible) text.push(visible);
+      continue;
+    }
+    if (nested && typeof nested === "object") text.push(...collectCardText(nested));
+  }
+  return text;
+}
+
+function uniqueText(values: string[]): string[] {
+  const seen = new Set<string>();
+  return values.filter((value) => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
 }
 
 function parsePlainText(rawContent: string): string {

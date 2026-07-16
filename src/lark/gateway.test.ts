@@ -72,6 +72,32 @@ describe("LarkGateway main-chat messaging", () => {
     expect(calls[0]).toEqual(["--profile", "bot-profile", "api", "GET", "/open-apis/application/v6/scopes", "--as", "bot", "--format", "json"]);
   });
 
+  it("requests user CardKit content when reading one message", async () => {
+    const calls: string[][] = [];
+    const cardContent = JSON.stringify({ body: { elements: [{ tag: "markdown", content: "1" }] }, schema: "2.0" });
+    const gateway = new LarkGateway("lark-cli", async (_command, args) => {
+      calls.push(args);
+      return { data: { items: [{
+        message_id: "om_card",
+        chat_id: "oc_chat",
+        sender: { id: "cli_sender", sender_type: "app" },
+        msg_type: "interactive",
+        body: { content: cardContent },
+        create_time: "1"
+      }] } };
+    }, "bot-profile");
+
+    await expect(gateway.getMessage("om_card")).resolves.toMatchObject({
+      messageId: "om_card",
+      messageType: "interactive",
+      rawContent: cardContent
+    });
+    expect(calls[0]).toEqual([
+      "--profile", "bot-profile", "api", "GET", "/open-apis/im/v1/messages/om_card", "--as", "bot",
+      "--params", JSON.stringify({ user_id_type: "open_id", card_msg_content_type: "user_card_content" })
+    ]);
+  });
+
   it("sends markdown and cards directly to a chat without thread reply arguments", async () => {
     const calls: string[][] = [];
     const gateway = new LarkGateway("lark-cli", async (_command, args) => {

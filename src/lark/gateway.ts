@@ -106,7 +106,7 @@ export class LarkGateway {
       "--as",
       "bot",
       "--params",
-      JSON.stringify({ user_id_type: "open_id" })
+      JSON.stringify({ user_id_type: "open_id", card_msg_content_type: "user_card_content" })
     ]);
     const message = messagesFromEnvelope(envelope)[0];
     if (!message) throw new Error(`message ${messageId} was not returned by Lark`);

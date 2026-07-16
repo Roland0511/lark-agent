@@ -58,4 +58,36 @@ describe("Lark attachment parsing", () => {
     expect(safe).not.toContain("file_marker");
     expect(safe).not.toContain("file_audio_marker");
   });
+
+  it("extracts visible CardKit text from user, raw and rendered card content", () => {
+    const userCard = JSON.stringify({
+      body: { elements: [
+        { tag: "markdown", element_id: "answer", content: "1" },
+        { tag: "plain_text", text: "下一步" }
+      ] },
+      config: { summary: { content: "摘要" } },
+      schema: "2.0"
+    });
+    const rawCard = JSON.stringify({
+      json_card: JSON.stringify({
+        body: { property: { elements: [{ property: { elements: [
+          { tag: "plain_text", property: { content: "2" } }
+        ] } }] } },
+        config: { summary: { content: "2" } },
+        schema: "2.0"
+      }),
+      card_schema: 2
+    });
+
+    expect(safeMessageContent("interactive", userCard, [])).toBe("1\n下一步");
+    expect(safeMessageContent("interactive", rawCard, [])).toBe("2");
+    expect(safeMessageContent("interactive", "<card>\n3\n</card>", [])).toBe("3");
+  });
+
+  it("uses the CardKit summary for an empty body and preserves unknown content", () => {
+    const summaryOnly = JSON.stringify({ body: { elements: [] }, config: { summary: { content: "4" } }, schema: "2.0" });
+    expect(safeMessageContent("interactive", summaryOnly, [])).toBe("4");
+    expect(safeMessageContent("interactive", "{not-json", [])).toBe("{not-json");
+    expect(safeMessageContent("interactive", "{}", [])).toBe("{}");
+  });
 });

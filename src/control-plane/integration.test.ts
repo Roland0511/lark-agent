@@ -2786,15 +2786,24 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const sourceTask = await db.selectFrom("tasks").selectAll().where("bot_id", "=", first.id).executeTakeFirstOrThrow();
     await db.insertInto("task_outputs").values({
       task_id: sourceTask.id, conversation_id: sourceTask.conversation_id, card_id: "card-native", message_id: "om_bot_reply_1",
-      visible_phase: "final", current_content: "第一机器人的最终回复", current_content_hash: null, last_item_id: null,
+      visible_phase: "final", current_content: "1", current_content_hash: null, last_item_id: null,
       last_error: null, opened_at: new Date(), closed_at: new Date()
     }).execute();
     const guardMessages: string[] = [];
     const outbound = { sendMarkdownToChat: async (_chatId: string, content: string) => { guardMessages.push(content); return "om_guard_notice"; } } as unknown as LarkGateway;
     const guard = new BotDialogueGuardService(db, new BotGatewayRegistry(db, "lark-cli", outbound));
+    const cardContent = (content: string) => JSON.stringify({
+      body: { elements: [{ tag: "markdown", element_id: "answer", content }] },
+      config: { summary: { content } },
+      schema: "2.0"
+    });
+    const compatibilityPlaceholder = JSON.stringify({ title: null, elements: [[
+      { tag: "img", image_key: "img_placeholder" },
+      { tag: "text", text: "请升级至最新版本客户端，以查看内容" }
+    ]] });
     let botDetails: LarkMessageDetails = {
       messageId: "om_bot_reply_1", rootId: null, parentId: null, threadId: null, chatId: "oc_test",
-      senderId: first.app_id, senderType: "app", messageType: "interactive", content: "第一机器人的最终回复",
+      senderId: first.app_id, senderType: "app", messageType: "interactive", content: cardContent("1"), rawContent: cardContent("1"),
       createTime: "2", mentions: []
     };
     const nativeLark = { getMessage: async () => botDetails } as unknown as LarkGateway;
@@ -2803,10 +2812,10 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
       type: "im.message.receive_v1", event_id: eventId, timestamp: "2", message_id: messageId, chat_id: "oc_test",
       chat_type: "group", sender_id: "ou_peer_scoped_sender", message_type: "interactive", content, create_time: "2"
     });
-    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", botDetails.content));
-    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", botDetails.content));
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", compatibilityPlaceholder));
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_1", "om_bot_reply_1", compatibilityPlaceholder));
     const botSignal = await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").executeTakeFirstOrThrow();
-    expect(botSignal).toMatchObject({ sender_id: "ou_peer_scoped_sender", sender_type: "bot", sender_bot_id: first.id, sender_display_name: first.display_name, sender_role: "member", ingress_source: "lark", origin_message_id: "om_human_origin", bot_dialogue_depth: 1 });
+    expect(botSignal).toMatchObject({ sender_id: "ou_peer_scoped_sender", sender_type: "bot", sender_bot_id: first.id, sender_display_name: first.display_name, sender_role: "member", ingress_source: "lark", origin_message_id: "om_human_origin", bot_dialogue_depth: 1, content: "1" });
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", first.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(0);
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_1").execute()).toHaveLength(1);
 
@@ -2814,18 +2823,18 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.updateTable("tasks").set({ state: "completed", completed_at: new Date(), updated_at: new Date() }).where("conversation_id", "=", secondConversation.id).execute();
     await db.updateTable("conversations").set({ active: false, followup_expires_at: null, updated_at: new Date() }).where("id", "=", secondConversation.id).execute();
     await db.updateTable("task_outputs").set({ message_id: "om_bot_reply_2", current_content: "@第二机器人 请继续" }).where("task_id", "=", sourceTask.id).execute();
-    botDetails = { ...botDetails, messageId: "om_bot_reply_2", content: "@第二机器人 请继续", mentions: [{ id: "ou_receiver_scoped", idType: "open_id", name: second.display_name }] };
-    await secondRouter.handleMessage(botEvent("ev_bot_reply_2", "om_bot_reply_2", botDetails.content));
+    botDetails = { ...botDetails, messageId: "om_bot_reply_2", content: cardContent("@第二机器人 请继续"), rawContent: cardContent("@第二机器人 请继续"), mentions: [{ id: "ou_receiver_scoped", idType: "open_id", name: second.display_name }] };
+    await secondRouter.handleMessage(botEvent("ev_bot_reply_2", "om_bot_reply_2", compatibilityPlaceholder));
     expect(await db.selectFrom("signals").selectAll().where("bot_id", "=", second.id).where("message_id", "=", "om_bot_reply_2").execute()).toHaveLength(1);
     expect(await db.selectFrom("conversations").selectAll().where("bot_id", "=", second.id).where("active", "=", true).execute()).toHaveLength(1);
 
     await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 1, updated_at: new Date() }).where("id", "=", 1).execute();
     await db.updateTable("task_outputs").set({ message_id: "om_guarded_1", current_content: "达到上限" }).where("task_id", "=", sourceTask.id).execute();
-    botDetails = { ...botDetails, messageId: "om_guarded_1", content: "达到上限", mentions: [] };
-    await secondRouter.handleMessage(botEvent("ev_guarded_1", "om_guarded_1", botDetails.content));
+    botDetails = { ...botDetails, messageId: "om_guarded_1", content: cardContent("达到上限"), rawContent: cardContent("达到上限"), mentions: [] };
+    await secondRouter.handleMessage(botEvent("ev_guarded_1", "om_guarded_1", compatibilityPlaceholder));
     await db.updateTable("task_outputs").set({ message_id: "om_guarded_2", current_content: "不会重复提示" }).where("task_id", "=", sourceTask.id).execute();
-    botDetails = { ...botDetails, messageId: "om_guarded_2", content: "不会重复提示" };
-    await secondRouter.handleMessage(botEvent("ev_guarded_2", "om_guarded_2", botDetails.content));
+    botDetails = { ...botDetails, messageId: "om_guarded_2", content: cardContent("不会重复提示"), rawContent: cardContent("不会重复提示") };
+    await secondRouter.handleMessage(botEvent("ev_guarded_2", "om_guarded_2", compatibilityPlaceholder));
     expect(guardMessages).toHaveLength(1);
     expect(await db.selectFrom("bot_dialogue_guards").selectAll().where("chat_id", "=", "oc_test").where("origin_message_id", "=", "om_human_origin").execute()).toHaveLength(1);
     expect(await db.selectFrom("outbox_messages").selectAll().where("operation_kind", "=", "bot_dialogue_guard").execute()).toHaveLength(1);
