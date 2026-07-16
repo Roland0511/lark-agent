@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
-  Activity, AlertTriangle, ArrowLeft, ArrowRight, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleGauge, Clock3, FileClock, Inbox,
+  Activity, AlertTriangle, ArrowDown, ArrowLeft, ArrowRight, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleGauge, Clock3, FileClock, Inbox,
   Check, Copy, Cpu, GitBranch, HardDrive, KeyRound, ListFilter, LogOut, Menu, MessageCircle, MessagesSquare, MoreHorizontal,
   Paperclip, Pencil, Plus, RefreshCw, RotateCcw, Search, Server, ShieldCheck, Sparkles, Timer, Trash2, UserRound, Wifi, WifiOff, Wrench, X
 } from "lucide-react";
@@ -341,7 +341,7 @@ function ChatMemoryWorkspaceDetail({ id, botId, user }: { id: string; botId: str
       <div className="recovery-actions"><button className="primary-button" disabled={recovery.isPending || recoveryResult?.recovered} onClick={() => recovery.mutate()}><RotateCcw size={16} />{recovery.isPending ? "正在检测固定环境…" : recoveryResult?.recovered ? "已恢复" : "检测并恢复"}</button><NavLink className="secondary-button" to={taskLink}>{taskLinkLabel}</NavLink></div>
     </section>}
     {state === "ready" && recoveryResult?.recovered && <div className="recovery-feedback success" aria-live="polite"><CheckCircle2 size={18} /><div><strong>恢复完成</strong><span>关联任务未自动重试，可前往任务中心确认后继续。</span></div><NavLink className="secondary-button" to={taskLink}>{taskLinkLabel}</NavLink></div>}
-    <ThreadMemorySnapshot contextId={id} threadId={d.threadId} user={user} />
+    <ThreadMemorySnapshot contextId={id} threadId={d.threadId} chatName={chatDisplayName(d)} agentName={d.botDisplayName ?? "本 Agent"} user={user} />
     <div className="layered-sections memory-layered-sections">
       <ChatSkillOverview botId={botId} context={d} user={user} />
       <details><summary><HardDrive size={17} /><span><strong>技术绑定信息</strong><small>Thread、执行环境与独立聊天工作区</small></span><ChevronDown size={17} /></summary><dl className="layered-detail-list two-column"><Detail label="Chat Context ID" value={d.id} /><Detail label="Chat ID" value={d.chatId} />{d.chatType === "p2p" && <Detail label="用户 Open ID" value={d.peerOpenId} />}<Detail label="Codex Thread" value={d.threadId ?? "首次执行时建立"} /><Detail label="固定执行器" value={executorNameWithId(d.executorDisplayName, d.executorId) ?? "首次执行时固定"} /><Detail label="Codex Profile" value={d.executorProfile ?? "首次执行时固定"} /><Detail label="Codex 版本" value={d.codexVersion} /><Detail label="总工作区" value={d.workspaceRootAlias ?? "首次执行时固定"} /><Detail label="聊天工作区" value={d.workspaceKey ? `${d.workspaceRootAlias ?? "<总工作区>"}/${d.botAppId}/chats/${d.workspaceKey}` : null} /><Detail label="配置指纹" value={d.executorConfigFingerprint} /><Detail label="首次绑定时间" value={formatDateTime(d.createdAt)} /><Detail label="最后活动" value={formatDateTime(d.lastActivityAt)} /></dl></details>
@@ -358,9 +358,23 @@ type ThreadSnapshotPage = {
   nextCursor: string | null;
 };
 
-export function ThreadMemorySnapshot({ contextId, threadId, user }: { contextId: string; threadId?: string | null; user: AdminUser }) {
+type ThreadParticipant = "all" | "user" | "self" | "other";
+type ThreadContentKind = "reply" | "reasoning" | "command" | "file" | "tool" | "compaction" | "unknown";
+
+const threadContentFilters: Array<{ value: ThreadContentKind; label: string }> = [
+  { value: "reply", label: "最终回复" },
+  { value: "reasoning", label: "推理" },
+  { value: "command", label: "命令" },
+  { value: "file", label: "文件变更" },
+  { value: "tool", label: "工具调用" },
+  { value: "compaction", label: "上下文压缩" },
+  { value: "unknown", label: "其它记录" }
+];
+
+export function ThreadMemorySnapshot({ contextId, threadId, chatName = "当前聊天", agentName = "本 Agent", user }: { contextId: string; threadId?: string | null; chatName?: string; agentName?: string; user: AdminUser }) {
   const queryClient = useQueryClient();
   const autoAttemptedContext = useRef<string | null>(null);
+  const [dialogOpen, setDialogOpen] = useState(false);
   const history = useInfiniteQuery({
     queryKey: ["chat-context", "thread-snapshot", contextId],
     queryFn: ({ pageParam }) => api<ThreadSnapshotPage>(`/v1/admin/chat-contexts/${contextId}/thread-snapshot?limit=50${pageParam ? `&before=${encodeURIComponent(pageParam)}` : ""}`),
@@ -397,22 +411,276 @@ export function ThreadMemorySnapshot({ contextId, threadId, user }: { contextId:
   const refreshing = refresh.isPending || ["queued", "running"].includes(refreshState?.state);
   const executorUnavailable = refreshState?.state === "queued" && ["stale", "offline"].includes(refreshState?.executorAvailability);
 
-  return <section className="thread-memory-panel" aria-labelledby="thread-memory-title">
-    <header className="thread-memory-header"><div><span className="thread-memory-icon"><MessagesSquare size={20} /></span><div><h3 id="thread-memory-title">Thread 记忆内容{snapshot ? ` · ${snapshot.itemCount} 项` : ""}</h3><p>{snapshot ? `最近快照 ${formatDateTime(snapshot.completedAt)} · ${snapshot.protocolSource ?? "thread/read"}` : "只读展示 Codex 已持久化的消息、推理与执行记录。"}</p></div></div><button className="secondary-button" disabled={!threadId || refreshing} onClick={() => refresh.mutate()}><RefreshCw className={refreshing ? "spin" : ""} size={15} />{refreshing ? refreshState?.state === "running" ? "正在读取…" : "等待执行器…" : snapshot ? "刷新" : "读取 Thread"}</button></header>
-    {!threadId ? <Empty icon={<FileClock />} title="Thread 尚未建立" text="首次有效任务执行并完成固定绑定后，才能读取持久化聊天内容。" /> : history.isLoading && !firstPage ? <PageLoading compact /> : history.error ? <ErrorBox error={history.error} /> : <>
-      {refreshing && <div className="thread-snapshot-status running" aria-live="polite"><RefreshCw className="spin" size={17} /><div><strong>{refreshState?.state === "running" ? "原执行器正在读取 Thread" : executorUnavailable ? "原执行器当前离线，快照保持排队" : "快照已排队，等待原执行器"}</strong><span>{executorUnavailable ? `最近心跳 ${relativeTime(refreshState.executorLastSeenAt)}；请在固定设备启动 Runner。已有作业会继续等待，超过 10 分钟后明确失败。` : snapshot ? "刷新期间继续展示上一份成功快照。" : "完成后会自动显示最近 50 项。"}</span></div></div>}
-      {refreshState?.state === "failed" && <div className="thread-snapshot-status failed" role="alert"><AlertTriangle size={17} /><div><strong>本次 Thread 读取失败</strong><span>{refreshState.error ?? "执行器未能生成快照。"}{snapshot ? " 已保留上一份成功快照。" : ""}</span></div></div>}
-      {refresh.error && <ErrorBox error={refresh.error} />}
-      {snapshot ? <>
-        <details className="thread-snapshot-metadata"><summary><HardDrive size={15} />快照元数据<ChevronDown size={15} /></summary><dl><Detail label="Thread ID" value={snapshot.threadId} /><Detail label="执行器 ID" value={snapshot.executorId} /><Detail label="回合数" value={`${snapshot.turnCount ?? 0}`} /><Detail label="Item 数" value={`${snapshot.itemCount ?? 0}`} /></dl><pre>{JSON.stringify(snapshot.thread, null, 2)}</pre></details>
-        {history.hasNextPage && <div className="thread-load-earlier"><button className="secondary-button" disabled={history.isFetchingNextPage} onClick={() => void history.fetchNextPage()}><FileClock size={15} />{history.isFetchingNextPage ? "正在加载…" : "加载更早"}</button><span>当前已显示 {items.length} / {snapshot.itemCount} 项</span></div>}
-        {groups.length ? <div className="thread-memory-timeline">{groups.map((group, groupIndex) => {
+  const summaryState = !threadId ? "Thread 尚未建立" : refreshing ? refreshState?.state === "running" ? "正在读取" : "等待执行器" : refreshState?.state === "failed" || history.error ? "最近刷新失败" : snapshot ? "快照已就绪" : history.isLoading ? "正在加载" : "等待首次快照";
+
+  return <>
+    <section className="thread-memory-panel thread-memory-summary" aria-labelledby="thread-memory-title">
+      <header className="thread-memory-header"><div><span className="thread-memory-icon"><MessagesSquare size={20} /></span><div><h3 id="thread-memory-title">Thread 记忆内容{snapshot ? ` · ${snapshot.itemCount} 项` : ""}</h3><p>{snapshot ? `最近快照 ${formatDateTime(snapshot.completedAt)} · ${snapshot.protocolSource ?? "thread/read"}` : "只读展示 Codex 已持久化的消息、推理与执行记录。"}</p></div></div><div className="thread-memory-summary-actions"><span className={`thread-summary-state ${refreshState?.state === "failed" || history.error ? "failed" : refreshing ? "running" : ""}`}>{summaryState}</span><button className="primary-button" disabled={!threadId} onClick={() => setDialogOpen(true)}><MessageCircle size={15} />查看内容</button><button className="secondary-button" aria-label="刷新 Thread 记忆" disabled={!threadId || refreshing} onClick={() => refresh.mutate()}><RefreshCw className={refreshing ? "spin" : ""} size={15} />刷新</button></div></header>
+    </section>
+    {dialogOpen && <ThreadMemoryDialog
+      agentName={agentName}
+      chatName={chatName}
+      executorUnavailable={executorUnavailable}
+      groups={groups}
+      hasNextPage={Boolean(history.hasNextPage)}
+      historyError={history.error}
+      historyLoading={history.isLoading && !firstPage}
+      isFetchingNextPage={history.isFetchingNextPage}
+      itemCount={Number(snapshot?.itemCount ?? items.length)}
+      items={items}
+      onClose={() => setDialogOpen(false)}
+      onLoadEarlier={() => history.fetchNextPage()}
+      onRefresh={() => refresh.mutate()}
+      refreshError={refresh.error}
+      refreshing={refreshing}
+      refreshState={refreshState}
+      snapshot={snapshot}
+      turnMap={turnMap}
+    />}
+  </>;
+}
+
+function ThreadMemoryDialog({ agentName, chatName, executorUnavailable, groups, hasNextPage, historyError, historyLoading, isFetchingNextPage, itemCount, items, onClose, onLoadEarlier, onRefresh, refreshError, refreshing, refreshState, snapshot, turnMap }: {
+  agentName: string;
+  chatName: string;
+  executorUnavailable: boolean;
+  groups: Array<{ turnId: string | null; items: AnyRecord[] }>;
+  hasNextPage: boolean;
+  historyError: unknown;
+  historyLoading: boolean;
+  isFetchingNextPage: boolean;
+  itemCount: number;
+  items: AnyRecord[];
+  onClose(): void;
+  onLoadEarlier(): Promise<unknown>;
+  onRefresh(): void;
+  refreshError: unknown;
+  refreshing: boolean;
+  refreshState: AnyRecord | null;
+  snapshot: AnyRecord | null;
+  turnMap: Map<string, AnyRecord>;
+}) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
+  const turnRefs = useRef(new Map<string, HTMLElement>());
+  const closeRef = useRef(onClose);
+  const initialScrollDone = useRef(false);
+  const [search, setSearch] = useState("");
+  const [participant, setParticipant] = useState<ThreadParticipant>("all");
+  const [contentKinds, setContentKinds] = useState<Set<ThreadContentKind>>(() => new Set(threadContentFilters.map((item) => item.value)));
+  const [activeTurn, setActiveTurn] = useState(() => threadGroupKey(groups.at(-1), Math.max(0, groups.length - 1)));
+  closeRef.current = onClose;
+
+  const participantCounts = useMemo(() => {
+    const counts: Record<Exclude<ThreadParticipant, "all">, number> = { user: 0, self: 0, other: 0 };
+    for (const item of items) {
+      const role = threadItemSpeaker(item, agentName).role;
+      if (role === "user" || role === "self" || role === "other") counts[role] += 1;
+    }
+    return counts;
+  }, [agentName, items]);
+  const normalizedSearch = search.trim().toLocaleLowerCase("zh-CN");
+  const visibleGroups = useMemo(() => groups.map((group, sourceIndex) => ({ ...group, sourceIndex, items: group.items.filter((item) => {
+    const role = threadItemSpeaker(item, agentName).role;
+    if (participant !== "all" && role !== participant) return false;
+    if (!contentKinds.has(threadItemContentKind(item))) return false;
+    return !normalizedSearch || threadItemSearchText(item).toLocaleLowerCase("zh-CN").includes(normalizedSearch);
+  }) })).filter((group) => group.items.length), [agentName, contentKinds, groups, normalizedSearch, participant]);
+  const visibleCount = visibleGroups.reduce((total, group) => total + group.items.length, 0);
+
+  const scrollToLatest = () => {
+    const chat = chatRef.current;
+    if (!chat) return;
+    chat.scrollTop = chat.scrollHeight;
+    const last = visibleGroups.at(-1);
+    if (last) setActiveTurn(threadGroupKey(last, Math.max(0, visibleGroups.length - 1)));
+  };
+  useEffect(() => {
+    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const focusable = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), [tabindex]:not([tabindex='-1'])") ?? []);
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") { event.preventDefault(); closeRef.current(); return; }
+      if (event.key !== "Tab") return;
+      const candidates = focusable();
+      if (!candidates.length) { event.preventDefault(); return; }
+      const first = candidates[0]!;
+      const last = candidates[candidates.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    scheduleThreadFrame(() => scheduleThreadFrame(() => { scrollToLatest(); initialScrollDone.current = true; dialogRef.current?.querySelector<HTMLInputElement>("input[type='search']")?.focus(); }));
+    return () => { document.removeEventListener("keydown", onKeyDown); document.body.style.overflow = previousOverflow; previous?.focus(); };
+  }, []);
+  useEffect(() => {
+    if (initialScrollDone.current || !items.length) return;
+    scheduleThreadFrame(() => scheduleThreadFrame(() => { scrollToLatest(); initialScrollDone.current = true; }));
+  }, [items.length]);
+
+  const jumpToTurn = (key: string) => {
+    const target = turnRefs.current.get(key);
+    const chat = chatRef.current;
+    if (!target || !chat) return;
+    chat.scrollTop = Math.max(0, target.offsetTop - 14);
+    setActiveTurn(key);
+  };
+  const loadEarlier = async () => {
+    const chat = chatRef.current;
+    const previousHeight = chat?.scrollHeight ?? 0;
+    const previousTop = chat?.scrollTop ?? 0;
+    await onLoadEarlier();
+    scheduleThreadFrame(() => scheduleThreadFrame(() => {
+      if (chat) chat.scrollTop = previousTop + Math.max(0, chat.scrollHeight - previousHeight);
+    }));
+  };
+  const toggleContentKind = (kind: ThreadContentKind) => setContentKinds((current) => {
+    const next = new Set(current);
+    if (next.has(kind)) next.delete(kind); else next.add(kind);
+    return next;
+  });
+  const clearFilters = () => { setSearch(""); setParticipant("all"); setContentKinds(new Set(threadContentFilters.map((item) => item.value))); };
+  const updateActiveTurn = () => {
+    const chat = chatRef.current;
+    if (!chat) return;
+    if (chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 160) {
+      const last = visibleGroups.at(-1);
+      if (last) setActiveTurn(threadGroupKey(last, last.sourceIndex));
+      return;
+    }
+    let nearest: { key: string; distance: number } | null = null;
+    for (const [key, element] of turnRefs.current) {
+      const distance = Math.abs(element.offsetTop - chat.scrollTop - 20);
+      if (!nearest || distance < nearest.distance) nearest = { key, distance };
+    }
+    if (nearest) setActiveTurn(nearest.key);
+  };
+
+  return <div className="thread-dialog-overlay" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+    <div ref={dialogRef} className="thread-dialog" role="dialog" aria-modal="true" aria-labelledby="thread-dialog-title">
+      <header className="thread-dialog-header"><div><h2 id="thread-dialog-title">Thread 记忆内容</h2><p>{chatName} · {agentName} · {itemCount} 项</p></div><div><span className={`thread-dialog-snapshot-state ${refreshState?.state === "failed" ? "failed" : refreshing ? "running" : ""}`}>{refreshing ? "快照更新中" : refreshState?.state === "failed" ? "最近刷新失败" : snapshot ? "快照已完成" : "等待快照"}</span><button className="ghost-button" disabled={refreshing} onClick={onRefresh}><RefreshCw className={refreshing ? "spin" : ""} size={15} />刷新</button><button className="icon-button" aria-label="关闭 Thread 记忆内容" onClick={onClose}><X size={19} /></button></div></header>
+      <div className="thread-dialog-search"><Search size={17} /><input type="search" aria-label="搜索 Thread 记忆" placeholder="搜索消息、命令、路径或工具结果" value={search} onChange={(event) => setSearch(event.target.value)} /><span>{visibleCount} 条结果</span></div>
+      <div className="thread-dialog-body">
+        <nav className="thread-turn-nav" aria-label="Thread 回合导航"><h3>回合导航</h3><div>{groups.map((group, index) => {
+          const key = threadGroupKey(group, index);
           const turn = group.turnId ? turnMap.get(group.turnId) : null;
-          return <section className="thread-turn-group" key={`${group.turnId ?? "unassigned"}-${groupIndex}`}><header><span>回合 {turn ? Number(turn.turnIndex) + 1 : "未关联"}</span><code title={group.turnId ?? undefined}>{shortId(group.turnId) ?? "持久化补项"}</code>{turn?.status && <StateBadge state={turn.status} />}{turn?.durationMs != null && <time>{formatDurationPrecise(Number(turn.durationMs) / 1_000)}</time>}</header><div>{group.items.map((item) => <ThreadMemoryItemCard key={`${item.ordinal}-${item.itemId}`} item={item} />)}</div></section>;
-        })}</div> : <Empty icon={<MessagesSquare />} title="Thread 中没有可展示项" text="Codex 返回了空历史；刷新不会推进任务或修改 Thread。" />}
-      </> : !refreshing && !refresh.error && refreshState?.state !== "failed" ? <Empty icon={<MessagesSquare />} title="正在准备首次快照" text="页面会自动请求原执行器只读加载 Thread 历史。" /> : null}
-    </>}
-  </section>;
+          return <button key={key} className={activeTurn === key ? "active" : ""} onClick={() => jumpToTurn(key)}><span>回合 {turn ? Number(turn.turnIndex) + 1 : index + 1}</span><small>{turn?.durationMs != null ? formatDurationPrecise(Number(turn.durationMs) / 1_000) : `${group.items.length} 项`}</small></button>;
+        })}</div><button className="thread-jump-latest-nav" onClick={scrollToLatest}><ArrowDown size={15} />跳到最新</button></nav>
+        <main ref={chatRef} className="thread-conversation" onScroll={updateActiveTurn}>
+          {refreshing && <div className="thread-snapshot-status running" aria-live="polite"><RefreshCw className="spin" size={17} /><div><strong>{refreshState?.state === "running" ? "原执行器正在读取 Thread" : executorUnavailable ? "原执行器当前离线，快照保持排队" : "快照已排队，等待原执行器"}</strong><span>{executorUnavailable ? `最近心跳 ${relativeTime(refreshState?.executorLastSeenAt)}；请在固定设备启动 Runner。` : snapshot ? "刷新期间继续展示上一份成功快照。" : "完成后会自动显示最近 50 项。"}</span></div></div>}
+          {refreshState?.state === "failed" && <div className="thread-snapshot-status failed" role="alert"><AlertTriangle size={17} /><div><strong>本次 Thread 读取失败</strong><span>{refreshState.error ?? "执行器未能生成快照。"}{snapshot ? " 已保留上一份成功快照。" : ""}</span></div></div>}
+          {Boolean(refreshError) && <ErrorBox error={refreshError} />}
+          {historyError ? <ErrorBox error={historyError} /> : historyLoading ? <PageLoading compact /> : snapshot ? <>
+            {hasNextPage && <div className="thread-load-earlier"><button className="secondary-button" disabled={isFetchingNextPage} onClick={() => void loadEarlier()}><FileClock size={15} />{isFetchingNextPage ? "正在加载…" : "加载更早"}</button><span>当前已显示 {items.length} / {itemCount} 项</span></div>}
+            {visibleGroups.length ? visibleGroups.map((group, groupIndex) => {
+              const fallbackIndex = group.sourceIndex ?? groupIndex;
+              const key = threadGroupKey(group, fallbackIndex);
+              const turn = group.turnId ? turnMap.get(group.turnId) : null;
+              const promptItem = groups[fallbackIndex]?.items.find((item) => String(item.itemType ?? item.raw?.type) === "userMessage");
+              const turnPrompt = promptItem ? textFromThreadValue(promptItem.raw?.content ?? promptItem.raw?.text) : "";
+              return <section ref={(element) => { if (element) turnRefs.current.set(key, element); else turnRefs.current.delete(key); }} className="thread-conversation-turn" key={key}><header><span /><strong>回合 {turn ? Number(turn.turnIndex) + 1 : fallbackIndex + 1}</strong>{turn?.durationMs != null && <time>{formatDurationPrecise(Number(turn.durationMs) / 1_000)}</time>}<span /></header><div>{group.items.map((item) => <ThreadConversationItem agentName={agentName} groupPrompt={turnPrompt} item={item} key={`${item.ordinal}-${item.itemId}`} />)}</div></section>;
+            }) : <Empty icon={<Search />} title="没有匹配的 Thread 记录" text="调整搜索词或筛选条件后再试。" />}
+          </> : <Empty icon={<MessagesSquare />} title="正在准备首次快照" text="页面会自动请求原执行器只读加载 Thread 历史。" />}
+          <button className="thread-floating-latest" onClick={scrollToLatest}><ArrowDown size={15} />最新消息</button>
+        </main>
+        <aside className="thread-filter-panel"><div className="thread-filter-heading"><h3>筛选</h3><button onClick={clearFilters}>重置</button></div><section><h4>参与者</h4>{([
+          ["all", "全部消息", items.length], ["user", "用户", participantCounts.user], ["self", agentName, participantCounts.self], ["other", "其它 Agent", participantCounts.other]
+        ] as Array<[ThreadParticipant, string, number]>).map(([value, label, count]) => <button className={participant === value ? "active" : ""} key={value} onClick={() => setParticipant(value)}><span>{label}</span><small>{count}</small></button>)}</section><section><h4>内容类型</h4>{threadContentFilters.map((filter) => <label key={filter.value}><input type="checkbox" checked={contentKinds.has(filter.value)} onChange={() => toggleContentKind(filter.value)} /><span><Check size={12} /></span>{filter.label}</label>)}</section></aside>
+      </div>
+    </div>
+  </div>;
+}
+
+function threadGroupKey(group: { turnId: string | null } | undefined, index: number): string {
+  return group?.turnId ?? `unassigned-${index}`;
+}
+
+function scheduleThreadFrame(callback: () => void): number {
+  return typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame(callback) : window.setTimeout(callback, 0);
+}
+
+function ThreadConversationItem({ agentName, groupPrompt, item }: { agentName: string; groupPrompt: string; item: AnyRecord }) {
+  const raw = item.raw && typeof item.raw === "object" ? item.raw as AnyRecord : {};
+  const type = String(item.itemType ?? raw.type ?? "unknown");
+  const presentation = threadItemPresentation[type] ?? { label: type === "unknown" ? "未知 Item" : type, kind: "unknown", icon: <FileClock size={15} /> };
+  const speaker = threadItemSpeaker(item, agentName);
+  const summary = threadItemDisplayText(item);
+  const fullPrompt = type === "agentMessage" && groupPrompt ? groupPrompt : textFromThreadValue(raw.content ?? raw.text ?? raw.prompt ?? raw.summary) || summary;
+  const [expanded, setExpanded] = useState(false);
+  const [detailMode, setDetailMode] = useState<"prompt" | "json">("prompt");
+  const [copied, setCopied] = useState(false);
+  const detailRef = useRef<HTMLDivElement>(null);
+  const detailText = detailMode === "json" ? JSON.stringify(item.raw, null, 2) : fullPrompt;
+  useEffect(() => {
+    if (!expanded) return;
+    scheduleThreadFrame(() => detailRef.current?.scrollIntoView?.({ block: "nearest", behavior: "smooth" }));
+  }, [expanded]);
+  const copyDetail = () => {
+    if (navigator.clipboard?.writeText) void navigator.clipboard.writeText(detailText).then(() => { setCopied(true); window.setTimeout(() => setCopied(false), 1_500); });
+  };
+  return <article className={`thread-chat-item participant-${speaker.role} type-${presentation.kind}`}>
+    <div className="thread-chat-avatar" aria-hidden="true">{speaker.role === "user" ? <UserRound size={15} /> : speaker.role === "self" || speaker.role === "other" ? <Bot size={15} /> : presentation.icon}</div>
+    <div className="thread-chat-content"><header><strong>{speaker.name}</strong><span>{presentation.label}</span><small className="mono" title={item.itemId}>{shortId(item.itemId) ?? `#${item.ordinal}`}</small></header><button className="thread-message-bubble" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}><pre>{summary || "此类型没有独立摘要，请展开查看完整内容。"}</pre></button><button className="thread-message-expand" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? "收起详情" : type === "agentMessage" || type === "userMessage" ? "展开完整提示词" : "展开完整内容"}<ChevronDown size={14} /></button>{expanded && <div ref={detailRef} className="thread-message-detail"><header><div role="tablist" aria-label="Thread Item 详情模式"><button role="tab" aria-selected={detailMode === "prompt"} className={detailMode === "prompt" ? "active" : ""} onClick={() => setDetailMode("prompt")}>{type === "agentMessage" || type === "userMessage" ? "完整提示词" : "完整内容"}</button><button role="tab" aria-selected={detailMode === "json"} className={detailMode === "json" ? "active" : ""} onClick={() => setDetailMode("json")}>原始 JSON</button></div><button aria-label="复制详情" onClick={copyDetail}><Copy size={14} />{copied ? "已复制" : "复制"}</button></header><pre>{detailText}</pre></div>}</div>
+  </article>;
+}
+
+function threadItemSpeaker(item: AnyRecord, agentName: string): { role: Exclude<ThreadParticipant, "all"> | "system"; name: string } {
+  const raw = item.raw && typeof item.raw === "object" ? item.raw as AnyRecord : {};
+  const type = String(item.itemType ?? raw.type ?? "unknown");
+  if (type === "agentMessage") return { role: "self", name: agentName };
+  if (type === "userMessage") {
+    const signal = extractThreadSignal(textFromThreadValue(raw.content ?? raw.text));
+    if (signal?.senderType === "bot") return { role: "other", name: signal.senderName || "其它 Agent" };
+    return { role: "user", name: "用户" };
+  }
+  if (type === "collabAgentToolCall") return { role: "other", name: String(raw.senderName ?? raw.agentName ?? "协作 Agent") };
+  return { role: "system", name: threadItemPresentation[type]?.label ?? "Thread 记录" };
+}
+
+function extractThreadSignal(text: string): { senderType: "user" | "bot"; senderName: string; text: string } | null {
+  const matches = [...text.matchAll(/^\s*-\s*\[(user|bot):([^|\]]+)(?:\|[^\]]*)?\]\s*(.*)$/gmu)];
+  const match = matches.at(-1);
+  if (!match) return null;
+  return { senderType: match[1] as "user" | "bot", senderName: match[2]?.trim() ?? "", text: match[3]?.trim() ?? "" };
+}
+
+function threadItemDisplayText(item: AnyRecord): string {
+  const raw = item.raw && typeof item.raw === "object" ? item.raw as AnyRecord : {};
+  const type = String(item.itemType ?? raw.type ?? "unknown");
+  if (type === "userMessage") {
+    const text = textFromThreadValue(raw.content ?? raw.text);
+    return extractThreadSignal(text)?.text || text;
+  }
+  if (type === "agentMessage") {
+    const text = textFromThreadValue(raw.text ?? raw.content);
+    try {
+      const parsed = JSON.parse(text) as AnyRecord;
+      return textFromThreadValue(parsed.reply ?? parsed.output ?? parsed.text) || text;
+    } catch { return text; }
+  }
+  if (type === "reasoning") return textFromThreadValue(raw.summary ?? raw.content ?? raw.text);
+  if (type === "commandExecution") return [raw.command ?? "未记录命令", raw.aggregatedOutput].filter(Boolean).map(String).join("\n");
+  if (type === "fileChange") return textFromThreadValue(raw.changes ?? raw.diff) || "记录了一次文件变更";
+  if (["mcpToolCall", "dynamicToolCall"].includes(type)) return [raw.server, raw.tool, raw.status].filter(Boolean).map(String).join(" · ") || "工具调用";
+  if (type === "collabAgentToolCall") return textFromThreadValue(raw.prompt ?? raw.result) || String(raw.tool ?? "协作代理调用");
+  if (type === "contextCompaction") return "Codex 已将更早上下文压缩为持久化摘要，Thread 本身没有被更换。";
+  return textFromThreadValue(raw.summary ?? raw.content ?? raw.text) || `未识别的 ${type} 记录`;
+}
+
+function threadItemContentKind(item: AnyRecord): ThreadContentKind {
+  const type = String(item.itemType ?? item.raw?.type ?? "unknown");
+  if (["userMessage", "agentMessage"].includes(type)) return "reply";
+  if (type === "reasoning") return "reasoning";
+  if (type === "commandExecution") return "command";
+  if (type === "fileChange") return "file";
+  if (["mcpToolCall", "dynamicToolCall", "collabAgentToolCall"].includes(type)) return "tool";
+  if (type === "contextCompaction") return "compaction";
+  return "unknown";
+}
+
+function threadItemSearchText(item: AnyRecord): string {
+  return `${threadItemDisplayText(item)}\n${JSON.stringify(item.raw ?? {})}`;
 }
 
 function groupThreadItems(items: AnyRecord[]): Array<{ turnId: string | null; items: AnyRecord[] }> {

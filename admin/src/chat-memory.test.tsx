@@ -116,6 +116,8 @@ describe("Thread 记忆内容", () => {
     const post = calls.find(([, init]) => init?.method === "POST");
     expect(post?.[0]).toBe("/v1/admin/chat-contexts/context-1/thread-snapshot");
     expect(new Headers(post?.[1]?.headers).get("x-csrf-token")).toBe("csrf-token");
+    await waitFor(() => expect(screen.getByText("等待执行器")).toBeTruthy());
+    fireEvent.click(screen.getByRole("button", { name: "查看内容" }));
     await waitFor(() => expect(screen.getByText("原执行器当前离线，快照保持排队")).toBeTruthy());
     expect(screen.getByText(/请在固定设备启动 Runner/)).toBeTruthy();
     expect(calls.filter(([, init]) => init?.method === "POST")).toHaveLength(1);
@@ -135,12 +137,48 @@ describe("Thread 记忆内容", () => {
 
     renderSnapshot("context-paged");
     expect(await screen.findByText("Thread 记忆内容 · 51 项")).toBeTruthy();
-    expect(screen.getByText("最新消息")).toBeTruthy();
+    expect(screen.queryByText("最新消息")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "查看内容" }));
+    expect(screen.getAllByText("最新消息").length).toBeGreaterThan(0);
     expect(screen.getByText("本次 Thread 读取失败")).toBeTruthy();
     expect(screen.getByText(/原执行器离线.*保留上一份成功快照/)).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: /加载更早/ }));
     expect(await screen.findByText("最早消息")).toBeTruthy();
     expect(calls.some((path) => path.includes("before=older"))).toBe(true);
     expect(screen.queryByRole("button", { name: /加载更早/ })).toBeNull();
+  });
+
+  it("以对话模式展示最终回复，并支持搜索、参与者筛选和详情模式切换", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => ok({
+      snapshot: { id: "snapshot-2", threadId: "thread-1", executorId: "runner-1", protocolSource: "thread/read", thread: { id: "thread-1" }, turnCount: 1, itemCount: 3, completedAt: "2026-07-16T01:00:00.000Z" },
+      refresh: null,
+      items: [
+        { ordinal: 0, turnId: "turn-1", itemId: "other-1", itemType: "userMessage", raw: { id: "other-1", type: "userMessage", content: [{ type: "text", text: "系统提示\n飞书信号：\n- [bot:协作助手|member|depth=1] 8\n最终必须返回 reply。" }] } },
+        { ordinal: 1, turnId: "turn-1", itemId: "self-1", itemType: "agentMessage", raw: { id: "self-1", type: "agentMessage", text: JSON.stringify({ reply: "9", disposition: "awaiting_followup", rationale: "等待对方数 10" }) } },
+        { ordinal: 2, turnId: "turn-1", itemId: "reason-1", itemType: "reasoning", raw: { id: "reason-1", type: "reasoning", summary: ["检查轮流顺序"] } }
+      ],
+      turns: [{ turnIndex: 0, turnId: "turn-1", status: "completed", durationMs: 1000 }],
+      nextCursor: null
+    })));
+
+    renderSnapshot("context-dialog");
+    await screen.findByText("Thread 记忆内容 · 3 项");
+    fireEvent.click(screen.getByRole("button", { name: "查看内容" }));
+    expect(screen.getByText("协作助手")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "8" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "9" })).toBeTruthy();
+    expect(screen.queryByText("等待对方数 10")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "9" }));
+    expect(screen.getByRole("tab", { name: "完整提示词" })).toBeTruthy();
+    expect(screen.getByText(/系统提示.*最终必须返回 reply/s)).toBeTruthy();
+    fireEvent.click(screen.getByRole("tab", { name: "原始 JSON" }));
+    expect(screen.getByText(/等待对方数 10/)).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("searchbox", { name: "搜索 Thread 记忆" }), { target: { value: "检查轮流顺序" } });
+    expect(screen.getByText("检查轮流顺序")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "8" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /其它 Agent/ }));
+    expect(screen.getByText("没有匹配的 Thread 记录")).toBeTruthy();
   });
 });
