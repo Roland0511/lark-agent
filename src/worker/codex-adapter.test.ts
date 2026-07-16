@@ -35,6 +35,7 @@ rl.on('line', (line) => {
     ] } } });
   }
   if (msg.method === 'thread/items/list') {
+    if (msg.params.threadId === 'thr_method_missing') return send({ id: msg.id, error: { code: -32601, message: 'thread/items/list is not supported yet' } });
     if (msg.params.threadId === 'thr_bad_list') return send({ id: msg.id, result: { data: {}, nextCursor: null } });
     if (msg.params.threadId === 'thr_repeat') return send({ id: msg.id, result: { data: [], nextCursor: 'repeat' } });
     if (!msg.params.cursor) return send({ id: msg.id, result: { data: [
@@ -187,6 +188,9 @@ describe("CodexAdapter", () => {
       expect(merged.items.find((item) => item.itemId === "agent_1")).toMatchObject({ turnId: "turn_a", itemIndex: 1 });
       expect(merged.items.find((item) => item.itemId === "persistent_extra")).toMatchObject({ turnId: null, itemIndex: null });
       expect(merged.items.find((item) => item.itemId === "read_only_1")).toMatchObject({ ordinal: 10, turnId: "turn_b", itemIndex: 1 });
+      const fallback = await adapter.readThreadHistory("thr_method_missing", true);
+      expect(fallback.protocolSource).toBe("thread/read");
+      expect(fallback.items.map((item) => item.itemType)).toEqual(["userMessage", "agentMessage", "contextCompaction", "webSearch"]);
       await expect(adapter.readThreadHistory("thr_mismatch", false)).rejects.toThrow(/unexpected thread id/);
       await expect(adapter.readThreadHistory("thr_bad_list", true)).rejects.toThrow(/invalid data/);
       await expect(adapter.readThreadHistory("thr_repeat", true)).rejects.toThrow(/repeated a pagination cursor/);

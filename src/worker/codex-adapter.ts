@@ -13,6 +13,13 @@ interface PendingRequest {
   reject: (error: Error) => void;
 }
 
+class CodexRpcError extends Error {
+  constructor(readonly code: number | undefined, message: string) {
+    super(`Codex RPC ${code ?? ""}: ${message}`);
+    this.name = "CodexRpcError";
+  }
+}
+
 interface TurnCollector {
   threadId: string;
   turnId: string | null;
@@ -129,7 +136,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.2" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.3" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -191,35 +198,42 @@ export class CodexAdapter {
     let merged = readItems;
     let protocolSource: CodexThreadHistory["protocolSource"] = "thread/read";
     if (includeItemsList) {
-      const listed: Record<string, unknown>[] = [];
-      const seenCursors = new Set<string>();
-      let cursor: string | null = null;
-      do {
-        const page = (await this.request("thread/items/list", {
-          threadId, cursor, limit: 200, sortDirection: "asc"
-        })) as { data?: unknown; nextCursor?: unknown };
-        if (!Array.isArray(page.data)) throw new Error("Codex thread/items/list returned invalid data");
-        listed.push(...page.data.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object"));
-        const next = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
-        if (next && seenCursors.has(next)) throw new Error("Codex thread/items/list repeated a pagination cursor");
-        if (next) seenCursors.add(next);
-        cursor = next;
-      } while (cursor);
-      const listedIds = new Set<string>();
-      merged = listed.map((item, ordinal) => {
-        const itemId = String(item.id ?? `unassigned:item:${ordinal}`);
-        listedIds.add(itemId);
-        const mapped = association.get(itemId);
-        return {
-          ordinal, turnId: mapped?.turnId ?? null, itemIndex: mapped?.itemIndex ?? null,
-          itemId, itemType: String(item.type ?? "unknown"), raw: item
-        };
-      });
-      for (const item of readItems) {
-        if (listedIds.has(item.itemId)) continue;
-        merged.push({ ...item, ordinal: merged.length });
+      try {
+        const listed: Record<string, unknown>[] = [];
+        const seenCursors = new Set<string>();
+        let cursor: string | null = null;
+        do {
+          const page = (await this.request("thread/items/list", {
+            threadId, cursor, limit: 200, sortDirection: "asc"
+          })) as { data?: unknown; nextCursor?: unknown };
+          if (!Array.isArray(page.data)) throw new Error("Codex thread/items/list returned invalid data");
+          listed.push(...page.data.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object"));
+          const next = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+          if (next && seenCursors.has(next)) throw new Error("Codex thread/items/list repeated a pagination cursor");
+          if (next) seenCursors.add(next);
+          cursor = next;
+        } while (cursor);
+        const listedIds = new Set<string>();
+        merged = listed.map((item, ordinal) => {
+          const itemId = String(item.id ?? `unassigned:item:${ordinal}`);
+          listedIds.add(itemId);
+          const mapped = association.get(itemId);
+          return {
+            ordinal, turnId: mapped?.turnId ?? null, itemIndex: mapped?.itemIndex ?? null,
+            itemId, itemType: String(item.type ?? "unknown"), raw: item
+          };
+        });
+        for (const item of readItems) {
+          if (listedIds.has(item.itemId)) continue;
+          merged.push({ ...item, ordinal: merged.length });
+        }
+        protocolSource = "thread/read+thread/items/list";
+      } catch (error) {
+        // Some Codex builds advertise the experimental method in their schema but
+        // still reject it at runtime. It is an optional supplement, so retain the
+        // complete thread/read payload instead of failing the diagnostic snapshot.
+        if (!(error instanceof CodexRpcError) || error.code !== -32601) throw error;
       }
-      protocolSource = "thread/read+thread/items/list";
     }
     const { turns: _turns, ...threadMetadata } = thread;
     return { thread: threadMetadata, turns, items: merged, protocolSource };
@@ -412,7 +426,7 @@ export class CodexAdapter {
       const pending = this.pending.get(message.id);
       if (!pending) return;
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(`Codex RPC ${message.error.code ?? ""}: ${message.error.message ?? "unknown error"}`));
+      if (message.error) pending.reject(new CodexRpcError(message.error.code, message.error.message ?? "unknown error"));
       else pending.resolve(message.result);
       return;
     }
