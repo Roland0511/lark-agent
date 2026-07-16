@@ -129,7 +129,8 @@ describe("worker config", () => {
       "skillhub_skills_v1",
       "skill_runtime_config_v1",
       "user_skills_inventory_v1",
-      "workspace_mapping_v1"
+      "workspace_mapping_v1",
+      "thread_snapshot_v1"
     ]);
   });
 

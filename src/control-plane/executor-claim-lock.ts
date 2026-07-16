@@ -28,7 +28,13 @@ export async function executorHasClaimCapacity(
       .where("executor_id", "=", executorId)
       .where("state", "=", "running")
       .where("lease_expires_at", ">", new Date())
-      .as("running_syncs")
+      .as("running_syncs"),
+    eb.selectFrom("chat_thread_snapshot_jobs")
+      .select((job) => job.fn.countAll<number>().as("count"))
+      .where("executor_id", "=", executorId)
+      .where("state", "=", "running")
+      .where("lease_expires_at", ">", new Date())
+      .as("running_thread_snapshots")
   ]).executeTakeFirstOrThrow();
-  return Number(usage.active_tasks) + Number(usage.running_syncs) < capacity;
+  return Number(usage.active_tasks) + Number(usage.running_syncs) + Number(usage.running_thread_snapshots) < capacity;
 }

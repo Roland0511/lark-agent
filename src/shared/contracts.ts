@@ -278,6 +278,58 @@ export const workspaceRuntimeSyncResultSchema = z.object({
 });
 export type WorkspaceRuntimeSyncResult = z.infer<typeof workspaceRuntimeSyncResultSchema>;
 
+export const threadSnapshotJobSchema = z.object({
+  id: canonicalUuidSchema,
+  chatContextId: lowercaseCanonicalUuidSchema,
+  threadId: z.string().min(1).max(256),
+  leaseToken: z.string().min(1),
+  leaseExpiresAt: z.string().datetime(),
+  attempt: z.number().int().positive()
+});
+export type ThreadSnapshotJob = z.infer<typeof threadSnapshotJobSchema>;
+
+export const threadSnapshotTurnSchema = z.object({
+  turnIndex: z.number().int().nonnegative(),
+  turnId: z.string().min(1).max(256),
+  status: z.string().min(1).max(128),
+  startedAt: z.number().int().nullable(),
+  completedAt: z.number().int().nullable(),
+  durationMs: z.number().int().nonnegative().nullable(),
+  error: z.unknown().nullable(),
+  raw: z.unknown()
+});
+export type ThreadSnapshotTurn = z.infer<typeof threadSnapshotTurnSchema>;
+
+export const threadSnapshotItemSchema = z.object({
+  ordinal: z.number().int().nonnegative(),
+  turnId: z.string().min(1).max(256).nullable(),
+  itemIndex: z.number().int().nonnegative().nullable(),
+  itemId: z.string().min(1).max(512),
+  itemType: z.string().min(1).max(128),
+  raw: z.unknown()
+});
+export type ThreadSnapshotItem = z.infer<typeof threadSnapshotItemSchema>;
+
+export const threadSnapshotChunkSchema = z.object({
+  chunkIndex: z.number().int().nonnegative(),
+  turns: z.array(threadSnapshotTurnSchema).max(50),
+  items: z.array(threadSnapshotItemSchema).max(50)
+}).refine((body) => body.turns.length > 0 || body.items.length > 0, "快照分块不能为空");
+export type ThreadSnapshotChunk = z.infer<typeof threadSnapshotChunkSchema>;
+
+export const threadSnapshotCompleteSchema = z.object({
+  threadMetadata: z.unknown(),
+  protocolSource: z.enum(["thread/read", "thread/read+thread/items/list"]),
+  turnCount: z.number().int().nonnegative(),
+  itemCount: z.number().int().nonnegative()
+});
+export type ThreadSnapshotComplete = z.infer<typeof threadSnapshotCompleteSchema>;
+
+export const threadSnapshotFailureSchema = z.object({
+  summary: z.string().min(1).max(2_000)
+});
+export type ThreadSnapshotFailure = z.infer<typeof threadSnapshotFailureSchema>;
+
 export const claimedTaskSchema = z.object({
   id: z.string().uuid(),
   botId: canonicalUuidSchema,

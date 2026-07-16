@@ -21,6 +21,37 @@ rl.on('line', (line) => {
   if (msg.method === 'initialized') return;
   if (msg.method === 'thread/start') return send({ id: msg.id, result: { thread: { id: 'thr_' + nextThread++ } } });
   if (msg.method === 'thread/resume') return send({ id: msg.id, result: { thread: { id: msg.params.threadId === 'thr_conflict' ? 'thr_unexpected' : msg.params.threadId } } });
+  if (msg.method === 'thread/read') {
+    const id = msg.params.threadId === 'thr_mismatch' ? 'thr_unexpected' : msg.params.threadId;
+    return send({ id: msg.id, result: { thread: { id, cwd: '/fixed/workspace', turns: [
+      { id: 'turn_a', status: 'completed', startedAt: 1000, completedAt: 1500, durationMs: 500, items: [
+        { id: 'user_1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] },
+        { id: 'agent_1', type: 'agentMessage', text: 'world', phase: 'final_answer' }
+      ] },
+      { id: 'turn_b', status: 'completed', startedAt: 2000, completedAt: 2800, durationMs: 800, items: [
+        { id: 'compact_1', type: 'contextCompaction' },
+        { id: 'read_only_1', type: 'webSearch', query: 'read only' }
+      ] }
+    ] } } });
+  }
+  if (msg.method === 'thread/items/list') {
+    if (msg.params.threadId === 'thr_bad_list') return send({ id: msg.id, result: { data: {}, nextCursor: null } });
+    if (msg.params.threadId === 'thr_repeat') return send({ id: msg.id, result: { data: [], nextCursor: 'repeat' } });
+    if (!msg.params.cursor) return send({ id: msg.id, result: { data: [
+      { id: 'user_1', type: 'userMessage', content: [{ type: 'text', text: 'hello' }] },
+      { id: 'agent_1', type: 'agentMessage', text: 'world', phase: 'final_answer' },
+      { id: 'compact_1', type: 'contextCompaction' },
+      { id: 'persistent_extra', type: 'imageView', path: '/tmp/image.png' }
+    ], nextCursor: 'page_2' } });
+    return send({ id: msg.id, result: { data: [
+      { id: 'reason_1', type: 'reasoning', summary: ['consider'] },
+      { id: 'command_1', type: 'commandExecution', command: 'pwd', status: 'completed' },
+      { id: 'file_1', type: 'fileChange', changes: [{ path: 'a.txt', kind: 'update' }] },
+      { id: 'mcp_1', type: 'mcpToolCall', server: 'docs', tool: 'search' },
+      { id: 'dynamic_1', type: 'dynamicToolCall', tool: 'custom' },
+      { id: 'collab_1', type: 'collabAgentToolCall', tool: 'spawn_agent' }
+    ], nextCursor: null } });
+  }
   if (msg.method === 'model/list') return send({ id: msg.id, result: { data: [{ id: 'exec-model', model: 'exec-model', displayName: 'Execution Model', isDefault: true, defaultReasoningEffort: 'high', supportedReasoningEfforts: [{ reasoningEffort: 'medium' }, { reasoningEffort: 'high' }] }], nextCursor: null } });
   if (msg.method === 'skills/list') return send({ id: msg.id, result: { data: [{ cwd: msg.params.cwds[0], errors: [], skills: [{ name: 'user-tool', description: 'tool', path: msg.params.cwds[0] + '/.agents/skills/user-tool/SKILL.md', scope: 'user', enabled: true, shortDescription: null, interface: { displayName: 'User Tool', shortDescription: 'Short' }, dependencies: { tools: [{ type: 'command', value: 'git', description: 'Git CLI' }] } }] }] } });
   if (msg.method === 'turn/start') {
@@ -131,5 +162,36 @@ describe("CodexAdapter", () => {
     expect(commentary).toEqual(["checking", "checking", "structured checking"]);
     expect(activity).toContain("thread/tokenUsage/updated");
     await adapter.stop();
+  }, 10_000);
+
+  it("reads every persisted Item type, merges optional item pages, and rejects protocol mismatches", async () => {
+    const config = await fakeCodexConfig();
+    const adapter = new CodexAdapter(config, async () => "decline");
+    await adapter.start();
+    try {
+      const direct = await adapter.readThreadHistory("thr_history", false);
+      expect(direct.protocolSource).toBe("thread/read");
+      expect(direct.thread).toEqual({ id: "thr_history", cwd: "/fixed/workspace" });
+      expect(direct.turns).toEqual([
+        expect.objectContaining({ turnIndex: 0, turnId: "turn_a", status: "completed", durationMs: 500 }),
+        expect.objectContaining({ turnIndex: 1, turnId: "turn_b", status: "completed", durationMs: 800 })
+      ]);
+      expect(direct.items.map((item) => item.itemType)).toEqual(["userMessage", "agentMessage", "contextCompaction", "webSearch"]);
+
+      const merged = await adapter.readThreadHistory("thr_history", true);
+      expect(merged.protocolSource).toBe("thread/read+thread/items/list");
+      expect(merged.items.map((item) => item.itemType)).toEqual([
+        "userMessage", "agentMessage", "contextCompaction", "imageView", "reasoning", "commandExecution",
+        "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch"
+      ]);
+      expect(merged.items.find((item) => item.itemId === "agent_1")).toMatchObject({ turnId: "turn_a", itemIndex: 1 });
+      expect(merged.items.find((item) => item.itemId === "persistent_extra")).toMatchObject({ turnId: null, itemIndex: null });
+      expect(merged.items.find((item) => item.itemId === "read_only_1")).toMatchObject({ ordinal: 10, turnId: "turn_b", itemIndex: 1 });
+      await expect(adapter.readThreadHistory("thr_mismatch", false)).rejects.toThrow(/unexpected thread id/);
+      await expect(adapter.readThreadHistory("thr_bad_list", true)).rejects.toThrow(/invalid data/);
+      await expect(adapter.readThreadHistory("thr_repeat", true)).rejects.toThrow(/repeated a pagination cursor/);
+    } finally {
+      await adapter.stop();
+    }
   }, 10_000);
 });

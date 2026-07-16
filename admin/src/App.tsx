@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type ReactNode, type SetStateAction } from "react";
-import { useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useMutation, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { NavLink, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   Activity, AlertTriangle, ArrowLeft, ArrowRight, Bot, CheckCircle2, ChevronDown, ChevronRight, CircleGauge, Clock3, FileClock, Inbox,
@@ -341,12 +341,152 @@ function ChatMemoryWorkspaceDetail({ id, botId, user }: { id: string; botId: str
       <div className="recovery-actions"><button className="primary-button" disabled={recovery.isPending || recoveryResult?.recovered} onClick={() => recovery.mutate()}><RotateCcw size={16} />{recovery.isPending ? "正在检测固定环境…" : recoveryResult?.recovered ? "已恢复" : "检测并恢复"}</button><NavLink className="secondary-button" to={taskLink}>{taskLinkLabel}</NavLink></div>
     </section>}
     {state === "ready" && recoveryResult?.recovered && <div className="recovery-feedback success" aria-live="polite"><CheckCircle2 size={18} /><div><strong>恢复完成</strong><span>关联任务未自动重试，可前往任务中心确认后继续。</span></div><NavLink className="secondary-button" to={taskLink}>{taskLinkLabel}</NavLink></div>}
+    <ThreadMemorySnapshot contextId={id} threadId={d.threadId} user={user} />
     <div className="layered-sections memory-layered-sections">
       <ChatSkillOverview botId={botId} context={d} user={user} />
       <details><summary><HardDrive size={17} /><span><strong>技术绑定信息</strong><small>Thread、执行环境与独立聊天工作区</small></span><ChevronDown size={17} /></summary><dl className="layered-detail-list two-column"><Detail label="Chat Context ID" value={d.id} /><Detail label="Chat ID" value={d.chatId} />{d.chatType === "p2p" && <Detail label="用户 Open ID" value={d.peerOpenId} />}<Detail label="Codex Thread" value={d.threadId ?? "首次执行时建立"} /><Detail label="固定执行器" value={executorNameWithId(d.executorDisplayName, d.executorId) ?? "首次执行时固定"} /><Detail label="Codex Profile" value={d.executorProfile ?? "首次执行时固定"} /><Detail label="Codex 版本" value={d.codexVersion} /><Detail label="总工作区" value={d.workspaceRootAlias ?? "首次执行时固定"} /><Detail label="聊天工作区" value={d.workspaceKey ? `${d.workspaceRootAlias ?? "<总工作区>"}/${d.botAppId}/chats/${d.workspaceKey}` : null} /><Detail label="配置指纹" value={d.executorConfigFingerprint} /><Detail label="首次绑定时间" value={formatDateTime(d.createdAt)} /><Detail label="最后活动" value={formatDateTime(d.lastActivityAt)} /></dl></details>
       <details><summary><ShieldCheck size={17} /><span><strong>自动压缩记录 · {Number(d.autoCompactionCount ?? 0)} 次</strong><small>压缩上下文但不更换 Thread 或工作区</small></span><ChevronDown size={17} /></summary><div className="chat-compaction-history compact">{d.compactions?.length ? <div>{d.compactions.map((item: AnyRecord) => <article key={item.id}><div><span>{formatDateTime(item.occurredAt)}</span><strong className="mono">Turn {shortId(item.turnId) ?? "—"}</strong></div><small className="mono">Thread {shortId(item.threadId) ?? "—"}{item.itemId ? ` · Item ${shortId(item.itemId)}` : ""}</small></article>)}</div> : <Empty icon={<FileClock />} title="尚未观测到自动压缩" text="Codex 触发原生上下文压缩后会显示在这里。" />}</div></details>
     </div>
   </div>;
+}
+
+type ThreadSnapshotPage = {
+  snapshot: AnyRecord | null;
+  refresh: AnyRecord | null;
+  items: AnyRecord[];
+  turns: AnyRecord[];
+  nextCursor: string | null;
+};
+
+export function ThreadMemorySnapshot({ contextId, threadId, user }: { contextId: string; threadId?: string | null; user: AdminUser }) {
+  const queryClient = useQueryClient();
+  const autoAttemptedContext = useRef<string | null>(null);
+  const history = useInfiniteQuery({
+    queryKey: ["chat-context", "thread-snapshot", contextId],
+    queryFn: ({ pageParam }) => api<ThreadSnapshotPage>(`/v1/admin/chat-contexts/${contextId}/thread-snapshot?limit=50${pageParam ? `&before=${encodeURIComponent(pageParam)}` : ""}`),
+    initialPageParam: "",
+    getNextPageParam: (lastPage) => lastPage.nextCursor ?? undefined,
+    enabled: Boolean(threadId),
+    refetchInterval: (query) => {
+      const data = query.state.data as { pages?: ThreadSnapshotPage[] } | undefined;
+      return ["queued", "running"].includes(data?.pages?.[0]?.refresh?.state) ? 2_000 : false;
+    }
+  });
+  const refresh = useMutation({
+    mutationFn: () => api<AnyRecord>(`/v1/admin/chat-contexts/${contextId}/thread-snapshot`, { method: "POST", body: "{}" }, user),
+    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["chat-context", "thread-snapshot", contextId] })
+  });
+  const firstPage = history.data?.pages[0];
+  useEffect(() => { autoAttemptedContext.current = null; }, [contextId]);
+  useEffect(() => {
+    if (!threadId || history.isLoading || !firstPage || firstPage.snapshot || firstPage.refresh || refresh.isPending) return;
+    if (autoAttemptedContext.current === contextId) return;
+    autoAttemptedContext.current = contextId;
+    refresh.mutate();
+  }, [contextId, firstPage, history.isLoading, refresh, threadId]);
+
+  const pages = history.data?.pages ?? [];
+  const snapshot = firstPage?.snapshot ?? null;
+  const refreshState = firstPage?.refresh ?? null;
+  const itemMap = new Map<number, AnyRecord>();
+  for (const page of [...pages].reverse()) for (const item of page.items) itemMap.set(Number(item.ordinal), item);
+  const items = [...itemMap.values()].sort((left, right) => Number(left.ordinal) - Number(right.ordinal));
+  const turnMap = new Map<string, AnyRecord>();
+  for (const page of pages) for (const turn of page.turns) turnMap.set(turn.turnId, turn);
+  const groups = groupThreadItems(items);
+  const refreshing = refresh.isPending || ["queued", "running"].includes(refreshState?.state);
+  const executorUnavailable = refreshState?.state === "queued" && ["stale", "offline"].includes(refreshState?.executorAvailability);
+
+  return <section className="thread-memory-panel" aria-labelledby="thread-memory-title">
+    <header className="thread-memory-header"><div><span className="thread-memory-icon"><MessagesSquare size={20} /></span><div><h3 id="thread-memory-title">Thread 记忆内容{snapshot ? ` · ${snapshot.itemCount} 项` : ""}</h3><p>{snapshot ? `最近快照 ${formatDateTime(snapshot.completedAt)} · ${snapshot.protocolSource ?? "thread/read"}` : "只读展示 Codex 已持久化的消息、推理与执行记录。"}</p></div></div><button className="secondary-button" disabled={!threadId || refreshing} onClick={() => refresh.mutate()}><RefreshCw className={refreshing ? "spin" : ""} size={15} />{refreshing ? refreshState?.state === "running" ? "正在读取…" : "等待执行器…" : snapshot ? "刷新" : "读取 Thread"}</button></header>
+    {!threadId ? <Empty icon={<FileClock />} title="Thread 尚未建立" text="首次有效任务执行并完成固定绑定后，才能读取持久化聊天内容。" /> : history.isLoading && !firstPage ? <PageLoading compact /> : history.error ? <ErrorBox error={history.error} /> : <>
+      {refreshing && <div className="thread-snapshot-status running" aria-live="polite"><RefreshCw className="spin" size={17} /><div><strong>{refreshState?.state === "running" ? "原执行器正在读取 Thread" : executorUnavailable ? "原执行器当前离线，快照保持排队" : "快照已排队，等待原执行器"}</strong><span>{executorUnavailable ? `最近心跳 ${relativeTime(refreshState.executorLastSeenAt)}；请在固定设备启动 Runner。已有作业会继续等待，超过 10 分钟后明确失败。` : snapshot ? "刷新期间继续展示上一份成功快照。" : "完成后会自动显示最近 50 项。"}</span></div></div>}
+      {refreshState?.state === "failed" && <div className="thread-snapshot-status failed" role="alert"><AlertTriangle size={17} /><div><strong>本次 Thread 读取失败</strong><span>{refreshState.error ?? "执行器未能生成快照。"}{snapshot ? " 已保留上一份成功快照。" : ""}</span></div></div>}
+      {refresh.error && <ErrorBox error={refresh.error} />}
+      {snapshot ? <>
+        <details className="thread-snapshot-metadata"><summary><HardDrive size={15} />快照元数据<ChevronDown size={15} /></summary><dl><Detail label="Thread ID" value={snapshot.threadId} /><Detail label="执行器 ID" value={snapshot.executorId} /><Detail label="回合数" value={`${snapshot.turnCount ?? 0}`} /><Detail label="Item 数" value={`${snapshot.itemCount ?? 0}`} /></dl><pre>{JSON.stringify(snapshot.thread, null, 2)}</pre></details>
+        {history.hasNextPage && <div className="thread-load-earlier"><button className="secondary-button" disabled={history.isFetchingNextPage} onClick={() => void history.fetchNextPage()}><FileClock size={15} />{history.isFetchingNextPage ? "正在加载…" : "加载更早"}</button><span>当前已显示 {items.length} / {snapshot.itemCount} 项</span></div>}
+        {groups.length ? <div className="thread-memory-timeline">{groups.map((group, groupIndex) => {
+          const turn = group.turnId ? turnMap.get(group.turnId) : null;
+          return <section className="thread-turn-group" key={`${group.turnId ?? "unassigned"}-${groupIndex}`}><header><span>回合 {turn ? Number(turn.turnIndex) + 1 : "未关联"}</span><code title={group.turnId ?? undefined}>{shortId(group.turnId) ?? "持久化补项"}</code>{turn?.status && <StateBadge state={turn.status} />}{turn?.durationMs != null && <time>{formatDurationPrecise(Number(turn.durationMs) / 1_000)}</time>}</header><div>{group.items.map((item) => <ThreadMemoryItemCard key={`${item.ordinal}-${item.itemId}`} item={item} />)}</div></section>;
+        })}</div> : <Empty icon={<MessagesSquare />} title="Thread 中没有可展示项" text="Codex 返回了空历史；刷新不会推进任务或修改 Thread。" />}
+      </> : !refreshing && !refresh.error && refreshState?.state !== "failed" ? <Empty icon={<MessagesSquare />} title="正在准备首次快照" text="页面会自动请求原执行器只读加载 Thread 历史。" /> : null}
+    </>}
+  </section>;
+}
+
+function groupThreadItems(items: AnyRecord[]): Array<{ turnId: string | null; items: AnyRecord[] }> {
+  const groups: Array<{ turnId: string | null; items: AnyRecord[] }> = [];
+  for (const item of items) {
+    const turnId = typeof item.turnId === "string" ? item.turnId : null;
+    const current = groups.at(-1);
+    if (!current || current.turnId !== turnId) groups.push({ turnId, items: [item] });
+    else current.items.push(item);
+  }
+  return groups;
+}
+
+const threadItemPresentation: Record<string, { label: string; kind: string; icon: ReactNode }> = {
+  userMessage: { label: "用户消息", kind: "user", icon: <UserRound size={17} /> },
+  agentMessage: { label: "Agent 消息", kind: "agent", icon: <Bot size={17} /> },
+  reasoning: { label: "推理", kind: "reasoning", icon: <Sparkles size={17} /> },
+  commandExecution: { label: "命令", kind: "command", icon: <Cpu size={17} /> },
+  fileChange: { label: "文件变更", kind: "file", icon: <HardDrive size={17} /> },
+  mcpToolCall: { label: "MCP 工具", kind: "tool", icon: <Wrench size={17} /> },
+  dynamicToolCall: { label: "动态工具", kind: "tool", icon: <Wrench size={17} /> },
+  collabAgentToolCall: { label: "协作代理", kind: "collab", icon: <GitBranch size={17} /> },
+  contextCompaction: { label: "上下文压缩", kind: "compaction", icon: <ShieldCheck size={17} /> }
+};
+
+export function ThreadMemoryItemCard({ item }: { item: AnyRecord }) {
+  const raw = item.raw && typeof item.raw === "object" ? item.raw as AnyRecord : {};
+  const type = String(item.itemType ?? raw.type ?? "unknown");
+  const presentation = threadItemPresentation[type] ?? { label: type === "unknown" ? "未知 Item" : type, kind: "unknown", icon: <FileClock size={17} /> };
+  const content = readableThreadItem(type, raw);
+  return <article className={`thread-memory-item type-${presentation.kind}`}><header><span>{presentation.icon}</span><div><strong>{presentation.label}</strong><small className="mono" title={item.itemId}>{shortId(item.itemId) ?? `#${item.ordinal}`}</small></div>{raw.status && <StateBadge state={String(raw.status)} />}</header>{content ? <div className="thread-item-readable">{content}</div> : <p className="thread-item-fallback">此类型没有独立摘要，请展开查看完整原始数据。</p>}<details className="thread-item-json"><summary>原始 JSON<ChevronDown size={14} /></summary><pre>{JSON.stringify(item.raw, null, 2)}</pre></details></article>;
+}
+
+function readableThreadItem(type: string, raw: AnyRecord): ReactNode {
+  if (type === "userMessage") return <ThreadText value={raw.content ?? raw.text} />;
+  if (type === "agentMessage") return <ThreadText value={raw.text ?? raw.content} />;
+  if (type === "reasoning") return <ThreadText value={raw.summary ?? raw.content ?? raw.text} />;
+  if (type === "commandExecution") return <><code className="thread-command">{String(raw.command ?? "未记录命令")}</code>{raw.cwd && <small>工作目录：{String(raw.cwd)}</small>}{raw.aggregatedOutput && <pre>{String(raw.aggregatedOutput)}</pre>}<ThreadFacts facts={[["退出码", raw.exitCode], ["耗时", raw.durationMs != null ? `${raw.durationMs} ms` : null]]} /></>;
+  if (type === "fileChange") return <><ThreadText value={raw.changes ?? raw.diff} /><ThreadFacts facts={[["状态", raw.status]]} /></>;
+  if (["mcpToolCall", "dynamicToolCall"].includes(type)) return <><ThreadFacts facts={[["服务", raw.server], ["工具", raw.tool], ["状态", raw.status]]} />{raw.arguments !== undefined && <ThreadData title="参数" value={raw.arguments} />}{raw.result !== undefined && <ThreadData title="结果" value={raw.result} />}{raw.error !== undefined && <ThreadData title="错误" value={raw.error} />}</>;
+  if (type === "collabAgentToolCall") return <><ThreadFacts facts={[["工具", raw.tool], ["状态", raw.status], ["发送方", raw.senderThreadId], ["接收方", Array.isArray(raw.receiverThreadIds) ? raw.receiverThreadIds.join("、") : raw.receiverThreadIds]]} /><ThreadText value={raw.prompt ?? raw.result} /></>;
+  if (type === "contextCompaction") return <p>Codex 已将更早上下文压缩为持久化摘要；Thread 本身没有被更换。</p>;
+  return null;
+}
+
+function ThreadText({ value }: { value: unknown }) {
+  const text = textFromThreadValue(value);
+  if (!text) return null;
+  return <pre>{text}</pre>;
+}
+
+function ThreadData({ title, value }: { title: string; value: unknown }) {
+  return <div className="thread-item-data"><strong>{title}</strong><pre>{typeof value === "string" ? value : JSON.stringify(value, null, 2)}</pre></div>;
+}
+
+function ThreadFacts({ facts }: { facts: Array<[string, unknown]> }) {
+  const visible = facts.filter(([, value]) => value !== null && value !== undefined && value !== "");
+  return visible.length ? <dl className="thread-item-facts">{visible.map(([label, value]) => <div key={label}><dt>{label}</dt><dd>{String(value)}</dd></div>)}</dl> : null;
+}
+
+function textFromThreadValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map((part) => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object") {
+      const record = part as AnyRecord;
+      if (typeof record.text === "string") return record.text;
+      if (typeof record.content === "string") return record.content;
+      if (typeof record.path === "string") return `${record.kind ? `${record.kind} · ` : ""}${record.path}${record.diff ? `\n${record.diff}` : ""}`;
+    }
+    return JSON.stringify(part, null, 2);
+  }).filter(Boolean).join("\n\n");
+  if (value && typeof value === "object") return JSON.stringify(value, null, 2);
+  return value == null ? "" : String(value);
 }
 
 function RecoveryCheckList({ checks }: { checks: AnyRecord[] }) {

@@ -43,6 +43,7 @@ import { BotDialogueGuardService } from "./bot-dialogue-guard.js";
 import { publicAttachments, storedAttachments } from "../lark/attachments.js";
 import { registerSkillRoutes } from "./skill-routes.js";
 import { SkillRuntimeService } from "./skill-runtime-service.js";
+import { registerThreadSnapshotRoutes } from "./thread-snapshot-routes.js";
 
 function leaseToken(request: FastifyRequest): string {
   const value = request.headers["x-lease-token"];
@@ -99,7 +100,7 @@ export function buildControlPlane(
 ): { app: FastifyInstance; services: ControlPlaneServices } {
   const app = Fastify({
     forceCloseConnections: true,
-    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "req.headers.x-sync-lease-token", "req.headers.x-upgrade-drain-token", "body.token", "body.appSecret", "body.value", "body.contentBase64", "body.content", "body.text", "body.payload", "body.result"] }
+    logger: { redact: ["req.headers.authorization", "req.headers.cookie", "req.headers.x-lease-token", "req.headers.x-sync-lease-token", "req.headers.x-snapshot-lease-token", "req.headers.x-upgrade-drain-token", "body.token", "body.appSecret", "body.value", "body.contentBase64", "body.content", "body.text", "body.payload", "body.result", "body.turns", "body.items", "body.threadMetadata"] }
   });
   const runtime = services?.runtime ?? readiness.runtime ?? new RuntimeStatus();
   const lark = services?.lark ?? new LarkGateway(config.larkCliPath);
@@ -442,6 +443,7 @@ export function buildControlPlane(
   registerAdminRoutes(app, db, config, { repository, lark, gateways, events: adminEvents, runtime });
   registerSkillRoutes(app, db, config, repository, adminEvents, skillRuntime);
   registerChatContextAdminRoutes(app, db, config, adminEvents);
+  registerThreadSnapshotRoutes(app, db, config, adminEvents);
   registerAdminFlowRoutes(app, db, config, runtime);
   registerMetrics(app, db, config, runtime);
 

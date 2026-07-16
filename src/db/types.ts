@@ -89,6 +89,49 @@ export interface ChatContextRecoveryAttemptsTable {
   checked_at: Timestamp;
 }
 
+export interface ChatThreadSnapshotJobsTable {
+  id: Generated<string>;
+  chat_context_id: string;
+  executor_id: string;
+  codex_thread_id: string;
+  requested_by: string;
+  state: Generated<"queued" | "running" | "completed" | "failed" | "superseded">;
+  lease_token_hash: string | null;
+  lease_expires_at: NullableTimestamp;
+  attempt: Generated<number>;
+  protocol_source: string | null;
+  thread_metadata: Json | null;
+  turn_count: Generated<number>;
+  item_count: Generated<number>;
+  last_error: string | null;
+  requested_at: Timestamp;
+  started_at: NullableTimestamp;
+  completed_at: NullableTimestamp;
+  updated_at: Timestamp;
+}
+
+export interface ChatThreadSnapshotTurnsTable {
+  job_id: string;
+  turn_index: number;
+  turn_id: string;
+  status: string;
+  started_at_epoch: number | null;
+  completed_at_epoch: number | null;
+  duration_ms: number | null;
+  error: Json | null;
+  raw_turn: Json;
+}
+
+export interface ChatThreadSnapshotItemsTable {
+  job_id: string;
+  ordinal: number;
+  turn_id: string | null;
+  item_index: number | null;
+  item_id: string;
+  item_type: string;
+  raw_item: Json;
+}
+
 export interface TasksTable {
   id: Generated<string>;
   bot_id: string;
@@ -544,6 +587,9 @@ export interface Database {
   chat_contexts: ChatContextsTable;
   chat_context_compactions: ChatContextCompactionsTable;
   chat_context_recovery_attempts: ChatContextRecoveryAttemptsTable;
+  chat_thread_snapshot_jobs: ChatThreadSnapshotJobsTable;
+  chat_thread_snapshot_turns: ChatThreadSnapshotTurnsTable;
+  chat_thread_snapshot_items: ChatThreadSnapshotItemsTable;
   processed_events: ProcessedEventsTable;
   conversations: ConversationsTable;
   tasks: TasksTable;

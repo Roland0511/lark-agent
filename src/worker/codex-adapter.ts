@@ -50,6 +50,33 @@ export interface CodexSkillsListEntry {
   errors: Array<{ path: string; message: string }>;
 }
 
+export interface CodexThreadHistoryTurn {
+  turnIndex: number;
+  turnId: string;
+  status: string;
+  startedAt: number | null;
+  completedAt: number | null;
+  durationMs: number | null;
+  error: unknown;
+  raw: Record<string, unknown>;
+}
+
+export interface CodexThreadHistoryItem {
+  ordinal: number;
+  turnId: string | null;
+  itemIndex: number | null;
+  itemId: string;
+  itemType: string;
+  raw: Record<string, unknown>;
+}
+
+export interface CodexThreadHistory {
+  thread: Record<string, unknown>;
+  turns: CodexThreadHistoryTurn[];
+  items: CodexThreadHistoryItem[];
+  protocolSource: "thread/read" | "thread/read+thread/items/list";
+}
+
 interface CodexAdapterOptions {
   environment?: NodeJS.ProcessEnv;
   shellEnvironmentAllowlist?: string[];
@@ -102,7 +129,7 @@ export class CodexAdapter {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", (line) => this.handleLine(line));
     await this.request("initialize", {
-      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.1" },
+      clientInfo: { name: "lark_agent", title: "Lark Agent", version: "0.4.2" },
       capabilities: { experimentalApi: true }
     });
     this.notify("initialized", {});
@@ -131,6 +158,71 @@ export class CodexAdapter {
       throw new Error(`Codex resumed an unexpected thread id (expected ${threadId}, received ${id})`);
     }
     return id;
+  }
+
+  async readThreadHistory(threadId: string, includeItemsList: boolean): Promise<CodexThreadHistory> {
+    const response = (await this.request("thread/read", { threadId, includeTurns: true })) as { thread?: Record<string, unknown> };
+    const thread = response.thread;
+    if (!thread || thread.id !== threadId) {
+      throw new Error(`Codex returned an unexpected thread id while reading history (expected ${threadId}, received ${String(thread?.id ?? "missing")})`);
+    }
+    const rawTurns = Array.isArray(thread.turns) ? thread.turns.filter((turn): turn is Record<string, unknown> => Boolean(turn) && typeof turn === "object") : [];
+    const turns: CodexThreadHistoryTurn[] = [];
+    const readItems: CodexThreadHistoryItem[] = [];
+    const association = new Map<string, { turnId: string; itemIndex: number }>();
+    for (const [turnIndex, turn] of rawTurns.entries()) {
+      const turnId = String(turn.id ?? `turn-${turnIndex}`);
+      const items = Array.isArray(turn.items) ? turn.items.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object") : [];
+      const { items: _items, ...raw } = turn;
+      turns.push({
+        turnIndex, turnId, status: String(turn.status ?? "unknown"),
+        startedAt: finiteInteger(turn.startedAt), completedAt: finiteInteger(turn.completedAt),
+        durationMs: finiteNonNegativeInteger(turn.durationMs), error: turn.error ?? null, raw
+      });
+      for (const [itemIndex, item] of items.entries()) {
+        const itemId = String(item.id ?? `${turnId}:item:${itemIndex}`);
+        association.set(itemId, { turnId, itemIndex });
+        readItems.push({
+          ordinal: readItems.length, turnId, itemIndex, itemId,
+          itemType: String(item.type ?? "unknown"), raw: item
+        });
+      }
+    }
+    let merged = readItems;
+    let protocolSource: CodexThreadHistory["protocolSource"] = "thread/read";
+    if (includeItemsList) {
+      const listed: Record<string, unknown>[] = [];
+      const seenCursors = new Set<string>();
+      let cursor: string | null = null;
+      do {
+        const page = (await this.request("thread/items/list", {
+          threadId, cursor, limit: 200, sortDirection: "asc"
+        })) as { data?: unknown; nextCursor?: unknown };
+        if (!Array.isArray(page.data)) throw new Error("Codex thread/items/list returned invalid data");
+        listed.push(...page.data.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object"));
+        const next = typeof page.nextCursor === "string" && page.nextCursor ? page.nextCursor : null;
+        if (next && seenCursors.has(next)) throw new Error("Codex thread/items/list repeated a pagination cursor");
+        if (next) seenCursors.add(next);
+        cursor = next;
+      } while (cursor);
+      const listedIds = new Set<string>();
+      merged = listed.map((item, ordinal) => {
+        const itemId = String(item.id ?? `unassigned:item:${ordinal}`);
+        listedIds.add(itemId);
+        const mapped = association.get(itemId);
+        return {
+          ordinal, turnId: mapped?.turnId ?? null, itemIndex: mapped?.itemIndex ?? null,
+          itemId, itemType: String(item.type ?? "unknown"), raw: item
+        };
+      });
+      for (const item of readItems) {
+        if (listedIds.has(item.itemId)) continue;
+        merged.push({ ...item, ordinal: merged.length });
+      }
+      protocolSource = "thread/read+thread/items/list";
+    }
+    const { turns: _turns, ...threadMetadata } = thread;
+    return { thread: threadMetadata, turns, items: merged, protocolSource };
   }
 
   async runTurn(
@@ -411,6 +503,15 @@ export class CodexAdapter {
     this.collector = null;
     this.child = null;
   }
+}
+
+function finiteInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) ? value : null;
+}
+
+function finiteNonNegativeInteger(value: unknown): number | null {
+  const parsed = finiteInteger(value);
+  return parsed !== null && parsed >= 0 ? parsed : null;
 }
 
 export function buildAttentionPrompt(taskSummary: string, signalPreview: string): string {

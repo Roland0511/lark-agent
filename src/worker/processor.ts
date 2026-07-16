@@ -1,13 +1,24 @@
 import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import type { AttentionResult, ClaimedTask, Signal, SignalAttachment, WorkerUserSkillsReport, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
+import type {
+  AttentionResult,
+  ClaimedTask,
+  Signal,
+  SignalAttachment,
+  ThreadSnapshotChunk,
+  ThreadSnapshotItem,
+  ThreadSnapshotJob,
+  ThreadSnapshotTurn,
+  WorkerUserSkillsReport,
+  WorkspaceRuntimeSyncJob
+} from "../shared/contracts.js";
 import { taskTurnResultSchema, type TaskTurnResult } from "../shared/contracts.js";
 import { errorMessage } from "../shared/errors.js";
 import { sha256 } from "../shared/crypto.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, ControlPlaneClient } from "./control-plane-client.js";
-import { CodexAdapter } from "./codex-adapter.js";
+import { CodexAdapter, type CodexThreadHistory } from "./codex-adapter.js";
 import { buildUserSkillsReport, isolatedCodexEnvironment, SkillRuntimeError, SkillRuntimeManager } from "./skills.js";
 import { resolveBotWorkspace, resolveChatWorkspace, type BotWorkspace } from "./workspace.js";
 import { attachmentTarget, cleanupExpiredAttachments, existingAttachment, type LocalAttachment } from "./attachments.js";
@@ -40,6 +51,7 @@ export class TaskProcessor {
   private userSkillRefresh: Promise<void> = Promise.resolve();
   private lastUserSkillsReport: WorkerUserSkillsReport | null = null;
   private workspaceSyncBusy = false;
+  private threadSnapshotBusy = false;
   private readonly attentionWorkspace: string;
   private activeSecretValues: string[] = [];
 
@@ -103,7 +115,7 @@ export class TaskProcessor {
   }
 
   isBusy(): boolean {
-    return this.currentTask !== null || this.workspaceSyncBusy;
+    return this.currentTask !== null || this.workspaceSyncBusy || this.threadSnapshotBusy;
   }
 
   async processWorkspaceRuntimeSync(job: WorkspaceRuntimeSyncJob): Promise<void> {
@@ -159,6 +171,58 @@ export class TaskProcessor {
     } finally {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       this.workspaceSyncBusy = false;
+    }
+  }
+
+  async processThreadSnapshot(job: ThreadSnapshotJob): Promise<void> {
+    if (this.isBusy()) throw new Error("runner is busy");
+    this.threadSnapshotBusy = true;
+    let leaseExpiresAt = Date.parse(job.leaseExpiresAt);
+    let leaseValidated = false;
+    let leaseLost = false;
+    let completionAttempted = false;
+    const renewLease = async () => {
+      const heartbeat = await this.client.heartbeatThreadSnapshot(job);
+      leaseExpiresAt = Date.parse(heartbeat.leaseExpiresAt);
+      leaseValidated = true;
+      leaseLost = false;
+    };
+    const assertLease = () => {
+      if (leaseLost || !Number.isFinite(leaseExpiresAt) || Date.now() >= leaseExpiresAt) {
+        throw new Error("thread snapshot lease expired");
+      }
+    };
+    let heartbeatTimer: NodeJS.Timeout | null = null;
+    try {
+      await renewLease();
+      heartbeatTimer = setInterval(() => {
+        void renewLease().catch(() => {
+          if (!Number.isFinite(leaseExpiresAt) || Date.now() >= leaseExpiresAt) leaseLost = true;
+        });
+      }, 20_000);
+      heartbeatTimer.unref();
+      const history = await this.codex.readThreadHistory(job.threadId, this.config.supportsThreadItemsList);
+      assertLease();
+      for (const chunk of buildThreadSnapshotChunks(history)) {
+        await this.client.uploadThreadSnapshotChunk(job, chunk);
+        assertLease();
+      }
+      completionAttempted = true;
+      await this.client.completeThreadSnapshot(job, {
+        threadMetadata: history.thread,
+        protocolSource: history.protocolSource,
+        turnCount: history.turns.length,
+        itemCount: history.items.length
+      });
+    } catch (error) {
+      if (leaseValidated && !completionAttempted && Number.isFinite(leaseExpiresAt) && Date.now() < leaseExpiresAt) {
+        completionAttempted = true;
+        await this.client.failThreadSnapshot(job, this.safeErrorSummary(error).slice(0, 2_000)).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      this.threadSnapshotBusy = false;
     }
   }
 
@@ -882,6 +946,42 @@ interface CodexCompactionAudit {
   turnId: string;
   itemId: string | null;
   source: "item/completed" | "thread/compacted";
+}
+
+const MAX_THREAD_SNAPSHOT_CHUNK_BYTES = 4 * 1024 * 1024;
+
+export function buildThreadSnapshotChunks(history: Pick<CodexThreadHistory, "turns" | "items">): ThreadSnapshotChunk[] {
+  const turns: ThreadSnapshotTurn[] = history.turns.map((turn) => ({ ...turn }));
+  const items: ThreadSnapshotItem[] = history.items.map((item) => ({ ...item }));
+  const chunks: ThreadSnapshotChunk[] = [];
+  let chunkIndex = 0;
+  const append = (kind: "turns" | "items", records: Array<ThreadSnapshotTurn | ThreadSnapshotItem>) => {
+    let current: ThreadSnapshotChunk = { chunkIndex, turns: [], items: [] };
+    const flush = () => {
+      if (!current.turns.length && !current.items.length) return;
+      chunks.push(current);
+      chunkIndex += 1;
+      current = { chunkIndex, turns: [], items: [] };
+    };
+    for (const record of records) {
+      const target = kind === "turns" ? current.turns : current.items;
+      target.push(record as never);
+      const bytes = Buffer.byteLength(JSON.stringify(current), "utf8");
+      if (target.length > 50 || bytes > MAX_THREAD_SNAPSHOT_CHUNK_BYTES) {
+        target.pop();
+        flush();
+        const nextTarget = kind === "turns" ? current.turns : current.items;
+        nextTarget.push(record as never);
+        if (Buffer.byteLength(JSON.stringify(current), "utf8") > MAX_THREAD_SNAPSHOT_CHUNK_BYTES) {
+          throw new Error("单个 Codex Thread Item 超过 4 MiB，未截断快照内容");
+        }
+      }
+    }
+    flush();
+  };
+  append("turns", turns);
+  append("items", items);
+  return chunks;
 }
 
 export function codexCompactionFromActivity(method: string, params: Record<string, unknown>): CodexCompactionAudit | null {

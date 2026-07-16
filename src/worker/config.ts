@@ -55,6 +55,7 @@ export interface ResolvedWorkerConfig {
   runtimeStateDir: string;
   workspaceRoots: Array<{ alias: string; path: string }>;
   capabilities: string[];
+  supportsThreadItemsList: boolean;
   runnerVersion: string;
   architecture: "arm64" | "x64";
   attachmentMaxBytes: number;
@@ -145,7 +146,7 @@ async function commandVersion(command: string, codexHome: string): Promise<strin
   });
 }
 
-async function protocolFingerprint(command: string, codexHome: string): Promise<string> {
+async function protocolFingerprint(command: string, codexHome: string): Promise<{ hash: string; supportsThreadItemsList: boolean }> {
   const outputDir = await mkdtemp(join(tmpdir(), "lark-agent-codex-schema-"));
   const env: NodeJS.ProcessEnv = { ...process.env, CODEX_HOME: codexHome };
   delete env.CODEX_SQLITE_HOME;
@@ -171,7 +172,10 @@ async function protocolFingerprint(command: string, codexHome: string): Promise<
     for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval"]) {
       if (!serverSchema.includes(`\"${method}\"`)) throw new Error(`Codex App Server protocol is missing ${method}`);
     }
-    return sha256(`${clientSchema}\n${serverSchema}`);
+    return {
+      hash: sha256(`${clientSchema}\n${serverSchema}`),
+      supportsThreadItemsList: clientSchema.includes('"thread/items/list"')
+    };
   } finally {
     await rm(outputDir, { recursive: true, force: true });
   }
@@ -246,7 +250,8 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   await chmod(runtimeStateDir, 0o700);
   await access(runtimeStateDir, constants.R_OK | constants.W_OK);
   const codexVersion = await commandVersion(raw.executor.codex_binary, codexHome);
-  const protocolHash = await protocolFingerprint(raw.executor.codex_binary, codexHome);
+  const protocol = await protocolFingerprint(raw.executor.codex_binary, codexHome);
+  if (!capabilities.includes("thread_snapshot_v1")) capabilities.push("thread_snapshot_v1");
   const overrides = profileOverrides(profileConfig);
   const baseValues = baseConfig ? parseToml(baseConfig) as Record<string, unknown> : {};
   const profileValues = parseToml(profileConfig) as Record<string, unknown>;
@@ -258,7 +263,7 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   // changing those must not invalidate an otherwise resumable Thread.
   const configFingerprint = continuationConfigFingerprint({
     codexVersion,
-    protocolHash,
+    protocolHash: protocol.hash,
     profileOverrides: overrides,
     effectiveModel,
     effectiveModelProvider,
@@ -286,6 +291,7 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     runtimeStateDir,
     workspaceRoots,
     capabilities,
+    supportsThreadItemsList: protocol.supportsThreadItemsList,
     runnerVersion: raw.executor.runner_version,
     architecture: process.arch === "arm64" ? "arm64" : "x64",
     attachmentMaxBytes: positiveInteger(env.ATTACHMENT_MAX_BYTES, 104_857_600, "ATTACHMENT_MAX_BYTES"),

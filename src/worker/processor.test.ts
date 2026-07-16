@@ -2,10 +2,10 @@ import { chmod, mkdtemp, readFile, realpath, writeFile } from "node:fs/promises"
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { describe, expect, it, vi } from "vitest";
-import type { ClaimedTask, Signal, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
+import type { ClaimedTask, Signal, ThreadSnapshotJob, WorkspaceRuntimeSyncJob } from "../shared/contracts.js";
 import type { ResolvedWorkerConfig } from "./config.js";
 import { AttachmentDownloadError, type ControlPlaneClient } from "./control-plane-client.js";
-import { buildTaskPrompt, codexCompactionFromActivity, shouldMergeCausalBotRevision, TaskProcessor } from "./processor.js";
+import { buildTaskPrompt, buildThreadSnapshotChunks, codexCompactionFromActivity, shouldMergeCausalBotRevision, TaskProcessor } from "./processor.js";
 
 function startupProcessor(listSkills: () => Promise<never[]> = async () => []) {
   const logs: string[] = [];
@@ -234,6 +234,84 @@ describe("TaskProcessor workspace runtime sync", () => {
     expect(results).toHaveLength(1);
     expect(results[0]).toMatchObject({ status: "failed", summary: "工作区无法准备，技能与运行配置未同步。" });
     expect(processor.isBusy()).toBe(false);
+  });
+});
+
+describe("TaskProcessor Thread snapshots", () => {
+  const snapshotJob = (): ThreadSnapshotJob => ({
+    id: "11111111-1111-4111-8111-111111111111",
+    chatContextId: "22222222-2222-4222-8222-222222222222",
+    threadId: "thread-fixed",
+    leaseToken: "snapshot-lease",
+    leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+    attempt: 1
+  });
+
+  it("uploads bounded chunks, excludes snapshot work from idle state, and completes without starting a turn", async () => {
+    const uploaded: Array<{ turns: unknown[]; items: unknown[] }> = [];
+    let releaseRead!: () => void;
+    const readGate = new Promise<void>((resolve) => { releaseRead = resolve; });
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      uploadThreadSnapshotChunk: vi.fn(async (_job: ThreadSnapshotJob, chunk: { turns: unknown[]; items: unknown[] }) => { uploaded.push(chunk); }),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], supportsThreadItemsList: true
+    } as ResolvedWorkerConfig, client);
+    const history = {
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read+thread/items/list" as const,
+      turns: [{ turnIndex: 0, turnId: "turn-0", status: "completed", startedAt: null, completedAt: null, durationMs: null, error: null, raw: { id: "turn-0" } }],
+      items: Array.from({ length: 101 }, (_, ordinal) => ({
+        ordinal, turnId: "turn-0", itemIndex: ordinal, itemId: `item-${ordinal}`, itemType: "agentMessage", raw: { id: `item-${ordinal}`, type: "agentMessage", text: `${ordinal}` }
+      }))
+    };
+    const codex = { readThreadHistory: vi.fn(async () => { await readGate; return history; }) };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+
+    const running = processor.processThreadSnapshot(snapshotJob());
+    await vi.waitFor(() => expect(processor.isBusy()).toBe(true));
+    await expect(processor.processThreadSnapshot(snapshotJob())).rejects.toThrow("runner is busy");
+    releaseRead();
+    await running;
+
+    expect(processor.isBusy()).toBe(false);
+    expect(codex.readThreadHistory).toHaveBeenCalledWith("thread-fixed", true);
+    expect(uploaded.flatMap((chunk) => chunk.turns)).toHaveLength(1);
+    expect(uploaded.flatMap((chunk) => chunk.items)).toHaveLength(101);
+    expect(uploaded.every((chunk) => chunk.turns.length <= 50 && chunk.items.length <= 50)).toBe(true);
+    expect(client.completeThreadSnapshot).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ turnCount: 1, itemCount: 101 }));
+    expect(client.failThreadSnapshot).not.toHaveBeenCalled();
+  });
+
+  it("reports an explicit failure when one persisted Item exceeds 4 MiB", async () => {
+    const client = {
+      heartbeatThreadSnapshot: vi.fn(async () => ({ leaseExpiresAt: new Date(Date.now() + 60_000).toISOString() })),
+      uploadThreadSnapshotChunk: vi.fn(async () => undefined),
+      completeThreadSnapshot: vi.fn(async () => undefined),
+      failThreadSnapshot: vi.fn(async () => undefined)
+    } as unknown as ControlPlaneClient;
+    const processor = new TaskProcessor({
+      workspaceRoots: [{ alias: "repo", path: "/tmp" }], supportsThreadItemsList: false
+    } as ResolvedWorkerConfig, client);
+    const codex = { readThreadHistory: vi.fn(async () => ({
+      thread: { id: "thread-fixed" }, protocolSource: "thread/read" as const, turns: [],
+      items: [{ ordinal: 0, turnId: null, itemIndex: null, itemId: "huge", itemType: "agentMessage", raw: { text: "x".repeat(4 * 1024 * 1024) } }]
+    })) };
+    (processor as unknown as { codex: typeof codex }).codex = codex;
+
+    await expect(processor.processThreadSnapshot(snapshotJob())).rejects.toThrow(/超过 4 MiB/);
+    expect(client.uploadThreadSnapshotChunk).not.toHaveBeenCalled();
+    expect(client.completeThreadSnapshot).not.toHaveBeenCalled();
+    expect(client.failThreadSnapshot).toHaveBeenCalledWith(expect.anything(), expect.stringContaining("超过 4 MiB"));
+    expect(processor.isBusy()).toBe(false);
+  });
+
+  it("rejects oversized items before silently truncating their raw JSON", () => {
+    expect(() => buildThreadSnapshotChunks({ turns: [], items: [{
+      ordinal: 0, turnId: null, itemIndex: null, itemId: "huge", itemType: "unknown", raw: { payload: "x".repeat(4 * 1024 * 1024) }
+    }] })).toThrow(/未截断快照内容/);
   });
 });
 

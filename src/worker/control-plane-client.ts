@@ -4,6 +4,10 @@ import {
   signalSchema,
   taskRuntimeEnvironmentResponseSchema,
   taskRuntimeSnapshotSchema,
+  threadSnapshotChunkSchema,
+  threadSnapshotCompleteSchema,
+  threadSnapshotFailureSchema,
+  threadSnapshotJobSchema,
   workerUserSkillsReportSchema,
   workerSessionResponseSchema,
   workspaceRuntimeSyncJobSchema,
@@ -16,6 +20,9 @@ import {
   type TaskRuntimeFile,
   type TaskRuntimeSnapshot,
   type TaskSkillPackage,
+  type ThreadSnapshotChunk,
+  type ThreadSnapshotComplete,
+  type ThreadSnapshotJob,
   type WorkerRegistration,
   type WorkerModelCatalogEntry,
   type WorkerUserSkillsReport,
@@ -145,6 +152,51 @@ export class ControlPlaneClient {
       return null;
     }
     return workspaceRuntimeSyncJobSchema.parse(await jsonResponse(response));
+  }
+
+  async claimThreadSnapshot(): Promise<ThreadSnapshotJob | null> {
+    const response = await this.authorizedFetch("/v1/workers/thread-snapshot-jobs/claim", { method: "POST" });
+    if (response.status === 204) return null;
+    if (response.status === 404 || response.status === 405) {
+      await response.body?.cancel().catch(() => undefined);
+      return null;
+    }
+    return threadSnapshotJobSchema.parse(await jsonResponse(response));
+  }
+
+  async heartbeatThreadSnapshot(job: ThreadSnapshotJob): Promise<{ leaseExpiresAt: string }> {
+    const response = await this.authorizedFetch(`/v1/workers/thread-snapshot-jobs/${job.id}/heartbeat`, {
+      method: "POST", headers: snapshotLeaseHeaders(job.leaseToken)
+    });
+    const body = (await jsonResponse(response)) as { leaseExpiresAt?: unknown };
+    if (typeof body.leaseExpiresAt !== "string" || !Number.isFinite(Date.parse(body.leaseExpiresAt))) {
+      throw new Error("thread snapshot heartbeat response is invalid");
+    }
+    return { leaseExpiresAt: body.leaseExpiresAt };
+  }
+
+  async uploadThreadSnapshotChunk(job: ThreadSnapshotJob, chunk: ThreadSnapshotChunk): Promise<void> {
+    threadSnapshotChunkSchema.parse(chunk);
+    await this.authorizedFetch(`/v1/workers/thread-snapshot-jobs/${job.id}/chunks`, {
+      method: "POST", headers: { ...snapshotLeaseHeaders(job.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(chunk)
+    }).then(jsonResponse);
+  }
+
+  async completeThreadSnapshot(job: ThreadSnapshotJob, result: ThreadSnapshotComplete): Promise<void> {
+    threadSnapshotCompleteSchema.parse(result);
+    await this.authorizedFetch(`/v1/workers/thread-snapshot-jobs/${job.id}/complete`, {
+      method: "POST", headers: { ...snapshotLeaseHeaders(job.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(result)
+    }).then(jsonResponse);
+  }
+
+  async failThreadSnapshot(job: ThreadSnapshotJob, summary: string): Promise<void> {
+    const body = threadSnapshotFailureSchema.parse({ summary });
+    await this.authorizedFetch(`/v1/workers/thread-snapshot-jobs/${job.id}/fail`, {
+      method: "POST", headers: { ...snapshotLeaseHeaders(job.leaseToken), "content-type": "application/json" },
+      body: JSON.stringify(body)
+    }).then(jsonResponse);
   }
 
   async downloadWorkspaceRuntimeFile(job: WorkspaceRuntimeSyncJob, file: TaskRuntimeFile, target: string): Promise<{ path: string; size: number; sha256: string }> {
@@ -341,6 +393,10 @@ function leaseHeaders(token: string): Record<string, string> {
 
 function syncLeaseHeaders(token: string): Record<string, string> {
   return { "x-sync-lease-token": token };
+}
+
+function snapshotLeaseHeaders(token: string): Record<string, string> {
+  return { "x-snapshot-lease-token": token };
 }
 
 async function jsonResponse(response: Response): Promise<unknown> {

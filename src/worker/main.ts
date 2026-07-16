@@ -77,6 +77,11 @@ while (!stopping) {
       await processor.processWorkspaceRuntimeSync(workspaceSync);
       continue;
     }
+    const threadSnapshot = await client.claimThreadSnapshot();
+    if (threadSnapshot) {
+      await processor.processThreadSnapshot(threadSnapshot);
+      continue;
+    }
     const task = await client.claim();
     if (!task) continue;
     await processor.process(task);
