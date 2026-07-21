@@ -1369,6 +1369,63 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect((await db.selectFrom("skill_file_sync_jobs").select("state").where("id", "=", syncJob.id).executeTakeFirstOrThrow()).state).toBe("queued");
   });
 
+  it("migrates legacy continuity fingerprints without blocking Codex runtime upgrades", async () => {
+    const now = new Date();
+    const blockedReason = "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认";
+    await insertWorker();
+    await enableWorkerWorkspaceMapping();
+    const context = await insertSkillContext("oc_continuity_fingerprint_v2", "worker-a");
+    await db.updateTable("chat_contexts").set({
+      codex_thread_id: "thread-continuity-v2",
+      executor_config_fingerprint: "b".repeat(64),
+      codex_version: "codex-cli old-version",
+      state: "blocked",
+      blocked_reason: blockedReason,
+      updated_at: now
+    }).where("id", "=", context.id).execute();
+    const conversation = await db.insertInto("conversations").values({
+      bot_id: context.bot_id, chat_context_id: context.id, bot_config_revision: 1, role_instructions_snapshot: "test",
+      attention_model_snapshot: null, attention_reasoning_effort_snapshot: null, execution_model_snapshot: null, execution_reasoning_effort_snapshot: null,
+      chat_id: context.chat_id, chat_type: "p2p", root_message_id: "om_continuity_v2", thread_id: null, room_seq: 1,
+      active: true, response_message_id: null, followup_expires_at: null, updated_at: now
+    }).returning("id").executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      bot_id: context.bot_id, conversation_id: conversation.id, state: "waiting_input", trigger_message_id: "om_continuity_v2",
+      requester_id: "ou_owner", requester_role: "owner", authorization_grant: JSON.stringify({ read: true }),
+      requested_workspace_alias: "repo", resolved_workspace_alias: "repo", preferred_executor_id: "worker-a", executor_id: "worker-a",
+      codex_thread_id: "thread-continuity-v2", executor_home_ref: "worker-a:home", executor_profile: "lark-agent",
+      executor_config_fingerprint: "b".repeat(64), executor_workspace_mapping_fingerprint: workspaceMappingFingerprint,
+      codex_version: "codex-cli old-version", lease_token_hash: null, lease_expires_at: null,
+      summary: blockedReason, completed_at: null, updated_at: now
+    }).returning("id").executeTakeFirstOrThrow();
+    const repository = new ControlPlaneRepository(db, 60);
+    const upgradedRegistration = {
+      executorId: "worker-a", displayName: "Worker A", homeRef: "worker-a:home", codexProfile: "lark-agent",
+      configFingerprint: "d".repeat(64), workspaceMappingFingerprint, codexVersion: "codex-cli next-version", capacity: 1,
+      workspaceAliases: ["repo"], capabilities: ["codex", "chat_context_v1", "workspace_mapping_v1", "continuity_fingerprint_v2"]
+    };
+
+    await repository.upsertWorker(upgradedRegistration);
+
+    expect(await db.selectFrom("chat_contexts").select(["state", "blocked_reason", "executor_config_fingerprint", "codex_version"])
+      .where("id", "=", context.id).executeTakeFirstOrThrow()).toEqual({
+      state: "ready", blocked_reason: null, executor_config_fingerprint: "d".repeat(64), codex_version: "codex-cli next-version"
+    });
+    expect(await db.selectFrom("tasks").select(["state", "summary", "executor_config_fingerprint", "codex_version"])
+      .where("id", "=", task.id).executeTakeFirstOrThrow()).toEqual({
+      state: "waiting_worker", summary: null, executor_config_fingerprint: "d".repeat(64), codex_version: "codex-cli next-version"
+    });
+    expect(await db.selectFrom("chat_context_recovery_attempts").select(["actor_open_id", "result"])
+      .where("chat_context_id", "=", context.id).orderBy("checked_at", "desc").executeTakeFirstOrThrow())
+      .toEqual({ actor_open_id: "system:continuity-fingerprint-v2", result: "recovered" });
+    expect((await db.selectFrom("task_events").select("event_type").where("task_id", "=", task.id).orderBy("created_at", "desc").executeTakeFirstOrThrow()).event_type)
+      .toBe("chat_context.fingerprint_migrated");
+
+    await repository.upsertWorker({ ...upgradedRegistration, configFingerprint: "e".repeat(64) });
+    expect((await db.selectFrom("chat_contexts").select("state").where("id", "=", context.id).executeTakeFirstOrThrow()).state).toBe("blocked");
+    expect((await db.selectFrom("tasks").select("state").where("id", "=", task.id).executeTakeFirstOrThrow()).state).toBe("waiting_input");
+  });
+
   it("saves, validates and clears a worker alias without changing its stable execution identity", async () => {
     const now = new Date();
     await db.insertInto("admin_sessions").values({

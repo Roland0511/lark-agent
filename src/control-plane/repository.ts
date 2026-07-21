@@ -1,6 +1,6 @@
 import { sql, type Kysely, type Transaction } from "kysely";
 import type { Database, Task } from "../db/types.js";
-import type { AuthorizationGrant, InboxDecision, WorkerRegistration } from "../shared/contracts.js";
+import { continuityFingerprintV2Capability, type AuthorizationGrant, type InboxDecision, type WorkerRegistration } from "../shared/contracts.js";
 import { randomToken, sha256 } from "../shared/crypto.js";
 import { AppError } from "../shared/errors.js";
 import { executorHasClaimCapacity, lockExecutorClaim } from "./executor-claim-lock.js";
@@ -17,6 +17,115 @@ interface WorkerRegistrationOptions {
   restoreDeleted?: boolean;
 }
 
+const configFingerprintBlockReasons = [
+  "固定执行器的 CODEX_HOME、Profile 或配置指纹已变化，需要主人确认",
+  "聊天绑定的执行器、CODEX_HOME、Profile、配置指纹或工作区别名已不匹配"
+];
+
+const configFingerprintTaskSummaries = [
+  ...configFingerprintBlockReasons,
+  "执行器 CODEX_HOME/profile 配置指纹已变化，需要主人确认"
+];
+
+async function migrateContinuityFingerprintV2(
+  db: Transaction<Database>,
+  registration: WorkerRegistration,
+  mappingFingerprint: string | null,
+  now: Date,
+  previous: {
+    home_ref: string;
+    codex_profile: string;
+    workspace_mapping_fingerprint: string | null;
+    capabilities: unknown;
+  } | undefined
+): Promise<void> {
+  if (!previous) return;
+  const previousCapabilities = Array.isArray(previous.capabilities) ? previous.capabilities.map(String) : [];
+  const isAlgorithmUpgrade = registration.capabilities.includes(continuityFingerprintV2Capability)
+    && !previousCapabilities.includes(continuityFingerprintV2Capability)
+    && previous.home_ref === registration.homeRef
+    && previous.codex_profile === registration.codexProfile
+    && (previous.workspace_mapping_fingerprint === null || mappingFingerprint === null || previous.workspace_mapping_fingerprint === mappingFingerprint);
+  if (!isAlgorithmUpgrade) return;
+
+  let contextQuery = db.selectFrom("chat_contexts").select(["id", "state", "blocked_reason"])
+    .where("executor_id", "=", registration.executorId)
+    .where("executor_home_ref", "=", registration.homeRef)
+    .where("executor_profile", "=", registration.codexProfile)
+    .where("codex_thread_id", "is not", null)
+    .where("workspace_root_alias", "in", registration.workspaceAliases)
+    .where((eb) => eb.or([
+      eb("state", "=", "ready"),
+      eb.and([eb("state", "=", "blocked"), eb("blocked_reason", "in", configFingerprintBlockReasons)])
+    ]));
+  contextQuery = previous.workspace_mapping_fingerprint === null
+    ? contextQuery.where((eb) => eb.or([
+        eb("executor_workspace_mapping_fingerprint", "is", null),
+        eb("executor_workspace_mapping_fingerprint", "=", mappingFingerprint)
+      ]))
+    : contextQuery.where("executor_workspace_mapping_fingerprint", "=", mappingFingerprint);
+  const contexts = await contextQuery.execute();
+  if (!contexts.length) return;
+
+  const contextIds = contexts.map((context) => context.id);
+  const recoveredContextIds = contexts
+    .filter((context) => context.state === "blocked" && configFingerprintBlockReasons.includes(context.blocked_reason ?? ""))
+    .map((context) => context.id);
+  await db.updateTable("chat_contexts").set({
+    executor_config_fingerprint: registration.configFingerprint,
+    executor_workspace_mapping_fingerprint: mappingFingerprint,
+    codex_version: registration.codexVersion,
+    updated_at: now
+  }).where("id", "in", contextIds).execute();
+  if (recoveredContextIds.length) {
+    await db.updateTable("chat_contexts").set({ state: "ready", blocked_reason: null, updated_at: now })
+      .where("id", "in", recoveredContextIds).execute();
+    await db.insertInto("chat_context_recovery_attempts").values(recoveredContextIds.map((chatContextId) => ({
+      chat_context_id: chatContextId,
+      actor_open_id: "system:continuity-fingerprint-v2",
+      state_before: "blocked" as const,
+      state_after: "ready" as const,
+      result: "recovered" as const,
+      failed_check_keys: JSON.stringify([]),
+      checked_at: now
+    }))).execute();
+  }
+
+  const conversations = await db.selectFrom("conversations").select("id").where("chat_context_id", "in", contextIds).execute();
+  if (!conversations.length) return;
+  const conversationIds = conversations.map((conversation) => conversation.id);
+  const activeTasks = await db.selectFrom("tasks").select(["id", "state", "summary"])
+    .where("conversation_id", "in", conversationIds)
+    .where("executor_id", "=", registration.executorId)
+    .where("state", "in", ["queued", "waiting_worker", "running", "waiting_input", "waiting_approval", "held_draft", "human_owned"])
+    .execute();
+  if (!activeTasks.length) return;
+  const taskIds = activeTasks.map((task) => task.id);
+  const requeuedTaskIds = activeTasks
+    .filter((task) => task.state === "waiting_input" && configFingerprintTaskSummaries.includes(task.summary ?? ""))
+    .map((task) => task.id);
+  await db.updateTable("tasks").set({
+    executor_config_fingerprint: registration.configFingerprint,
+    executor_workspace_mapping_fingerprint: mappingFingerprint,
+    codex_version: registration.codexVersion,
+    updated_at: now
+  }).where("id", "in", taskIds).execute();
+  if (requeuedTaskIds.length) {
+    await db.updateTable("tasks").set({
+      state: "waiting_worker",
+      summary: null,
+      revision: sql`revision + 1`,
+      updated_at: now
+    }).where("id", "in", requeuedTaskIds).execute();
+    await db.insertInto("task_events").values(requeuedTaskIds.map((taskId) => ({
+      task_id: taskId,
+      event_type: "chat_context.fingerprint_migrated",
+      summary: "连续性指纹已升级，任务恢复等待执行",
+      payload: JSON.stringify({ version: 2 })
+    }))).execute();
+  }
+}
+
 export async function upsertWorkerRegistration(
   db: Transaction<Database>,
   registration: WorkerRegistration,
@@ -26,7 +135,7 @@ export async function upsertWorkerRegistration(
   const mappingFingerprint = registration.workspaceMappingFingerprint ?? null;
   await sql`select pg_advisory_xact_lock(hashtext(${`worker-registration:${registration.executorId}`}))`.execute(db);
   const previous = await db.selectFrom("workers")
-    .select(["config_fingerprint", "workspace_mapping_fingerprint"])
+    .select(["config_fingerprint", "workspace_mapping_fingerprint", "home_ref", "codex_profile", "capabilities"])
     .where("executor_id", "=", registration.executorId)
     .executeTakeFirst();
   const expectedProfileSwitch = await db.selectFrom("profile_switch_migrations")
@@ -113,6 +222,8 @@ export async function upsertWorkerRegistration(
       .where("executor_workspace_mapping_fingerprint", "is distinct from", mappingFingerprint)
       .execute();
   }
+
+  await migrateContinuityFingerprintV2(db, registration, mappingFingerprint, now, previous);
 
   if (!expectedProfileSwitch) {
     await db.updateTable("tasks")

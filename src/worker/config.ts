@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 import { sha256, stableHomeRef } from "../shared/crypto.js";
+import { continuityFingerprintV2Capability } from "../shared/contracts.js";
 
 const workspaceRootSchema = z.object({
   alias: z.string().min(1).max(128),
@@ -48,6 +49,7 @@ export interface ResolvedWorkerConfig {
   profileReasoningEffort: string | null;
   codexBinary: string;
   codexVersion: string;
+  runtimeFingerprint: string;
   configFingerprint: string;
   workspaceMappingFingerprint: string;
   capacity: number;
@@ -106,17 +108,13 @@ function profileOverrides(source: string): string[] {
 }
 
 function continuationConfigFingerprint(input: {
-  codexVersion: string;
-  protocolHash: string;
   profileOverrides: string[];
   effectiveModel: unknown;
   effectiveModelProvider: unknown;
   effectiveReasoningEffort: unknown;
 }): string {
   return sha256(JSON.stringify({
-    version: 1,
-    codexVersion: input.codexVersion,
-    protocolHash: input.protocolHash,
+    version: 2,
     model: typeof input.effectiveModel === "string" ? input.effectiveModel : null,
     modelProvider: typeof input.effectiveModelProvider === "string" ? input.effectiveModelProvider : null,
     reasoningEffort: typeof input.effectiveReasoningEffort === "string" ? input.effectiveReasoningEffort : null,
@@ -253,6 +251,7 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   const protocol = await protocolFingerprint(raw.executor.codex_binary, codexHome);
   if (!capabilities.includes("thread_snapshot_v1")) capabilities.push("thread_snapshot_v1");
   if (!capabilities.includes("thread_turn_summary_v1")) capabilities.push("thread_turn_summary_v1");
+  if (!capabilities.includes(continuityFingerprintV2Capability)) capabilities.push(continuityFingerprintV2Capability);
   const overrides = profileOverrides(profileConfig);
   const baseValues = baseConfig ? parseToml(baseConfig) as Record<string, unknown> : {};
   const profileValues = parseToml(profileConfig) as Record<string, unknown>;
@@ -263,13 +262,14 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
   // also contains desktop preferences, trusted projects and plugin metadata;
   // changing those must not invalidate an otherwise resumable Thread.
   const configFingerprint = continuationConfigFingerprint({
-    codexVersion,
-    protocolHash: protocol.hash,
     profileOverrides: overrides,
     effectiveModel,
     effectiveModelProvider,
     effectiveReasoningEffort
   });
+  // Runtime changes should restart the Worker, but they are not evidence that a
+  // saved Thread is incompatible. A real resume failure is handled at runtime.
+  const runtimeFingerprint = sha256(JSON.stringify({ version: 1, codexVersion, protocolHash: protocol.hash }));
   const mappingFingerprint = workspaceMappingFingerprint(workspaceRoots);
   return {
     controlPlaneUrl: raw.control_plane.url.replace(/\/$/, ""),
@@ -285,6 +285,7 @@ export async function loadWorkerConfig(configFile: string, env: NodeJS.ProcessEn
     profileReasoningEffort: typeof effectiveReasoningEffort === "string" ? effectiveReasoningEffort : null,
     codexBinary: raw.executor.codex_binary,
     codexVersion,
+    runtimeFingerprint,
     configFingerprint,
     workspaceMappingFingerprint: mappingFingerprint,
     capacity: raw.executor.capacity,

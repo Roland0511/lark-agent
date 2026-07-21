@@ -44,6 +44,8 @@ export const authorizationGrantSchema = z.object({
 });
 export type AuthorizationGrant = z.infer<typeof authorizationGrantSchema>;
 
+export const continuityFingerprintV2Capability = "continuity_fingerprint_v2";
+
 export const workerRegistrationSchema = z.object({
   executorId: z.string().min(1).max(128),
   displayName: z.string().min(1).max(128),

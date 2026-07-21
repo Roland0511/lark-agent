@@ -60,6 +60,7 @@ const configTimer = setInterval(() => {
   void loadWorkerConfig(configFile).then((fresh) => {
     if (
       fresh.configFingerprint !== config.configFingerprint ||
+      fresh.runtimeFingerprint !== config.runtimeFingerprint ||
       fresh.workspaceMappingFingerprint !== config.workspaceMappingFingerprint
     ) {
       configChanged = true;

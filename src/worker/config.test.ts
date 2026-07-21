@@ -4,6 +4,24 @@ import { tmpdir } from "node:os";
 import { describe, expect, it } from "vitest";
 import { loadWorkerConfig, workspaceMappingFingerprint } from "./config.js";
 
+async function writeFakeCodex(path: string, version = "codex-cli test-version", extraClientMethod = ""): Promise<void> {
+  await writeFile(path, `#!/bin/sh
+if [ "$1" = "--version" ]; then echo '${version}'; exit 0; fi
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--out" ]; then
+    shift
+    mkdir -p "$1"
+    printf '%s' '{"methods":["thread/start","thread/resume","thread/read","turn/start","turn/steer","turn/interrupt","skills/list"${extraClientMethod ? `,"${extraClientMethod}"` : ""}]}' > "$1/ClientRequest.json"
+    printf '%s' '{"methods":["item/commandExecution/requestApproval","item/fileChange/requestApproval"]}' > "$1/ServerRequest.json"
+    exit 0
+  fi
+  shift
+done
+exit 1
+`);
+  await chmod(path, 0o755);
+}
+
 async function fixture(baseConfig = "model = \"test\"\n") {
   const root = await mkdtemp(join(tmpdir(), "lark-agent-config-"));
   const codexHome = join(root, "codex-home");
@@ -13,27 +31,13 @@ async function fixture(baseConfig = "model = \"test\"\n") {
   await writeFile(join(codexHome, "config.toml"), baseConfig);
   await writeFile(join(codexHome, "lark-agent.config.toml"), "approval_policy = \"on-request\"\n[tui.model_availability_nux]\n\"test.model\" = 2\n");
   const fakeCodex = join(root, "codex");
-  await writeFile(fakeCodex, `#!/bin/sh
-if [ "$1" = "--version" ]; then echo 'codex-cli test-version'; exit 0; fi
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--out" ]; then
-    shift
-    mkdir -p "$1"
-    printf '%s' '{"methods":["thread/start","thread/resume","thread/read","turn/start","turn/steer","turn/interrupt","skills/list"]}' > "$1/ClientRequest.json"
-    printf '%s' '{"methods":["item/commandExecution/requestApproval","item/fileChange/requestApproval"]}' > "$1/ServerRequest.json"
-    exit 0
-  fi
-  shift
-done
-exit 1
-`);
-  await chmod(fakeCodex, 0o755);
+  await writeFakeCodex(fakeCodex);
   const configFile = join(root, "worker.yaml");
   await writeFile(
     configFile,
     `control_plane:\n  url: https://agent.example.test\n  device_token_env: TEST_DEVICE_TOKEN\nexecutor:\n  id: test-worker\n  display_name: Test Worker\n  codex_home: ${JSON.stringify(codexHome)}\n  codex_profile: lark-agent\n  codex_binary: ${JSON.stringify(fakeCodex)}\n  capacity: 1\n  workspace_roots:\n    - alias: repo\n      path: ${JSON.stringify(workspace)}\n`
   );
-  return { configFile, codexHome: await realpath(codexHome), workspace };
+  return { configFile, codexHome: await realpath(codexHome), workspace, fakeCodex };
 }
 
 describe("worker config", () => {
@@ -59,6 +63,7 @@ describe("worker config", () => {
     expect(config.capabilities).toContain("workspace_mapping_v1");
     expect(config.capabilities).toContain("thread_snapshot_v1");
     expect(config.capabilities).toContain("thread_turn_summary_v1");
+    expect(config.capabilities).toContain("continuity_fingerprint_v2");
     expect(config.runtimeStateDir).toBe(await realpath(join(dirname(data.configFile), "state")));
     expect(config.attachmentMaxBytes).toBe(104_857_600);
     expect(config.attachmentTaskMaxBytes).toBe(209_715_200);
@@ -99,6 +104,20 @@ describe("worker config", () => {
     expect(profileChange.configFingerprint).not.toBe(initial.configFingerprint);
   });
 
+  it("restarts for Codex runtime changes without changing the continuity fingerprint", async () => {
+    const data = await fixture();
+    const env = { TEST_DEVICE_TOKEN: ["test", "device", "token"].join("-") };
+    const initial = await loadWorkerConfig(data.configFile, env);
+
+    await writeFakeCodex(data.fakeCodex, "codex-cli next-version", "thread/items/list");
+    const upgraded = await loadWorkerConfig(data.configFile, env);
+
+    expect(upgraded.codexVersion).toBe("codex-cli next-version");
+    expect(upgraded.runtimeFingerprint).not.toBe(initial.runtimeFingerprint);
+    expect(upgraded.configFingerprint).toBe(initial.configFingerprint);
+    expect(upgraded.supportsThreadItemsList).toBe(true);
+  });
+
   it("tracks canonical workspace mappings independently from the continuity fingerprint", async () => {
     const data = await fixture();
     const env = { TEST_DEVICE_TOKEN: "test-device-token" };
@@ -133,7 +152,8 @@ describe("worker config", () => {
       "user_skills_inventory_v1",
       "workspace_mapping_v1",
       "thread_snapshot_v1",
-      "thread_turn_summary_v1"
+      "thread_turn_summary_v1",
+      "continuity_fingerprint_v2"
     ]);
   });
 
