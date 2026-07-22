@@ -551,6 +551,7 @@ export class TaskProcessor {
         let hasDeferred = false;
         for (const signal of signals) {
           let decision = signal.decision;
+          const explicitAttention = explicitlyActivatedAttention(signal);
           if (decision === "pending" && shouldMergeCausalBotRevision(task, signal, revision > 0)) {
             const attention: AttentionResult = {
               decision: "merge",
@@ -562,6 +563,15 @@ export class TaskProcessor {
               decision: attention.decision,
               priority: attention.priority,
               policy: "causal_bot_revision"
+            });
+            decision = attention.decision;
+          } else if (explicitAttention) {
+            const attention = explicitAttention;
+            await this.client.decideSignal(task.id, signal.id, task.leaseToken, attention);
+            await this.client.event(task.id, task.leaseToken, "attention.completed", "显式激活消息已直接进入执行", {
+              decision: attention.decision,
+              priority: attention.priority,
+              policy: "explicit_activation"
             });
             decision = attention.decision;
           } else if (decision === "pending") {
@@ -1186,6 +1196,15 @@ export function buildTaskPrompt(task: ClaimedTask, signals: Signal[], revision: 
     "最终必须按结构化 schema 返回 reply、disposition 和 rationale。reply 是适合直接回复飞书的简洁正文；不要重复 commentary，完整执行日志不要复制到回复中。",
     "若请求已完整完成且不期待对方继续，disposition=complete；若当前回复明确期待下一条输入、接龙、确认或后续步骤，disposition=awaiting_followup。数数到目标值前必须等待，达到目标值时完成。"
   ].join("\n");
+}
+
+export function explicitlyActivatedAttention(signal: Signal): AttentionResult | null {
+  if (signal.decision !== "pending" || signal.priority < 90) return null;
+  return {
+    decision: "consume",
+    priority: signal.priority,
+    rationale: "私聊或明确提及属于显式激活，必须进入主工作线程。"
+  };
 }
 
 export function shouldMergeCausalBotRevision(task: ClaimedTask, signal: Signal, revision: boolean): boolean {

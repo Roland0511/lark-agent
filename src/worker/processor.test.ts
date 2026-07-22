@@ -12,6 +12,7 @@ import {
   buildThreadSummaryBatchPlan,
   buildThreadSummaryBatches,
   codexCompactionFromActivity,
+  explicitlyActivatedAttention,
   fallbackThreadTurnSummary,
   prepareThreadSummaryCodexConfig,
   shouldMergeCausalBotRevision,
@@ -251,6 +252,20 @@ describe("TaskProcessor attachments", () => {
 });
 
 describe("TaskProcessor stale draft revision", () => {
+  it("consumes explicitly activated pending signals without model attention", () => {
+    const explicit = { ...signal("99999999-9999-4999-8999-999999999998", []), decision: "pending" as const, priority: 90 };
+    const background = { ...explicit, priority: 50 };
+    const decided = { ...explicit, decision: "dismiss" as const };
+
+    expect(explicitlyActivatedAttention(explicit)).toEqual({
+      decision: "consume",
+      priority: 90,
+      rationale: "私聊或明确提及属于显式激活，必须进入主工作线程。"
+    });
+    expect(explicitlyActivatedAttention(background)).toBeNull();
+    expect(explicitlyActivatedAttention(decided)).toBeNull();
+  });
+
   it("merges a registered bot reply from the same causal chain deterministically", () => {
     const botSignal: Signal = {
       ...signal("99999999-9999-4999-8999-999999999999", []),
