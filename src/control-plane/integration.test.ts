@@ -139,6 +139,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const chatThreadSnapshotsSql = await readFile(fileURLToPath(new URL("../db/migrations/022_chat_thread_snapshots.sql", import.meta.url)), "utf8");
     const chatThreadTurnSummariesSql = await readFile(fileURLToPath(new URL("../db/migrations/023_chat_thread_turn_summaries.sql", import.meta.url)), "utf8");
     const deviceCommandsSql = await readFile(fileURLToPath(new URL("../db/migrations/024_device_commands_and_profile_migrations.sql", import.meta.url)), "utf8");
+    const taskBotPolicySnapshotsSql = await readFile(fileURLToPath(new URL("../db/migrations/025_task_bot_policy_snapshots.sql", import.meta.url)), "utf8");
     const client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(initialSql);
@@ -173,6 +174,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await client.query(chatThreadSnapshotsSql);
     await client.query(chatThreadTurnSummariesSql);
     await client.query(deviceCommandsSql);
+    await client.query(taskBotPolicySnapshotsSql);
     await client.end();
   });
 
@@ -219,7 +221,7 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     await db.deleteFrom("workers").execute();
     await db.deleteFrom("bots").where("id", "!=", "00000000-0000-0000-0000-000000000001").execute();
     await db.updateTable("bot_dialogue_settings").set({ max_consecutive_depth: 30, updated_at: new Date() }).where("id", "=", 1).execute();
-    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, owner_open_id: config.ownerOpenId, attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, credential_state: "verified", permission_state: "unchecked", permission_check: null, permission_checked_at: null, deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    await db.updateTable("bots").set({ app_id: config.botAppId, bot_open_id: config.botAppId, display_name: config.agentDisplayName, role_instructions: "", attention_model: null, attention_reasoning_effort: null, execution_model: null, execution_reasoning_effort: null, default_executor_id: null, default_workspace_alias: null, enabled: true, is_system: true, config_revision: 1, credential_state: "verified", permission_state: "unchecked", permission_check: null, permission_checked_at: null, deleted_at: null }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     await db.insertInto("bot_chat_bindings").values({ bot_id: "00000000-0000-0000-0000-000000000001", chat_id: "oc_test", chat_name: "测试群", enabled: true, preferred_executor_id: null, workspace_alias: null, updated_at: new Date() }).execute();
   });
 
@@ -1544,7 +1546,22 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     });
     expect(sessionResponse.statusCode).toBe(200);
     const sessionToken = sessionResponse.json<{ sessionToken: string }>().sessionToken;
+    await db.updateTable("bots").set({
+      config_revision: 9,
+      role_instructions: "领取时的新角色",
+      attention_model: null,
+      attention_reasoning_effort: null,
+      execution_model: "gpt-execution-new",
+      execution_reasoning_effort: "high",
+      updated_at: new Date()
+    }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     const conversation = await db.insertInto("conversations").values({
+      bot_config_revision: 8,
+      role_instructions_snapshot: "入队时的旧角色",
+      attention_model_snapshot: "gpt-attention-old",
+      attention_reasoning_effort_snapshot: "low",
+      execution_model_snapshot: "gpt-execution-old",
+      execution_reasoning_effort_snapshot: "low",
       chat_id: "oc_test",
       chat_type: "group",
       root_message_id: "om_root",
@@ -1602,10 +1619,18 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
     const claimResponse = await app.inject({ method: "POST", url: "/v1/tasks/claim", headers: { authorization: `Bearer ${sessionToken}` } });
     expect(claimResponse.statusCode).toBe(200);
-    const claim = claimResponse.json<{ id: string; botAppId: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string; signals: Array<{ id: string; attachments: Array<{ id: string; type: string; fileName: string }> }> }>();
+    const claim = claimResponse.json<{ id: string; botAppId: string; leaseToken: string; chatType: string; turnIndex: number; triggerMessageId: string; attentionContext: string; requestedWorkspaceAlias: string | null; resolvedWorkspaceAlias: string; roleInstructions: string; botConfigRevision: number; attentionModel: string | null; attentionReasoningEffort: string | null; executionModel: string | null; executionReasoningEffort: string | null; signals: Array<{ id: string; attachments: Array<{ id: string; type: string; fileName: string }> }> }>();
     expect(claim.id).toBe(task.id);
     expect(claim).toMatchObject({ botAppId: "cli_bot", chatType: "group", turnIndex: 1, triggerMessageId: "om_root", requestedWorkspaceAlias: "repo", resolvedWorkspaceAlias: "repo" });
     expect(claim.attentionContext).toContain("首次激活回合");
+    expect(claim).toMatchObject({
+      roleInstructions: "领取时的新角色",
+      botConfigRevision: 9,
+      attentionModel: null,
+      attentionReasoningEffort: null,
+      executionModel: "gpt-execution-new",
+      executionReasoningEffort: "high"
+    });
     expect(claim.signals[0]?.attachments).toEqual([{ id: "11111111-1111-4111-8111-111111111111", type: "file", fileName: "proof.txt" }]);
     expect(claimResponse.body).not.toContain("file_internal_secret");
     const claimedRow = await db.selectFrom("tasks").selectAll().where("id", "=", task.id).executeTakeFirstOrThrow();
@@ -1613,6 +1638,14 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     expect(claimedRow.executor_profile).toBe("lark-agent");
     expect(claimedRow.executor_config_fingerprint).toBe("a".repeat(64));
     expect(claimedRow.resolved_workspace_alias).toBe("repo");
+    expect(claimedRow).toMatchObject({
+      bot_config_revision_snapshot: 9,
+      role_instructions_snapshot: "领取时的新角色",
+      attention_model_snapshot: null,
+      attention_reasoning_effort_snapshot: null,
+      execution_model_snapshot: "gpt-execution-new",
+      execution_reasoning_effort_snapshot: "high"
+    });
 
     let attachmentTemp = "";
     const attachmentGateway = new (await import("../lark/gateway.js")).LarkGateway("lark-cli", async () => ({}), null, async (_command, args, _env, options) => {
@@ -2545,6 +2578,15 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
 
   it("reuses one private chat Thread across separate top-level conversations", async () => {
     await insertWorker();
+    await db.updateTable("bots").set({
+      config_revision: 41,
+      role_instructions: "旧角色",
+      attention_model: "gpt-attention-old",
+      attention_reasoning_effort: "low",
+      execution_model: "gpt-execution-old",
+      execution_reasoning_effort: "medium",
+      updated_at: new Date()
+    }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
     const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
     const router = new MessageRouter(db);
     const repository = new ControlPlaneRepository(db, 60);
@@ -2559,17 +2601,151 @@ describe.skipIf(!databaseUrl)("control plane PostgreSQL integration", () => {
     const firstRoute = await router.route(bot, message("one"));
     const firstClaim = await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
     expect(firstClaim?.task.id).toBe(firstRoute.taskId);
+    expect(firstClaim?.task).toMatchObject({
+      bot_config_revision_snapshot: 41,
+      role_instructions_snapshot: "旧角色",
+      attention_model_snapshot: "gpt-attention-old",
+      attention_reasoning_effort_snapshot: "low",
+      execution_model_snapshot: "gpt-execution-old",
+      execution_reasoning_effort_snapshot: "medium"
+    });
     expect((await repository.bindTaskThread(firstRoute.taskId as string, "thread-private-stable")).status).toBe("bound");
     await repository.finishTask(firstRoute.taskId as string, "completed", "done", { disposition: "complete", processedRoomSeq: 1, reason: "done" });
 
+    // The task is already queued with the old conversation snapshot when the bot is updated.
     const secondRoute = await router.route(bot, message("two"));
+    await db.updateTable("bots").set({
+      config_revision: 42,
+      role_instructions: "新角色",
+      attention_model: null,
+      attention_reasoning_effort: null,
+      execution_model: "gpt-execution-new",
+      execution_reasoning_effort: "high",
+      updated_at: new Date()
+    }).where("id", "=", bot.id).execute();
+    const secondClaim = await repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) });
     const tasks = await db.selectFrom("tasks").selectAll().orderBy("created_at").execute();
     const conversations = await db.selectFrom("conversations").selectAll().orderBy("created_at").execute();
     expect(secondRoute.taskId).not.toBe(firstRoute.taskId);
+    expect(secondClaim?.task.id).toBe(secondRoute.taskId);
+    expect(secondClaim?.task).toMatchObject({
+      bot_config_revision_snapshot: 42,
+      role_instructions_snapshot: "新角色",
+      attention_model_snapshot: null,
+      attention_reasoning_effort_snapshot: null,
+      execution_model_snapshot: "gpt-execution-new",
+      execution_reasoning_effort_snapshot: "high"
+    });
     expect(conversations).toHaveLength(2);
     expect(new Set(conversations.map((item) => item.chat_context_id))).toEqual(new Set([conversations[0]?.chat_context_id]));
-    expect(tasks[1]).toMatchObject({ state: "waiting_worker", executor_id: "worker-a", codex_thread_id: "thread-private-stable" });
+    expect(conversations[1]).toMatchObject({ bot_config_revision: 41, role_instructions_snapshot: "旧角色" });
+    expect(tasks[1]).toMatchObject({ state: "running", executor_id: "worker-a", codex_thread_id: "thread-private-stable" });
     expect((await db.selectFrom("chat_contexts").selectAll().executeTakeFirstOrThrow()).codex_thread_id).toBe("thread-private-stable");
+  });
+
+  it("keeps the first-claim bot policy snapshot when an expired task is retried", async () => {
+    await insertWorker();
+    await db.updateTable("bots").set({ config_revision: 51, role_instructions: "首次领取角色", attention_model: null, attention_reasoning_effort: null, execution_model: "gpt-old", execution_reasoning_effort: "medium", updated_at: new Date() })
+      .where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    const routed = await new MessageRouter(db).route(bot, {
+      eventId: "ev_policy_retry", eventType: "im.message.receive_v1", messageId: "om_policy_retry",
+      chatId: "oc_policy_retry", chatType: "p2p", rootMessageId: "om_policy_retry",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null,
+      senderDisplayName: "主人", ingressSource: "lark", originMessageId: "om_policy_retry",
+      botDialogueDepth: 0, messageType: "text", content: "retry", explicitlyActivated: true
+    });
+    const repository = new ControlPlaneRepository(db, 60);
+    const principal = { executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) };
+    const firstClaim = await repository.claimTask(principal);
+    expect(firstClaim?.task).toMatchObject({ bot_config_revision_snapshot: 51, role_instructions_snapshot: "首次领取角色", execution_model_snapshot: "gpt-old" });
+
+    await db.updateTable("bots").set({ config_revision: 52, role_instructions: "更新后角色", execution_model: "gpt-new", updated_at: new Date() }).where("id", "=", bot.id).execute();
+    await db.updateTable("tasks").set({ lease_expires_at: new Date(Date.now() - 1_000) }).where("id", "=", routed.taskId as string).execute();
+    await expect(repository.recoverExpiredLeases()).resolves.toBe(1);
+    const retryClaim = await repository.claimTask(principal);
+
+    expect(retryClaim?.task.id).toBe(routed.taskId);
+    expect(retryClaim?.task).toMatchObject({
+      bot_config_revision_snapshot: 51,
+      role_instructions_snapshot: "首次领取角色",
+      execution_model_snapshot: "gpt-old",
+      execution_reasoning_effort_snapshot: "medium"
+    });
+  });
+
+  it("claims one coherent bot policy revision while a bot update races with the claim", async () => {
+    await insertWorker();
+    await db.updateTable("bots").set({
+      config_revision: 71, role_instructions: "并发旧角色",
+      attention_model: "gpt-attention-old", attention_reasoning_effort: "low",
+      execution_model: "gpt-execution-old", execution_reasoning_effort: "medium", updated_at: new Date()
+    }).where("id", "=", "00000000-0000-0000-0000-000000000001").execute();
+    const bot = await db.selectFrom("bots").selectAll().where("id", "=", "00000000-0000-0000-0000-000000000001").executeTakeFirstOrThrow();
+    await new MessageRouter(db).route(bot, {
+      eventId: "ev_policy_race", eventType: "im.message.receive_v1", messageId: "om_policy_race",
+      chatId: "oc_policy_race", chatType: "p2p", rootMessageId: "om_policy_race",
+      senderId: "ou_owner", senderRole: "owner", senderType: "user", senderBotId: null,
+      senderDisplayName: "主人", ingressSource: "lark", originMessageId: "om_policy_race",
+      botDialogueDepth: 0, messageType: "text", content: "race", explicitlyActivated: true
+    });
+    const repository = new ControlPlaneRepository(db, 60);
+
+    const [, claim] = await Promise.all([
+      db.updateTable("bots").set({
+        config_revision: 72, role_instructions: "并发新角色",
+        attention_model: null, attention_reasoning_effort: null,
+        execution_model: "gpt-execution-new", execution_reasoning_effort: "high", updated_at: new Date()
+      }).where("id", "=", bot.id).execute(),
+      repository.claimTask({ executorId: "worker-a", homeRef: "worker-a:home", codexProfile: "lark-agent", configFingerprint: "a".repeat(64) })
+    ]);
+
+    const snapshot = claim?.task;
+    expect(snapshot).not.toBeNull();
+    const coherentSnapshots = [
+      [71, "并发旧角色", "gpt-attention-old", "low", "gpt-execution-old", "medium"],
+      [72, "并发新角色", null, null, "gpt-execution-new", "high"]
+    ];
+    expect(coherentSnapshots).toContainEqual([
+      snapshot?.bot_config_revision_snapshot,
+      snapshot?.role_instructions_snapshot,
+      snapshot?.attention_model_snapshot,
+      snapshot?.attention_reasoning_effort_snapshot,
+      snapshot?.execution_model_snapshot,
+      snapshot?.execution_reasoning_effort_snapshot
+    ]);
+  });
+
+  it("backfills historical task policy snapshots from their conversation", async () => {
+    const conversation = await db.insertInto("conversations").values({
+      bot_config_revision: 61, role_instructions_snapshot: "历史角色",
+      attention_model_snapshot: null, attention_reasoning_effort_snapshot: null,
+      execution_model_snapshot: "gpt-history", execution_reasoning_effort_snapshot: "low",
+      chat_id: "oc_policy_backfill", chat_type: "p2p", root_message_id: "om_policy_backfill", thread_id: null,
+      room_seq: 1, active: true, response_message_id: null, followup_expires_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const task = await db.insertInto("tasks").values({
+      conversation_id: conversation.id, trigger_message_id: "om_policy_backfill", state: "queued", requester_id: "ou_owner", requester_role: "owner",
+      authorization_grant: JSON.stringify({ read: true, repoWrite: false, gitCommit: false, gitPush: false, deploy: false, larkWrite: false, destructive: false }),
+      requested_workspace_alias: null, preferred_executor_id: null, executor_id: null, codex_thread_id: null,
+      executor_home_ref: null, executor_profile: null, executor_config_fingerprint: null, codex_version: null,
+      lease_token_hash: null, lease_expires_at: null, summary: null, completed_at: null, updated_at: new Date()
+    }).returningAll().executeTakeFirstOrThrow();
+    const migrationSql = await readFile(fileURLToPath(new URL("../db/migrations/025_task_bot_policy_snapshots.sql", import.meta.url)), "utf8");
+
+    await sql.raw(migrationSql).execute(db);
+
+    expect(await db.selectFrom("tasks").select([
+      "bot_config_revision_snapshot", "role_instructions_snapshot", "attention_model_snapshot",
+      "attention_reasoning_effort_snapshot", "execution_model_snapshot", "execution_reasoning_effort_snapshot"
+    ]).where("id", "=", task.id).executeTakeFirstOrThrow()).toEqual({
+      bot_config_revision_snapshot: 61,
+      role_instructions_snapshot: "历史角色",
+      attention_model_snapshot: null,
+      attention_reasoning_effort_snapshot: null,
+      execution_model_snapshot: "gpt-history",
+      execution_reasoning_effort_snapshot: "low"
+    });
   });
 
   it("keeps a group Thread after follow-up expiry and a new explicit activation", async () => {

@@ -6,6 +6,11 @@ import { AppError } from "../shared/errors.js";
 import { executorHasClaimCapacity, lockExecutorClaim } from "./executor-claim-lock.js";
 import { authorizationFromMessage } from "./policy.js";
 
+type ClaimedTask = Task & {
+  bot_config_revision_snapshot: number;
+  role_instructions_snapshot: string;
+};
+
 export interface TaskLeaseGuard {
   executorId: string;
   leaseToken: string;
@@ -262,7 +267,7 @@ export class ControlPlaneRepository {
     codexProfile: string;
     configFingerprint: string;
     workspaceMappingFingerprint?: string | null;
-  }): Promise<null | { task: Task; leaseToken: string; leaseExpiresAt: Date }> {
+  }): Promise<null | { task: ClaimedTask; leaseToken: string; leaseExpiresAt: Date }> {
     const leaseToken = randomToken();
     const leaseExpiresAt = new Date(Date.now() + this.leaseSeconds * 1000);
     const task = await this.db.transaction().execute(async (trx) => {
@@ -286,10 +291,17 @@ export class ControlPlaneRepository {
       const singleWorkspaceAlias = aliases.length === 1 ? aliases[0] as string : null;
       const workspaceMappingReady = capabilities.includes("workspace_mapping_v1") &&
         workspaceMappingFingerprint !== null && worker.workspace_mapping_fingerprint === workspaceMappingFingerprint;
-      const result = await sql<Task>`
+      const result = await sql<ClaimedTask>`
       WITH candidate AS (
-        SELECT tasks.id, tasks.revision
+        SELECT tasks.id, tasks.revision,
+          bots.config_revision AS current_bot_config_revision,
+          bots.role_instructions AS current_role_instructions,
+          bots.attention_model AS current_attention_model,
+          bots.attention_reasoning_effort AS current_attention_reasoning_effort,
+          bots.execution_model AS current_execution_model,
+          bots.execution_reasoning_effort AS current_execution_reasoning_effort
         FROM tasks
+        JOIN bots ON bots.id = tasks.bot_id
         JOIN conversations ON conversations.id = tasks.conversation_id
         JOIN chat_contexts ON chat_contexts.id = conversations.chat_context_id
         WHERE tasks.state IN ('queued', 'waiting_worker')
@@ -415,6 +427,30 @@ export class ControlPlaneRepository {
           executor_config_fingerprint = ${principal.configFingerprint},
           executor_workspace_mapping_fingerprint = ${workspaceMappingFingerprint},
           codex_version = ${worker.codex_version},
+          bot_config_revision_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_bot_config_revision
+            ELSE t.bot_config_revision_snapshot
+          END,
+          role_instructions_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_role_instructions
+            ELSE t.role_instructions_snapshot
+          END,
+          attention_model_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_attention_model
+            ELSE t.attention_model_snapshot
+          END,
+          attention_reasoning_effort_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_attention_reasoning_effort
+            ELSE t.attention_reasoning_effort_snapshot
+          END,
+          execution_model_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_execution_model
+            ELSE t.execution_model_snapshot
+          END,
+          execution_reasoning_effort_snapshot = CASE
+            WHEN t.bot_config_revision_snapshot IS NULL THEN candidate.current_execution_reasoning_effort
+            ELSE t.execution_reasoning_effort_snapshot
+          END,
           resolved_workspace_alias = COALESCE(t.resolved_workspace_alias, t.requested_workspace_alias, ${singleWorkspaceAlias}),
           lease_token_hash = ${sha256(leaseToken)},
           lease_expires_at = ${leaseExpiresAt},

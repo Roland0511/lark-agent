@@ -140,6 +140,12 @@ export interface TasksTable {
   id: Generated<string>;
   bot_id: string;
   conversation_id: string;
+  bot_config_revision_snapshot: Generated<number | null>;
+  role_instructions_snapshot: Generated<string | null>;
+  attention_model_snapshot: Generated<string | null>;
+  attention_reasoning_effort_snapshot: Generated<string | null>;
+  execution_model_snapshot: Generated<string | null>;
+  execution_reasoning_effort_snapshot: Generated<string | null>;
   state: TaskState;
   turn_index: Generated<number>;
   trigger_message_id: string;

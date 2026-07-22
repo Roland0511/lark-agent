@@ -197,9 +197,7 @@ export function buildControlPlane(
           .innerJoin("bots", "bots.id", "conversations.bot_id")
           .innerJoin("chat_contexts", "chat_contexts.id", "conversations.chat_context_id")
           .select([
-            "conversations.chat_context_id", "conversations.room_seq", "conversations.chat_type", "conversations.bot_config_revision", "conversations.role_instructions_snapshot",
-            "conversations.attention_model_snapshot", "conversations.attention_reasoning_effort_snapshot",
-            "conversations.execution_model_snapshot", "conversations.execution_reasoning_effort_snapshot",
+            "conversations.chat_context_id", "conversations.room_seq", "conversations.chat_type",
             "bots.app_id", "bots.display_name", "chat_contexts.codex_thread_id as chat_context_thread_id"
           ])
           .where("conversations.id", "=", claimed.task.conversation_id).executeTakeFirstOrThrow();
@@ -225,12 +223,12 @@ export function buildControlPlane(
           botId: claimed.task.bot_id,
           botAppId: conversation.app_id,
           botDisplayName: conversation.display_name,
-          roleInstructions: conversation.role_instructions_snapshot,
-          botConfigRevision: conversation.bot_config_revision,
-          attentionModel: conversation.attention_model_snapshot,
-          attentionReasoningEffort: conversation.attention_reasoning_effort_snapshot,
-          executionModel: conversation.execution_model_snapshot,
-          executionReasoningEffort: conversation.execution_reasoning_effort_snapshot,
+          roleInstructions: claimed.task.role_instructions_snapshot,
+          botConfigRevision: claimed.task.bot_config_revision_snapshot,
+          attentionModel: claimed.task.attention_model_snapshot,
+          attentionReasoningEffort: claimed.task.attention_reasoning_effort_snapshot,
+          executionModel: claimed.task.execution_model_snapshot,
+          executionReasoningEffort: claimed.task.execution_reasoning_effort_snapshot,
           conversationId: claimed.task.conversation_id,
           chatContextId: conversation.chat_context_id,
           workspaceKey: conversation.chat_context_id,
